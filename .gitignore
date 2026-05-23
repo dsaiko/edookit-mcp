@@ -1,0 +1,55 @@
+# --- Project binaries ---
+/edookit-mcp
+/bin/
+/dist/
+
+# --- Go build artifacts ---
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries and coverage
+*.test
+*.out
+coverage.txt
+coverage.html
+*.cover
+
+# Profiling output
+*.prof
+*.pprof
+cpu.out
+mem.out
+
+# Go workspace files (local-only; keep go.mod/go.sum committed)
+go.work
+go.work.sum
+
+# --- Local config / secrets ---
+.env
+.env.local
+*.local.yaml
+*.local.yml
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.DocumentRevisions-V100
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+Icon?
+
+# --- Editors / IDEs ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
