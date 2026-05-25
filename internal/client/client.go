@@ -89,9 +89,6 @@ type Client struct {
 // any /handler/page/* hit. Only when warmup fails does chromium relaunch
 // for a full OIDC login.
 func New(cfg Config) (*Client, error) {
-	if cfg.BaseURL == "" {
-		return nil, errors.New("BaseURL is required")
-	}
 	if cfg.Username == "" || cfg.Password == "" {
 		return nil, errors.New("username and password are required")
 	}
@@ -99,22 +96,12 @@ func New(cfg Config) (*Client, error) {
 		cfg.CookieMaxAge = 10 * time.Hour
 	}
 	if cfg.Timezone == nil {
-		// "Europe/Prague" is the school's TZ for the schools this MCP targets.
-		// time/tzdata is imported in main.go so this works on Windows / locked
-		// down containers that lack /usr/share/zoneinfo.
-		loc, err := time.LoadLocation("Europe/Prague")
-		if err != nil {
-			// Should never happen with time/tzdata embedded, but fall back to
-			// the host's local TZ rather than erroring out on construction.
-			log.Printf("[client] LoadLocation(Europe/Prague) failed (%v); falling back to time.Local", err)
-			loc = time.Local
-		}
-		cfg.Timezone = loc
+		cfg.Timezone = defaultTimezone()
 	}
 
-	u, err := url.Parse(cfg.BaseURL)
+	u, err := parseBaseURL(cfg.BaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse base url: %w", err)
+		return nil, err
 	}
 
 	httpClient, err := buildHTTPClient(cfg.HTTPClient)
@@ -125,33 +112,85 @@ func New(cfg Config) (*Client, error) {
 	c := &Client{cfg: cfg, http: httpClient, baseURL: u}
 
 	if cfg.CookieCachePath != "" {
-		cookies, age, err := loadCookies(cfg.CookieCachePath, cfg.BaseURL)
-		switch {
-		case err == nil && age < cfg.CookieMaxAge:
-			// Populate the jar but leave loggedIn=false so the first
-			// ensureLoggedIn call does a cheap GET / warmup to validate +
-			// resurrect the PHP session before any /handler/page/* request.
-			c.http.Jar.SetCookies(c.baseURL, cookies)
-			log.Printf("[client] loaded %d cached cookies (age %s); will verify on first call",
-				len(cookies), age.Round(time.Minute))
-		case err == nil:
-			log.Printf("[client] cached cookies are stale (age %s > max %s); will re-login on first request",
-				age.Round(time.Minute), cfg.CookieMaxAge)
-		case !errors.Is(err, os.ErrNotExist):
-			log.Printf("[client] cookie cache load failed: %v", err)
-		}
+		c.preloadCookies()
 	}
 
 	return c, nil
 }
 
-func (c *Client) resolve(path string) string {
-	ref, _ := url.Parse(path)
-	return c.baseURL.ResolveReference(ref).String()
+// parseBaseURL validates the configured BaseURL. url.Parse accepts schemeless
+// inputs like "school.edookit.net" by stashing them in Path; the failure would
+// surface much later in an HTTP/chromedp call with a less useful message.
+// Reject those (and missing/invalid hosts) here while we still have context.
+func parseBaseURL(raw string) (*url.URL, error) {
+	if raw == "" {
+		return nil, errors.New("BaseURL is required")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse base url: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("BaseURL %q must use http or https scheme (e.g. https://your-school-login.edookit.net)", raw)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("BaseURL %q has no host", raw)
+	}
+	return u, nil
+}
+
+// defaultTimezone returns Europe/Prague (the TZ for the schools this MCP
+// targets). time/tzdata is imported in main.go so this works on Windows /
+// locked-down containers that lack /usr/share/zoneinfo. Falls back to
+// time.Local on the (effectively impossible) embedded-tzdata failure rather
+// than erroring out on construction.
+func defaultTimezone() *time.Location {
+	loc, err := time.LoadLocation("Europe/Prague")
+	if err != nil {
+		log.Printf("[client] LoadLocation(Europe/Prague) failed (%v); falling back to time.Local", err)
+		return time.Local
+	}
+	return loc
+}
+
+// preloadCookies loads cached cookies into the jar if present and fresh.
+// Leaves loggedIn=false either way so the first ensureLoggedIn call does a
+// cheap GET / warmup that validates and resurrects the PHP session before
+// any /handler/page/* request.
+func (c *Client) preloadCookies() {
+	cookies, age, err := loadCookies(c.cfg.CookieCachePath, c.cfg.BaseURL)
+	switch {
+	case err == nil && age < c.cfg.CookieMaxAge:
+		c.http.Jar.SetCookies(c.baseURL, cookies)
+		log.Printf("[client] loaded %d cached cookies (age %s); will verify on first call",
+			len(cookies), age.Round(time.Minute))
+	case err == nil:
+		log.Printf("[client] cached cookies are stale (age %s > max %s); will re-login on first request",
+			age.Round(time.Minute), c.cfg.CookieMaxAge)
+	case !errors.Is(err, os.ErrNotExist):
+		log.Printf("[client] cookie cache load failed: %v", err)
+	}
+}
+
+// resolve turns a relative or absolute path into a full URL by resolving it
+// against baseURL. A url.Parse failure on the input (e.g. caller passed a
+// malformed query-string-as-path) is propagated rather than swallowed — a
+// nil ref into ResolveReference panics, and silently constructing baseURL
+// would dispatch the wrong endpoint.
+func (c *Client) resolve(path string) (string, error) {
+	ref, err := url.Parse(path)
+	if err != nil {
+		return "", fmt.Errorf("parse request path %q: %w", path, err)
+	}
+	return c.baseURL.ResolveReference(ref).String(), nil
 }
 
 func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, method, c.resolve(path), body)
+	abs, err := c.resolve(path)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, abs, body)
 	if err != nil {
 		return nil, err
 	}

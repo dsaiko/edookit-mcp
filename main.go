@@ -87,8 +87,12 @@ func registerInboxTool(s *server.MCPServer, cli *client.Client) {
 	s.AddTool(
 		mcp.NewTool("list_inbox",
 			mcp.WithDescription("List messages in the Edookit inbox (Komunikace → Přijaté). "+
-				"Returns the most recent messages first. Each result has id, date, sender, "+
-				"subject, body_preview (first ~200 chars), and attachments count."),
+				"Returns a JSON object with two keys: `messages` is an array of message "+
+				"objects (id, date, sender, subject, body_preview ~200 chars, attachments "+
+				"count) in newest-first order; `parse_warnings` (optional) lists any rows "+
+				"the server returned that couldn't be parsed — usually means Edookit's row "+
+				"HTML changed. An empty messages array with no warnings means the mailbox "+
+				"itself is empty; an error is returned if every fetched row failed to parse."),
 			mcp.WithString("view",
 				mcp.Description("Which subset to list: 'inbox' (default), 'unread' (Nepřečtené), "+
 					"'starred' (S hvězdičkou), 'archived' (Archiv), 'all' (Vše)."),
@@ -128,8 +132,12 @@ func registerSentTool(s *server.MCPServer, cli *client.Client) {
 	s.AddTool(
 		mcp.NewTool("list_sent",
 			mcp.WithDescription("List messages the user has sent (Komunikace → Vytvořené). "+
-				"Returns the most recent first. Each result has id, date, status (e.g. 'Publikováno'), "+
-				"subject, body_preview, and attachments count."),
+				"Returns a JSON object with two keys: `messages` is an array of message "+
+				"objects (id, date, status like 'Publikováno', subject, body_preview, "+
+				"attachments count) in newest-first order; `parse_warnings` (optional) lists "+
+				"any rows the server returned that couldn't be parsed. An empty messages "+
+				"array with no warnings means nothing has been sent; an error is returned "+
+				"if every fetched row failed to parse."),
 			mcp.WithString("fulltext",
 				mcp.Description("Optional server-side full-text search across subjects and bodies."),
 			),

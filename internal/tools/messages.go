@@ -159,9 +159,11 @@ func fetchAndParse(ctx context.Context, cli *client.Client, path string, baseQue
 		}
 		rowsFetched += len(rows)
 
-		for _, row := range rows {
+		for rowIdx, row := range rows {
 			if len(row) < 3 {
-				w := fmt.Sprintf("row %d on page %d has only %d cells (expected >=3)", len(result.Messages)+1, page, len(row))
+				// rowIdx+1 is the 1-based position within the current page; that's
+				// what shows up in Edookit's UI if you scroll through the grid.
+				w := fmt.Sprintf("row %d on page %d has only %d cells (expected >=3)", rowIdx+1, page, len(row))
 				log.Printf("[tools] skipping %s", w)
 				result.ParseWarnings = append(result.ParseWarnings, w)
 				continue

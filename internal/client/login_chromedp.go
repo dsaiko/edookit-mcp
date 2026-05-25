@@ -292,9 +292,14 @@ func loginViaBrowser(ctx context.Context, cfg browserLoginConfig) ([]*http.Cooki
 		return nil, fmt.Errorf("read cookies: %w", err)
 	}
 
+	// Chrome cookie Domain values never include a port, but base.Host does if
+	// EDOOKIT_URL has one (e.g. test servers, non-default https ports). Use
+	// the bare hostname for the cookie-domain match — keep base.Host elsewhere
+	// where redirect comparisons want the port back.
+	baseHostname := base.Hostname()
 	out := make([]*http.Cookie, 0, len(rawCookies))
 	for _, c := range rawCookies {
-		if !hostMatchesCookie(base.Host, c.Domain) {
+		if !hostMatchesCookie(baseHostname, c.Domain) {
 			continue
 		}
 		out = append(out, &http.Cookie{ //nolint:gosec // G124: attributes are proxied verbatim from the browser; we can't tighten them without breaking server-issued cookies

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -72,18 +73,23 @@ func saveCookies(path, baseURL string, cookies []*http.Cookie) error {
 		return fmt.Errorf("write %s: %w", tmp, err)
 	}
 	// os.Rename atomically replaces the destination on Unix and (since Go 1.5)
-	// on Windows via MoveFileEx(MOVEFILE_REPLACE_EXISTING). On older Windows
-	// or with certain ACLs the rename can still fail with EEXIST; if it does,
-	// fall back to a remove-then-rename which loses atomicity but at least
-	// keeps the cache updating across runs.
+	// on Windows via MoveFileEx(MOVEFILE_REPLACE_EXISTING). Older Windows or
+	// some ACL configurations can still fail with "already exists" — only in
+	// THAT case do we fall back to remove-then-rename. Other errors (perms,
+	// I/O, disk full) propagate without touching the existing cache: blowing
+	// it away would leave the user worse off than just failing the save.
 	if err := os.Rename(tmp, path); err != nil {
-		if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+		if !errors.Is(err, fs.ErrExist) {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("rename %s -> %s: %w", tmp, path, err)
+		}
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
 			_ = os.Remove(tmp)
 			return fmt.Errorf("rename %s -> %s (fallback remove failed: %w): %w", tmp, path, removeErr, err)
 		}
 		if err := os.Rename(tmp, path); err != nil {
 			_ = os.Remove(tmp)
-			return fmt.Errorf("rename %s -> %s: %w", tmp, path, err)
+			return fmt.Errorf("rename %s -> %s (after fallback remove): %w", tmp, path, err)
 		}
 	}
 	return nil

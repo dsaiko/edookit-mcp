@@ -139,7 +139,7 @@ Restartujte Claude Code a v konverzaci by se měly objevit nástroje `list_inbox
 | `list_inbox` | Vypíše zprávy z **Přijaté** (volitelně jen Nepřečtené, S hvězdičkou, Archiv, Vše). Podporuje fulltext a filtrování podle data. |
 | `list_sent` | Vypíše zprávy z **Vytvořené** (odeslané). Stejné filtry kromě "view". |
 
-Každá zpráva obsahuje ID, datum, odesílatele (u příjmu) / stav (u odeslaných), předmět, prvních ~200 znaků textu a počet příloh.
+Každý nástroj vrací JSON s polem `messages` (ID, datum, odesílatel u příjmu / stav u odeslaných, předmět, prvních ~200 znaků textu, počet příloh) a volitelným polem `parse_warnings`, kde se objeví řádky, které server vrátil ale konektor je nedokázal naparsovat (typicky když Edookit změní formát řádku). Pokud selže parser u úplně všech řádků, vrátí se chyba místo prázdného výsledku — jinak by Claude nemohl odlišit "schránka je prázdná" od "parser je rozbitý".
 
 ### Bezpečnost a soukromí
 
