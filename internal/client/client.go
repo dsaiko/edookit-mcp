@@ -51,6 +51,20 @@ type Config struct {
 	// Default 10h, sized for Edookit's ~12h session window.
 	CookieMaxAge time.Duration
 
+	// MaxAttempts is the total number of HTTP request attempts before
+	// giving up, including the initial try. Default 3 (1 initial + 2
+	// retries); set to 1 to disable retries entirely. Only transient
+	// failures are retried — network errors (other than context
+	// cancellation) and HTTP 408/502/503/504. HTTP 500/501/505+ are
+	// treated as deterministic and propagated immediately so we don't mask
+	// genuine server bugs behind silent retries.
+	MaxAttempts int
+
+	// RetryBaseDelay is the base for exponential backoff between retries.
+	// Default 500ms; with the default MaxAttempts=3 the schedule is
+	// 500ms → 1s (~1.5s total worst case before failure).
+	RetryBaseDelay time.Duration
+
 	// Timezone is the school's wall-clock timezone. Edookit row dates are
 	// rendered in tenant-local time ("21.05.2026 12:31") with no offset
 	// suffix, so we need an explicit Location to interpret them correctly —
@@ -147,6 +161,12 @@ func New(cfg Config) (*Client, error) {
 	}
 	if cfg.CookieMaxAge == 0 {
 		cfg.CookieMaxAge = 10 * time.Hour
+	}
+	if cfg.MaxAttempts == 0 {
+		cfg.MaxAttempts = 3
+	}
+	if cfg.RetryBaseDelay == 0 {
+		cfg.RetryBaseDelay = 500 * time.Millisecond
 	}
 	if cfg.Timezone == nil {
 		cfg.Timezone = defaultTimezone()
@@ -302,22 +322,92 @@ func buildHTTPClient(provided *http.Client) (*http.Client, *swappableJar, error)
 	return &http.Client{Jar: jar, Timeout: 20 * time.Second}, jar, nil
 }
 
-// do dispatches req through c.http while fencing the request's cookie
-// lifecycle against a concurrent invalidateSession swap. net/http calls
-// Jar.Cookies before sending and Jar.SetCookies after the response — if
-// reset() happens between those, the response's Set-Cookie headers would
-// pollute the freshly-installed jar. We snapshot the current inner here
-// and bind it to a request-scoped client copy so both calls target the
-// same jar generation; the snapshot becomes garbage when the request
-// finishes. Falls through to plain c.http.Do when we don't own the jar
-// (caller-supplied client with its own jar), where the issue is theirs.
+// do dispatches req through c.http with two pieces of safety net layered
+// on top of plain http.Do:
+//
+//  1. Cookie-jar fence: net/http calls Jar.Cookies before sending and
+//     Jar.SetCookies after the response. If reset() (from a concurrent
+//     invalidateSession) lands between those two calls, the response's
+//     Set-Cookie headers would pollute the freshly-installed jar. We
+//     snapshot the current inner at each attempt and bind it to a
+//     request-scoped client copy so both jar calls target the same
+//     generation; the snapshot becomes garbage when the request finishes.
+//     Falls through to plain c.http.Do when we don't own the jar
+//     (caller-supplied client with its own jar) — that's the caller's
+//     problem to fence as they see fit.
+//
+//  2. Transient-failure retry: net errors (excluding context cancellation
+//     / deadline) and HTTP 408/502/503/504 trigger a retry with
+//     exponential backoff up to MaxAttempts total tries. Other 5xx and
+//     all 4xx propagate immediately so we don't mask genuine server bugs
+//     or auth failures behind silent retries. Safe because every caller
+//     issues GET requests; the moment we add a non-idempotent verb this
+//     needs gating on req.Method.
 func (c *Client) do(req *http.Request) (*http.Response, error) {
-	if c.jar == nil {
-		return c.http.Do(req)
+	attempts := c.cfg.MaxAttempts
+	if attempts < 1 {
+		attempts = 1
 	}
-	snap := *c.http
-	snap.Jar = c.jar.inner.Load()
-	return snap.Do(req)
+
+	var lastErr error
+	for i := range attempts {
+		if i > 0 {
+			delay := c.cfg.RetryBaseDelay << (i - 1)
+			log.Printf("[client] retrying %s %s after %s (attempt %d/%d, last: %v)", //nolint:gosec // G706: req.URL.Path is built from constants in internal/tools + url.Values, not user-supplied input
+				req.Method, req.URL.Path, delay, i+1, attempts, lastErr)
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(delay):
+			}
+		}
+
+		// Re-snapshot the jar on each attempt so a concurrent
+		// invalidateSession between retries lands us on the fresh inner.
+		client := c.http
+		if c.jar != nil {
+			snap := *c.http
+			snap.Jar = c.jar.inner.Load()
+			client = &snap
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			// Context cancellation / deadline are caller intent — don't
+			// burn the remaining attempts on them.
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
+			lastErr = err
+			continue
+		}
+		if isTransientStatus(resp.StatusCode) {
+			// Drain + close so the underlying connection can be reused for
+			// the retry instead of being torn down and re-dialed.
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			continue
+		}
+		return resp, nil
+	}
+	return nil, fmt.Errorf("after %d attempt(s): %w", attempts, lastErr)
+}
+
+// isTransientStatus reports whether an HTTP status code is one we expect
+// to succeed on retry — load-balancer / upstream timeouts and overload
+// signals. Deliberately excludes the rest of the 5xx range: HTTP 500 from
+// Edookit is much more likely a deterministic application bug than a
+// transient condition, and silently retrying would mask it.
+func isTransientStatus(code int) bool {
+	switch code {
+	case http.StatusRequestTimeout, // 408
+		http.StatusBadGateway,         // 502
+		http.StatusServiceUnavailable, // 503
+		http.StatusGatewayTimeout:     // 504
+		return true
+	}
+	return false
 }
 
 // EnsureLoggedIn forces a login if we don't already have a session. Normally

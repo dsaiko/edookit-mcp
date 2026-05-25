@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -19,13 +20,16 @@ import (
 // newClientForTest wires a Client to point at srv.URL, with whatever
 // per-test overrides callers want via opts. Default config is sensible for
 // most tests: a no-op LoginFunc that returns a single PHPSESSID cookie so
-// chromedp never runs.
+// chromedp never runs, and retries are disabled (MaxAttempts=1) so tests
+// that simulate transient 5xx don't get slowed down by ~1.5s of backoff.
+// Retry-behavior tests opt in by setting MaxAttempts explicitly.
 func newClientForTest(t *testing.T, srv *httptest.Server, configure ...func(*Config)) *Client {
 	t.Helper()
 	cfg := Config{
-		BaseURL:  srv.URL,
-		Username: "u",
-		Password: "p",
+		BaseURL:     srv.URL,
+		Username:    "u",
+		Password:    "p",
+		MaxAttempts: 1,
 		LoginFunc: func(_ context.Context) ([]*http.Cookie, error) {
 			return []*http.Cookie{{Name: "PHPSESSID", Value: "test-session", Path: "/"}}, nil
 		},
@@ -674,4 +678,140 @@ func TestConcurrentRequests_NoRaceUnderInvalidation(t *testing.T) {
 	close(stop)
 	wg.Wait()
 	// Reaching here without `go test -race` complaining is the assertion.
+}
+
+// ---------- retry on transient failures ----------
+
+// Two 503s then a 200 — the retry layer should swallow both 503s and the
+// caller sees only the eventual success.
+func TestDo_RetriesTransientStatus(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/handler/page/dashboard", func(w http.ResponseWriter, _ *http.Request) {
+		n := hits.Add(1)
+		if n <= 2 {
+			http.Error(w, "upstream timeout", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"authenticated": true, "ok": true}`))
+	})
+	srv := fakeServer(t, mux)
+	defer srv.Close()
+
+	cli := newClientForTest(t, srv, func(c *Config) {
+		c.MaxAttempts = 3
+		c.RetryBaseDelay = time.Millisecond // keep the test fast
+	})
+
+	var got struct {
+		Authenticated bool `json:"authenticated"`
+		OK            bool `json:"ok"`
+	}
+	if err := cli.GetJSON(context.Background(), "/handler/page/dashboard", &got); err != nil {
+		t.Fatalf("GetJSON: %v", err)
+	}
+	if !got.OK {
+		t.Errorf("got %+v, want ok=true", got)
+	}
+	if hits.Load() != 3 {
+		t.Errorf("got %d hits, want exactly 3 (503, 503, 200)", hits.Load())
+	}
+}
+
+// Persistent 503 — every attempt fails. Expect the error to mention the
+// attempt count + status so it's debuggable.
+func TestDo_FailsAfterAllAttemptsExhausted(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/handler/page/dashboard", func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		http.Error(w, "still down", http.StatusServiceUnavailable)
+	})
+	srv := fakeServer(t, mux)
+	defer srv.Close()
+
+	cli := newClientForTest(t, srv, func(c *Config) {
+		c.MaxAttempts = 3
+		c.RetryBaseDelay = time.Millisecond
+	})
+
+	var got map[string]any
+	err := cli.GetJSON(context.Background(), "/handler/page/dashboard", &got)
+	if err == nil {
+		t.Fatal("expected error after exhausting retries, got nil")
+	}
+	if !strings.Contains(err.Error(), "3 attempt") {
+		t.Errorf("error %q should mention the attempt count", err.Error())
+	}
+	if !strings.Contains(err.Error(), "503") {
+		t.Errorf("error %q should mention the underlying HTTP 503", err.Error())
+	}
+	if hits.Load() != 3 {
+		t.Errorf("got %d hits, want 3 (one per attempt)", hits.Load())
+	}
+}
+
+// A 500 should NOT be retried — those are deterministic application bugs
+// from Edookit, not transient infrastructure hiccups. Retrying them would
+// just hide the bug and waste time.
+func TestDo_DoesNotRetryDeterministic5xx(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/handler/page/dashboard", func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	srv := fakeServer(t, mux)
+	defer srv.Close()
+
+	cli := newClientForTest(t, srv, func(c *Config) {
+		c.MaxAttempts = 3
+		c.RetryBaseDelay = time.Millisecond
+	})
+
+	var got map[string]any
+	err := cli.GetJSON(context.Background(), "/handler/page/dashboard", &got)
+	if err == nil {
+		t.Fatal("expected error on HTTP 500, got nil")
+	}
+	if hits.Load() != 1 {
+		t.Errorf("got %d hits, want 1 (500 must not retry)", hits.Load())
+	}
+}
+
+// Context cancellation during the backoff window must short-circuit the
+// retry loop and surface the cancellation, not the prior HTTP error.
+func TestDo_HonorsContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/handler/page/dashboard", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	})
+	srv := fakeServer(t, mux)
+	defer srv.Close()
+
+	cli := newClientForTest(t, srv, func(c *Config) {
+		c.MaxAttempts = 5
+		c.RetryBaseDelay = 500 * time.Millisecond // long enough to cancel inside
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	var got map[string]any
+	err := cli.GetJSON(ctx, "/handler/page/dashboard", &got)
+	if err == nil {
+		t.Fatal("expected error from canceled context, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want a context cancellation error", err)
+	}
 }
