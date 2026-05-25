@@ -254,10 +254,10 @@ Login + browser-driven flow are not unit-tested — they're exercised by `make s
 
 ### Per-school configuration
 
-Two values are currently hardcoded for [SSST](https://www.ssst.cz/) (the school this MCP was originally built for) and would need rework for use by another Edookit tenant:
+`edookit-mcp` is per-tenant by construction:
 
-1. The `EDOOKIT_URL` is per-school but already env-driven — just put your own URL in `.env`.
-2. The Plus4U OIDC client_id (`plus4uClientID` in `login_chromedp.go`) is per-tenant. To support arbitrary schools it should be extracted at runtime from the landing-page JS literal `uu_app_oidc_providers_oidcg02_client_id`. Open an issue if you need this.
+1. `EDOOKIT_URL` is env-driven — put your own school's Edookit URL in `.env`.
+2. The Plus4U OIDC `client_id` is extracted at runtime from the landing page's embedded `UU5.Environment.uu_app_oidc_providers_oidcg02_client_id` literal during login. The fetch interceptor that strips the lib's hardcoded `prompt=none` only fires for requests carrying this captured ID, so any other school's tenant works out of the box without code changes. (If the extraction step fails — i.e. the landing page no longer exposes that field — login aborts with a clear error rather than silently misbehaving.)
 
 ### Distribution and releases
 

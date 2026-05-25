@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/fetch"
 	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 )
@@ -25,9 +27,15 @@ type loginStep struct {
 }
 
 // makeLoginEventListener builds the chromedp.ListenTarget callback used during
-// browser login. Surfaces browser-side warnings/errors and intercepts OIDC
-// auth requests to strip prompt=none for our client_id.
-func makeLoginEventListener(ctx context.Context) func(any) {
+// browser login. Surfaces browser-side warnings/errors, intercepts OIDC auth
+// requests to strip prompt=none, and auto-dismisses any alert/confirm dialogs
+// the page tries to open (Plus4U's lib surfaces non-fatal init errors via
+// alert() which would otherwise block the entire flow in headful mode).
+//
+// The client_id is captured at runtime from the landing page and shared via
+// atomic.Value so this listener — which runs in a chromedp event goroutine —
+// can read it without a race against the step that writes it.
+func makeLoginEventListener(ctx context.Context, clientIDStore *atomic.Value) func(any) {
 	return func(ev any) {
 		switch ev := ev.(type) {
 		case *runtime.EventConsoleAPICalled:
@@ -42,23 +50,46 @@ func makeLoginEventListener(ctx context.Context) func(any) {
 		case *runtime.EventExceptionThrown:
 			log.Printf("[browser-exception] %s", ev.ExceptionDetails.Text)
 		case *fetch.EventRequestPaused:
-			handleFetchIntercept(ctx, ev)
+			clientID, _ := clientIDStore.Load().(string)
+			handleFetchIntercept(ctx, ev, clientID)
+		case *page.EventJavascriptDialogOpening:
+			// Plus4U's init code surfaces non-fatal errors (e.g.
+			// "Asynchronous method getMetadata must be invoked prior to
+			// synchronous invocation") via alert(). Headless chrome
+			// auto-dismisses; headful mode blocks the flow on a modal that
+			// no user is going to click. Accept any dialog so the flow
+			// behaves identically in both modes. The error itself is
+			// already logged by the browser-exception/console handlers.
+			log.Printf("[browser-dialog %s] %s (auto-dismissing)", ev.Type, ev.Message)
+			c := chromedp.FromContext(ctx)
+			execCtx := cdp.WithExecutor(ctx, c.Target)
+			go func() {
+				if err := page.HandleJavaScriptDialog(true).Do(execCtx); err != nil {
+					log.Printf("[browser-dialog] dismiss failed: %v", err)
+				}
+			}()
 		}
 	}
 }
 
 // handleFetchIntercept rewrites the outer OIDC auth request to remove
 // prompt=none, which Plus4U's client lib hardcodes for silent SSO. Nested
-// IdM SPA auth requests (different client_id) pass through untouched.
-func handleFetchIntercept(ctx context.Context, ev *fetch.EventRequestPaused) {
+// IdM SPA auth requests (different client_id) pass through untouched. If
+// clientID is empty (extraction step hasn't run yet, or failed) every
+// intercepted request passes through unmodified — same behavior as
+// "we don't know which one is ours, so don't touch any of them".
+func handleFetchIntercept(ctx context.Context, ev *fetch.EventRequestPaused, clientID string) {
 	origURL := ev.Request.URL
-	newURL := stripPromptNoneForClient(origURL, plus4uClientID)
+	newURL := origURL
+	if clientID != "" {
+		newURL = stripPromptNoneForClient(origURL, clientID)
+	}
 	c := chromedp.FromContext(ctx)
 	execCtx := cdp.WithExecutor(ctx, c.Target)
 
 	req := fetch.ContinueRequest(ev.RequestID)
 	if newURL != origURL {
-		log.Printf("[fetch-intercept] stripped prompt=none from outer auth (client=%s)", plus4uClientID)
+		log.Printf("[fetch-intercept] stripped prompt=none from outer auth (client=%s)", clientID)
 		req = req.WithURL(newURL)
 	}
 	go func() {
@@ -123,17 +154,27 @@ func loginViaBrowser(ctx context.Context, cfg browserLoginConfig) ([]*http.Cooki
 
 	// Listen for events: surface browser-side errors (silent JS catches in
 	// Plus4U's gateway lib otherwise swallow these), and intercept the OIDC
-	// auth request to strip Plus4U's hardcoded prompt=none.
-	chromedp.ListenTarget(timeoutCtx, makeLoginEventListener(timeoutCtx))
+	// auth request to strip Plus4U's hardcoded prompt=none. The fetch
+	// interceptor only acts on requests whose client_id matches the value we
+	// extract from the landing page below — so it stays empty until the
+	// "extract OIDC client_id" step runs, which is fine since the auth
+	// request only fires AFTER the Plus4U button click, which is well after
+	// extraction. Plus4U's nested IdM SPA silent renewal uses a different
+	// client_id and is correctly left alone.
+	var clientIDStore atomic.Value
+	clientIDStore.Store("") // initialize so Load never returns nil
+	chromedp.ListenTarget(timeoutCtx, makeLoginEventListener(timeoutCtx, &clientIDStore))
 
-	// Enable network event reporting + fetch interception for OIDC auth URLs.
+	// Enable network/fetch/page domains. Page is needed so the dialog event
+	// handler in the listener receives JavaScript-dialog-opening events.
 	if err := chromedp.Run(timeoutCtx,
 		network.Enable(),
+		page.Enable(),
 		fetch.Enable().WithPatterns([]*fetch.RequestPattern{
 			{URLPattern: "https://uuidentity.plus4u.net/*/oidc/auth*"},
 		}),
 	); err != nil {
-		return nil, fmt.Errorf("enable network/fetch domains: %w", err)
+		return nil, fmt.Errorf("enable network/fetch/page domains: %w", err)
 	}
 
 	// Selector for the "Přihlásit přes Plus4U" button on Edookit's landing
@@ -156,6 +197,34 @@ func loginViaBrowser(ctx context.Context, cfg browserLoginConfig) ([]*http.Cooki
 				return waitForJSCondition(ctx,
 					`typeof idmLoginClick === 'function' && typeof libraryImportPromise !== 'undefined'`,
 					30*time.Second)
+			}),
+		},
+		{
+			// Pull the per-tenant OIDC client_id straight out of the landing
+			// page's embedded UU5.Environment block, so the fetch interceptor
+			// strips prompt=none from THIS school's auth request and leaves
+			// any other client's (notably the IdM SPA's silent renewal)
+			// alone. Different Edookit tenants get different client IDs;
+			// hardcoding would break the flow for any school other than the
+			// one this MCP was first built against.
+			//
+			// Runs AFTER waiting for the lib to finish initializing — reading
+			// the property during the lib's async init can race with its
+			// internal getMetadata() call and trigger a "must be invoked
+			// async" error in the lib.
+			name: "extract OIDC client_id from landing page",
+			action: chromedp.ActionFunc(func(ctx context.Context) error {
+				const js = `(window.UU5 && window.UU5.Environment && window.UU5.Environment.uu_app_oidc_providers_oidcg02_client_id) || ""`
+				var got string
+				if err := chromedp.Run(ctx, chromedp.Evaluate(js, &got)); err != nil {
+					return fmt.Errorf("evaluate client_id: %w", err)
+				}
+				if got == "" {
+					return errors.New("OIDC client_id not found in landing page (expected window.UU5.Environment.uu_app_oidc_providers_oidcg02_client_id)")
+				}
+				clientIDStore.Store(got)
+				log.Printf("[login] OIDC client_id: %s", got)
+				return nil
 			}),
 		},
 		{
@@ -325,15 +394,12 @@ func hostMatchesCookie(host, cookieDomain string) bool {
 	return host == d || strings.HasSuffix(host, "."+d)
 }
 
-// plus4uClientID is Edookit's OIDC client identifier on the Plus4U provider.
-// Discovered in the embedded UU5.Environment block of the landing page —
-// see uu_app_oidc_providers_oidcg02_client_id. Stable across sessions.
-const plus4uClientID = "721ac68f5be74347aea24ef1ccf9d472"
-
 // stripPromptNoneForClient removes prompt=none from a URL, but only when the
 // request's client_id matches the given target. The IdM SPA on Plus4U fires
 // its own nested silent renewal with a different client_id; that one must
-// keep prompt=none or the IdM SPA's session-restore path breaks.
+// keep prompt=none or the IdM SPA's session-restore path breaks. The matching
+// client_id is captured at runtime from the landing page's UU5.Environment
+// block (uu_app_oidc_providers_oidcg02_client_id) — it is per-tenant.
 func stripPromptNoneForClient(raw, clientID string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
