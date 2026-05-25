@@ -31,6 +31,18 @@ type Message struct {
 	Attachments int    `json:"attachments"`
 }
 
+// ListResult is what ListInbox / ListSent return. Messages is the parsed
+// rows; ParseWarnings records each row the server returned that we couldn't
+// parse (typically schema drift in Edookit's row HTML). Surfacing the
+// warnings instead of swallowing them lets the MCP caller — and through it,
+// Claude and the user — distinguish "no messages match" from "the parser
+// silently dropped everything". When every fetched row fails to parse the
+// call returns an error instead of an empty ListResult.
+type ListResult struct {
+	Messages      []Message `json:"messages"`
+	ParseWarnings []string  `json:"parse_warnings,omitempty"`
+}
+
 // InboxOptions controls ListInbox.
 type InboxOptions struct {
 	View     string // "inbox" (default) | "unread" | "starred" | "archived" | "all"
@@ -71,13 +83,13 @@ var validInboxViews = map[string]bool{
 }
 
 // ListInbox fetches received messages (Komunikace → Přijaté).
-func ListInbox(ctx context.Context, cli *client.Client, opts InboxOptions) ([]Message, error) {
+func ListInbox(ctx context.Context, cli *client.Client, opts InboxOptions) (ListResult, error) {
 	view := opts.View
 	if view == "" {
 		view = ViewInbox
 	}
 	if !validInboxViews[view] {
-		return nil, fmt.Errorf("invalid view %q (want one of %s/%s/%s/%s/%s)",
+		return ListResult{}, fmt.Errorf("invalid view %q (want one of %s/%s/%s/%s/%s)",
 			view, ViewInbox, ViewUnread, ViewStarred, ViewArchived, ViewAll)
 	}
 
@@ -92,7 +104,7 @@ func ListInbox(ctx context.Context, cli *client.Client, opts InboxOptions) ([]Me
 }
 
 // ListSent fetches messages the user has sent (Komunikace → Vytvořené).
-func ListSent(ctx context.Context, cli *client.Client, opts SentOptions) ([]Message, error) {
+func ListSent(ctx context.Context, cli *client.Client, opts SentOptions) (ListResult, error) {
 	q := url.Values{}
 	q.Set("object_type_general", "object_type_message")
 	if opts.Fulltext != "" {
@@ -120,14 +132,15 @@ type gridResponse struct {
 	} `json:"components"`
 }
 
-func fetchAndParse(ctx context.Context, cli *client.Client, path string, baseQuery url.Values, since string, limit int, isSent bool) ([]Message, error) {
+func fetchAndParse(ctx context.Context, cli *client.Client, path string, baseQuery url.Values, since string, limit int, isSent bool) (ListResult, error) {
 	loc := cli.Timezone()
 	sinceTime, err := parseSince(since, loc)
 	if err != nil {
-		return nil, fmt.Errorf("invalid since %q: %w", since, err)
+		return ListResult{}, fmt.Errorf("invalid since %q: %w", since, err)
 	}
 
-	results := make([]Message, 0, limit)
+	result := ListResult{Messages: make([]Message, 0, limit)}
+	var rowsFetched int
 
 	for page := 1; page <= maxPages; page++ {
 		q := cloneValues(baseQuery)
@@ -135,7 +148,7 @@ func fetchAndParse(ctx context.Context, cli *client.Client, path string, baseQue
 
 		var resp gridResponse
 		if err := cli.GetJSON(ctx, path+"?"+q.Encode(), &resp); err != nil {
-			return nil, fmt.Errorf("fetch page %d: %w", page, err)
+			return ListResult{}, fmt.Errorf("fetch page %d: %w", page, err)
 		}
 		if len(resp.Components.Workspace) == 0 {
 			break
@@ -144,34 +157,52 @@ func fetchAndParse(ctx context.Context, cli *client.Client, path string, baseQue
 		if len(rows) == 0 {
 			break
 		}
+		rowsFetched += len(rows)
 
 		for _, row := range rows {
 			if len(row) < 3 {
-				log.Printf("[tools] skipping row %d on page %d: only %d cells (expected ≥3)", len(results)+1, page, len(row))
+				w := fmt.Sprintf("row %d on page %d has only %d cells (expected >=3)", len(result.Messages)+1, page, len(row))
+				log.Printf("[tools] skipping %s", w)
+				result.ParseWarnings = append(result.ParseWarnings, w)
 				continue
 			}
 			msg, perr := parseRow(row[0], row[2], isSent, loc)
 			if perr != nil {
-				// Surface the schema drift so it's visible in logs instead of
-				// returning a short result with no explanation.
+				// Surface schema drift both in logs AND in the result envelope
+				// so a downstream caller (the MCP client → Claude → the user)
+				// can tell "parser broke" from "mailbox empty".
 				log.Printf("[tools] skipping malformed row: %v", perr)
+				result.ParseWarnings = append(result.ParseWarnings, perr.Error())
 				continue
 			}
 			if !sinceTime.IsZero() {
 				if t, terr := time.Parse(time.RFC3339, msg.Date); terr == nil && t.Before(sinceTime) {
-					return results, nil // hit the date floor; stop
+					return finalizeResult(result, rowsFetched)
 				}
 			}
-			results = append(results, msg)
-			if len(results) >= limit {
-				return results, nil
+			result.Messages = append(result.Messages, msg)
+			if len(result.Messages) >= limit {
+				return finalizeResult(result, rowsFetched)
 			}
 		}
 		if len(rows) < pageSize {
 			break // last page (partial)
 		}
 	}
-	return results, nil
+	return finalizeResult(result, rowsFetched)
+}
+
+// finalizeResult is the last gate before fetchAndParse returns. If the server
+// gave us rows but every one failed to parse, that's a hard failure (schema
+// drift, server returning a totally different shape) — surface as an error
+// rather than a silent empty mailbox. A partial loss (some parsed, some
+// warned) still returns the partial Messages.
+func finalizeResult(r ListResult, rowsFetched int) (ListResult, error) {
+	if rowsFetched > 0 && len(r.Messages) == 0 && len(r.ParseWarnings) > 0 {
+		return ListResult{}, fmt.Errorf("fetched %d row(s) but none parsed — schema may have drifted (first warning: %s)",
+			rowsFetched, r.ParseWarnings[0])
+	}
+	return r, nil
 }
 
 func cloneValues(v url.Values) url.Values {

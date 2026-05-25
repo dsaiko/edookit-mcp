@@ -129,14 +129,14 @@ func TestListInbox_BasicHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListInbox: %v", err)
 	}
-	if len(msgs) != 2 {
-		t.Fatalf("got %d messages, want 2", len(msgs))
+	if len(msgs.Messages) != 2 {
+		t.Fatalf("got %d messages, want 2", len(msgs.Messages))
 	}
-	if msgs[0].ID != "m-100" || msgs[0].Subject != "Subject A" {
-		t.Errorf("msgs[0] = %+v", msgs[0])
+	if msgs.Messages[0].ID != "m-100" || msgs.Messages[0].Subject != "Subject A" {
+		t.Errorf("msgs.Messages[0] = %+v", msgs.Messages[0])
 	}
-	if msgs[1].Attachments != 2 {
-		t.Errorf("msgs[1].Attachments = %d, want 2", msgs[1].Attachments)
+	if msgs.Messages[1].Attachments != 2 {
+		t.Errorf("msgs.Messages[1].Attachments = %d, want 2", msgs.Messages[1].Attachments)
 	}
 }
 
@@ -217,8 +217,8 @@ func TestListInbox_LimitRespected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListInbox: %v", err)
 	}
-	if len(msgs) != 7 {
-		t.Errorf("got %d messages, want 7", len(msgs))
+	if len(msgs.Messages) != 7 {
+		t.Errorf("got %d messages, want 7", len(msgs.Messages))
 	}
 }
 
@@ -255,8 +255,8 @@ func TestListInbox_PaginatesWhenLimitExceedsPageSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListInbox: %v", err)
 	}
-	if len(msgs) != 130 {
-		t.Errorf("got %d messages, want 130", len(msgs))
+	if len(msgs.Messages) != 130 {
+		t.Errorf("got %d messages, want 130", len(msgs.Messages))
 	}
 	// Should have hit pages 1 and 2 only (page 2 returns 50 < pageSize=100 → last page).
 	if len(pagesHit) != 2 || pagesHit[0] != 1 || pagesHit[1] != 2 {
@@ -283,10 +283,10 @@ func TestListInbox_SinceStopsAtBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListInbox: %v", err)
 	}
-	if len(msgs) != 2 {
-		t.Fatalf("got %d messages, want 2 (boundary should stop at m-1)", len(msgs))
+	if len(msgs.Messages) != 2 {
+		t.Fatalf("got %d messages, want 2 (boundary should stop at m-1)", len(msgs.Messages))
 	}
-	for _, m := range msgs {
+	for _, m := range msgs.Messages {
 		if m.Subject == "Old" || m.Subject == "Even older" {
 			t.Errorf("unexpected old message included: %q", m.Subject)
 		}
@@ -306,8 +306,66 @@ func TestListInbox_EmptyResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListInbox: %v", err)
 	}
-	if len(msgs) != 0 {
-		t.Errorf("got %d messages, want 0", len(msgs))
+	if len(msgs.Messages) != 0 {
+		t.Errorf("got %d messages, want 0", len(msgs.Messages))
+	}
+	if len(msgs.ParseWarnings) != 0 {
+		t.Errorf("got %d warnings, want 0 (server returned no rows, not malformed ones)", len(msgs.ParseWarnings))
+	}
+}
+
+// Mixed-fate page: most rows parse, one is malformed. Expect Messages to
+// contain the good ones and ParseWarnings to record the bad one — no error.
+func TestListInbox_PartialFailureSurfacedAsWarnings(t *testing.T) {
+	t.Parallel()
+
+	srv := fakeServer(t, func(_ *testing.T, _ *http.Request) [][]string {
+		return [][]string{
+			buildRow("m-1", "20.05.2026 10:00", "Alice", "Subj A", "Body", 0),
+			// Missing subject — parseRow returns an error → row goes into ParseWarnings.
+			{"m-2", "m-2", `<small><b>20.05.2026 10:00</b>, <span>Bob</span></small><div></div>Body<br>`},
+			buildRow("m-3", "19.05.2026 09:00", "Carol", "Subj C", "Body", 0),
+		}
+	})
+	defer srv.Close()
+
+	cli := newTestClient(t, srv)
+	msgs, err := ListInbox(context.Background(), cli, InboxOptions{})
+	if err != nil {
+		t.Fatalf("ListInbox: %v", err)
+	}
+	if len(msgs.Messages) != 2 {
+		t.Fatalf("got %d messages, want 2 (the two that parsed)", len(msgs.Messages))
+	}
+	if len(msgs.ParseWarnings) != 1 {
+		t.Fatalf("got %d warnings, want 1 (the one malformed row)", len(msgs.ParseWarnings))
+	}
+	if !strings.Contains(msgs.ParseWarnings[0], "m-2") || !strings.Contains(msgs.ParseWarnings[0], "subject") {
+		t.Errorf("warning %q should reference the bad row UID and the missing field", msgs.ParseWarnings[0])
+	}
+}
+
+// Total failure: rows fetched but EVERY one fails to parse. That's
+// undistinguishable from "the parser is broken", so fetchAndParse returns
+// an error rather than a silent empty result.
+func TestListInbox_TotalParseFailureReturnsError(t *testing.T) {
+	t.Parallel()
+
+	srv := fakeServer(t, func(_ *testing.T, _ *http.Request) [][]string {
+		return [][]string{
+			{"m-1", "m-1", `<small></small><div></div><br>`}, // missing all required fields
+			{"m-2", "m-2", `<small></small><div></div><br>`},
+		}
+	})
+	defer srv.Close()
+
+	cli := newTestClient(t, srv)
+	_, err := ListInbox(context.Background(), cli, InboxOptions{})
+	if err == nil {
+		t.Fatal("expected error when all rows fail to parse, got nil")
+	}
+	if !strings.Contains(err.Error(), "schema may have drifted") {
+		t.Errorf("error %q should mention schema drift", err.Error())
 	}
 }
 
@@ -335,16 +393,16 @@ func TestListSent_BasicHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListSent: %v", err)
 	}
-	if len(msgs) != 2 {
-		t.Fatalf("got %d messages, want 2", len(msgs))
+	if len(msgs.Messages) != 2 {
+		t.Fatalf("got %d messages, want 2", len(msgs.Messages))
 	}
-	if msgs[0].Status != "Publikováno" || msgs[0].Sender != "" {
-		t.Errorf("msgs[0] = %+v (status should be set, sender empty)", msgs[0])
+	if msgs.Messages[0].Status != "Publikováno" || msgs.Messages[0].Sender != "" {
+		t.Errorf("msgs.Messages[0] = %+v (status should be set, sender empty)", msgs.Messages[0])
 	}
-	if msgs[1].Status != "Nepublikováno" {
-		t.Errorf("msgs[1].Status = %q", msgs[1].Status)
+	if msgs.Messages[1].Status != "Nepublikováno" {
+		t.Errorf("msgs.Messages[1].Status = %q", msgs.Messages[1].Status)
 	}
-	if msgs[0].Attachments != 1 {
-		t.Errorf("msgs[0].Attachments = %d, want 1", msgs[0].Attachments)
+	if msgs.Messages[0].Attachments != 1 {
+		t.Errorf("msgs.Messages[0].Attachments = %d, want 1", msgs.Messages[0].Attachments)
 	}
 }

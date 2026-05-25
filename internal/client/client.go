@@ -59,6 +59,13 @@ type Config struct {
 	Timezone *time.Location
 
 	HTTPClient *http.Client
+
+	// LoginFunc, if non-nil, replaces the default chromedp-driven OIDC login
+	// with a caller-supplied function. Production callers leave this nil —
+	// it exists so tests can exercise ensureLoggedIn's retry/invalidation
+	// paths without bringing up a real browser. Returned cookies are
+	// installed into the same jar the rest of the client uses.
+	LoginFunc func(ctx context.Context) ([]*http.Cookie, error)
 }
 
 // Client is a session-aware HTTP client. It performs OIDC login in a real
@@ -153,6 +160,25 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body io.Re
 	return req, nil
 }
 
+// login runs whichever login mechanism the Config chose. By default it
+// drives chromedp through the OIDC flow; tests can override with
+// Config.LoginFunc to skip the real browser.
+func (c *Client) login(ctx context.Context) ([]*http.Cookie, error) {
+	if c.cfg.LoginFunc != nil {
+		return c.cfg.LoginFunc(ctx)
+	}
+	return loginViaBrowser(ctx, browserLoginConfig{
+		BaseURL:  c.cfg.BaseURL,
+		Username: c.cfg.Username,
+		Password: c.cfg.Password,
+		Headless: c.cfg.HeadlessLogin,
+		Timeout:  c.cfg.LoginTimeout,
+		// Deliberately no UserAgent — chromium uses its native Chrome UA, so
+		// Plus4U / reCAPTCHA bot heuristics see a real-looking browser.
+		// defaultUserAgent stays on the net/http client for non-browser requests.
+	})
+}
+
 // buildHTTPClient returns the *http.Client New should use. If the caller
 // provided one, we honor it and only fill in a fresh cookie jar when none
 // was supplied. If they didn't, we build the whole thing with a 20s timeout
@@ -243,16 +269,7 @@ func (c *Client) ensureLoggedIn(ctx context.Context) error {
 		log.Printf("[client] cached session invalid (%v); falling back to fresh login", warmupErr)
 	}
 
-	cookies, err := loginViaBrowser(ctx, browserLoginConfig{
-		BaseURL:  c.cfg.BaseURL,
-		Username: c.cfg.Username,
-		Password: c.cfg.Password,
-		Headless: c.cfg.HeadlessLogin,
-		Timeout:  c.cfg.LoginTimeout,
-		// Deliberately no UserAgent — chromium uses its native Chrome UA, so
-		// Plus4U / reCAPTCHA bot heuristics see a real-looking browser.
-		// defaultUserAgent stays on the net/http client for non-browser requests.
-	})
+	cookies, err := c.login(ctx)
 	if err != nil {
 		return fmt.Errorf("oidc login: %w", err)
 	}

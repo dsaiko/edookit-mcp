@@ -203,12 +203,15 @@ func runTestMessages(cli *client.Client) {
 	if err != nil {
 		log.Fatalf("list inbox: %v", err)
 	}
-	for _, m := range inbox {
+	for _, m := range inbox.Messages {
 		log.Printf("  [%s] %s | %s | %q | attachments=%d",
 			m.ID, m.Date, m.Sender, m.Subject, m.Attachments)
 		if m.BodyPreview != "" {
 			log.Printf("    %s", m.BodyPreview)
 		}
+	}
+	for _, w := range inbox.ParseWarnings {
+		log.Printf("  [parse-warning] %s", w)
 	}
 
 	log.Printf("=== SENT (3 most recent) ===")
@@ -216,12 +219,15 @@ func runTestMessages(cli *client.Client) {
 	if err != nil {
 		log.Fatalf("list sent: %v", err)
 	}
-	for _, m := range sent {
+	for _, m := range sent.Messages {
 		log.Printf("  [%s] %s | %s | %q | attachments=%d",
 			m.ID, m.Date, m.Status, m.Subject, m.Attachments)
 		if m.BodyPreview != "" {
 			log.Printf("    %s", m.BodyPreview)
 		}
+	}
+	for _, w := range sent.ParseWarnings {
+		log.Printf("  [parse-warning] %s", w)
 	}
 
 	log.Printf("=== INBOX UNREAD ===")
@@ -229,8 +235,8 @@ func runTestMessages(cli *client.Client) {
 	if err != nil {
 		log.Fatalf("list unread: %v", err)
 	}
-	log.Printf("%d unread message(s)", len(unread))
-	for _, m := range unread {
+	log.Printf("%d unread message(s)", len(unread.Messages))
+	for _, m := range unread.Messages {
 		log.Printf("  [%s] %s | %s | %q", m.ID, m.Date, m.Sender, m.Subject)
 	}
 }
