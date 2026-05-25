@@ -11,6 +11,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -658,6 +659,21 @@ func (c *Client) getTo(ctx context.Context, path string, dst io.Writer, retry bo
 
 	if resp.StatusCode >= 400 {
 		return 0, fmt.Errorf("GET %s: HTTP %d", path, resp.StatusCode)
+	}
+
+	// Session-expiry without off-origin bounce: Edookit can answer a binary
+	// download URL with HTTP 200 + a text/html login page when cookies are
+	// stale (instead of redirecting away from the host). Without this check
+	// we would happily stream the login HTML into the destination file. No
+	// legitimate Edookit download (PDF / DOCX / image / etc.) reports
+	// Content-Type: text/html, so treating an HTML response on this code
+	// path as session expiry is safe.
+	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(strings.ToLower(ct), "text/html") {
+		if !retry {
+			return 0, fmt.Errorf("GET %s: server returned text/html (likely login page) — re-login failed", path)
+		}
+		c.invalidateSession()
+		return c.getTo(ctx, path, dst, false)
 	}
 
 	return io.Copy(dst, resp.Body)

@@ -254,8 +254,10 @@ func registerDownloadAttachmentsTool(s *server.MCPServer, cli *client.Client) {
 					"is portable across operating systems (/tmp/... on Linux/macOS, "+
 					"%TMP%\\... on Windows) and gets garbage-collected by the OS. Pass an "+
 					"explicit path for persistent storage (e.g. ~/Downloads/edookit/, where "+
-					"a leading ~ is expanded to the user's home dir). The directory is "+
-					"created if missing."),
+					"a leading ~ is expanded to the user's home dir). Must be either "+
+					"absolute or start with ~/ — relative paths are rejected because the "+
+					"MCP server's cwd is whatever started the host application and not a "+
+					"stable anchor. The directory is created if missing."),
 			),
 			mcp.WithBoolean("overwrite",
 				mcp.Description("If true, existing files at the destination are overwritten. "+

@@ -113,6 +113,22 @@ func TestResolveDestDir_AbsolutePathPassedThrough(t *testing.T) {
 	}
 }
 
+func TestResolveDestDir_RelativePathRejected(t *testing.T) {
+	t.Parallel()
+	// MCP server's cwd is unpredictable (whatever started the host app),
+	// so accepting relative paths would land files in surprising places.
+	cases := []string{"Downloads", "./foo", "foo/bar"}
+	for _, raw := range cases {
+		_, err := resolveDestDir(raw, "m-1")
+		if err == nil {
+			t.Errorf("resolveDestDir(%q) returned nil error; want a clear rejection", raw)
+		}
+		if err != nil && !strings.Contains(err.Error(), "absolute") {
+			t.Errorf("resolveDestDir(%q) error %q should mention absolute requirement", raw, err.Error())
+		}
+	}
+}
+
 // ---------- DownloadAttachments end-to-end ----------
 
 func TestDownloadAttachments_HappyPath(t *testing.T) {
@@ -409,3 +425,147 @@ func TestDownloadAttachments_DateInRFC3339(t *testing.T) {
 
 // Used elsewhere to silence the linter about unused variables in fixtures.
 var _ = strconv.Itoa
+
+func TestDownloadAttachments_EmptyURLReportedPerFile(t *testing.T) {
+	t.Parallel()
+	// An attachment with no Link must not silently resolve to baseURL and
+	// save the landing page as the file. The other attachments in the
+	// same call must continue normally.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	mux.HandleFunc("/handler/download/file-good", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("good"))
+	})
+	var msgJSON []byte
+	mux.HandleFunc("/handler/page/message-edit", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(msgJSON)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	msgJSON = buildMessageEditJSON(t, 1, []messageEditAttachment{
+		{ID: "1@a", Name: "good.txt", Link: srv.URL + "/handler/download/file-good"},
+		{ID: "1@b", Name: "ghost.txt", Link: ""},
+		{ID: "1@c", Name: "blank.txt", Link: "   "},
+	})
+	cli := buildClient(t, srv)
+	destDir := t.TempDir()
+
+	res, err := DownloadAttachments(context.Background(), cli, "m-1", DownloadOptions{DestDir: destDir})
+	if err != nil {
+		t.Fatalf("DownloadAttachments: %v", err)
+	}
+	if len(res.Files) != 3 {
+		t.Fatalf("Files = %d, want 3", len(res.Files))
+	}
+	for _, f := range res.Files {
+		switch f.Name {
+		case "good.txt":
+			if f.Error != "" {
+				t.Errorf("good entry has error: %s", f.Error)
+			}
+		case "ghost.txt", "blank.txt":
+			if f.Error == "" {
+				t.Errorf("%s should have errored on empty URL", f.Name)
+			}
+			if _, err := os.Stat(filepath.Join(destDir, f.Name)); err == nil {
+				t.Errorf("%s should not have been created on disk", f.Name)
+			}
+		}
+	}
+}
+
+func TestDownloadAttachments_DuplicateFilenamesGetSuffixed(t *testing.T) {
+	t.Parallel()
+	// Two attachments share the same Edookit-supplied name. We want both
+	// files written to disk — second one gets a "-2" suffix so neither
+	// collides nor is swallowed by skip-if-exists.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	mux.HandleFunc("/handler/download/file-1", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("first payload"))
+	})
+	mux.HandleFunc("/handler/download/file-2", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("second payload"))
+	})
+	var msgJSON []byte
+	mux.HandleFunc("/handler/page/message-edit", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(msgJSON)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	msgJSON = buildMessageEditJSON(t, 1, []messageEditAttachment{
+		{ID: "1@a", Name: "report.pdf", Link: srv.URL + "/handler/download/file-1"},
+		{ID: "1@b", Name: "report.pdf", Link: srv.URL + "/handler/download/file-2"},
+	})
+	cli := buildClient(t, srv)
+	destDir := t.TempDir()
+
+	res, err := DownloadAttachments(context.Background(), cli, "m-1", DownloadOptions{DestDir: destDir})
+	if err != nil {
+		t.Fatalf("DownloadAttachments: %v", err)
+	}
+	if len(res.Files) != 2 {
+		t.Fatalf("Files = %d, want 2", len(res.Files))
+	}
+	// Name (display) stays "report.pdf" for both; Path is disambiguated.
+	if res.Files[0].Name != "report.pdf" || res.Files[1].Name != "report.pdf" {
+		t.Errorf("Names = %q / %q, want both report.pdf", res.Files[0].Name, res.Files[1].Name)
+	}
+	if filepath.Base(res.Files[0].Path) == filepath.Base(res.Files[1].Path) {
+		t.Errorf("Paths collide: both %q — second attachment should have been suffixed", res.Files[0].Path)
+	}
+	if filepath.Base(res.Files[1].Path) != "report-2.pdf" {
+		t.Errorf("second path = %q, want filename report-2.pdf", res.Files[1].Path)
+	}
+	// Both files should exist with their distinct contents.
+	a, _ := os.ReadFile(res.Files[0].Path)
+	b, _ := os.ReadFile(res.Files[1].Path)
+	if string(a) != "first payload" || string(b) != "second payload" {
+		t.Errorf("contents mismatch: %q / %q", a, b)
+	}
+}
+
+func TestDownloadAttachments_SessionExpiryDetectedOnHTMLResponse(t *testing.T) {
+	t.Parallel()
+	// Edookit can answer a binary download URL with HTTP 200 + an HTML
+	// login page when the session expires (no off-origin redirect). Without
+	// the Content-Type check in GetTo we would happily stream the login
+	// HTML into the destination file. Here the test server returns HTML
+	// for the download endpoint; we expect the per-file error to mention
+	// the html / re-login condition and the file to NOT be created.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	mux.HandleFunc("/handler/download/file-html", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte("<html><body>please log in</body></html>"))
+	})
+	var msgJSON []byte
+	mux.HandleFunc("/handler/page/message-edit", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(msgJSON)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	msgJSON = buildMessageEditJSON(t, 1, []messageEditAttachment{
+		{ID: "1@h", Name: "doc.pdf", Link: srv.URL + "/handler/download/file-html"},
+	})
+	cli := buildClient(t, srv)
+	destDir := t.TempDir()
+
+	res, err := DownloadAttachments(context.Background(), cli, "m-1", DownloadOptions{DestDir: destDir})
+	if err != nil {
+		t.Fatalf("DownloadAttachments: %v", err)
+	}
+	if len(res.Files) != 1 {
+		t.Fatalf("Files = %d, want 1", len(res.Files))
+	}
+	if res.Files[0].Error == "" {
+		t.Fatalf("expected per-file error for HTML response; got none")
+	}
+	if !strings.Contains(strings.ToLower(res.Files[0].Error), "html") &&
+		!strings.Contains(strings.ToLower(res.Files[0].Error), "re-login") {
+		t.Errorf("error %q should mention html / re-login", res.Files[0].Error)
+	}
+	if _, err := os.Stat(res.Files[0].Path); err == nil {
+		t.Errorf("file at %s should not have been created", res.Files[0].Path)
+	}
+}

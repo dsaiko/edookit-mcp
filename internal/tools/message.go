@@ -112,8 +112,10 @@ type messageEditWorkspaceComponent struct {
 // messageEditWorkspaceData has two shapes depending on which DOMTarget
 // owns the component. The form-message panel carries __form_panel_main;
 // the fileviewer panel carries data (a nested array of attachments).
-// Both fields are pointers so a missing one decodes as nil instead of an
-// empty slice we can't distinguish from "field absent".
+// Either field can legitimately be absent (one for each DOMTarget) and
+// JSON-unmarshal leaves the missing one nil — only the parseFullMessage
+// dispatch reads the field appropriate to its component, so the other
+// staying nil is fine.
 type messageEditWorkspaceData struct {
 	FormPanelMain []messageEditPanel      `json:"__form_panel_main,omitempty"`
 	Data          []messageEditAttachment `json:"data,omitempty"`
@@ -150,17 +152,7 @@ func parseFullMessage(num int, raw *messageEditResponse, loc *time.Location) (*F
 		return nil, errors.New("server reported authenticated=false")
 	}
 
-	var form *messageEditWorkspaceComponent
-	var fileviewer *messageEditWorkspaceComponent
-	for i := range raw.Components.Workspace {
-		w := &raw.Components.Workspace[i]
-		switch w.DOMTarget {
-		case domTargetFormMessage:
-			form = w
-		case domTargetFileviewer:
-			fileviewer = w
-		}
-	}
+	form, fileviewer := pickFormAndFileviewer(raw.Components.Workspace)
 	if form == nil {
 		return nil, fmt.Errorf("message-edit response has no __lc_Form_Message workspace component (got %d components)", len(raw.Components.Workspace))
 	}
@@ -170,19 +162,56 @@ func parseFullMessage(num int, raw *messageEditResponse, loc *time.Location) (*F
 		Number:      num,
 		Attachments: []Attachment{}, // never null in JSON output, even when empty
 	}
+	populateMessageFields(msg, form.Data.FormPanelMain, loc)
 
-	subject, _ := findFormItem(form.Data.FormPanelMain, "name")
-	if subject != nil {
+	// Schema-drift guard: if Edookit renames or removes both "name" and
+	// "description__editor" items, parseFullMessage would otherwise return
+	// a successful FullMessage with empty subject AND empty body — which
+	// downstream presents as "this message has nothing in it". Loud
+	// failure here matches the row-parser's policy (see fetchAndParse:
+	// rows-fetched-but-none-parsed becomes an error) so schema drift
+	// gets flagged as drift, not as "the message is empty".
+	if msg.Subject == "" && msg.BodyText == "" && msg.BodyHTML == "" {
+		return nil, fmt.Errorf("message %d: parsed message has empty subject AND empty body — Edookit form schema may have drifted (expected items 'name' and 'description__editor' in __form_panel_main)", num)
+	}
+
+	if fileviewer != nil {
+		msg.Attachments = collectAttachments(fileviewer.Data.Data, loc)
+	}
+
+	return msg, nil
+}
+
+// pickFormAndFileviewer scans the workspace array once and returns the
+// two components parseFullMessage needs (form + attachments). Either may
+// be nil — only form is required; missing fileviewer just means "no
+// attachments". Both can also be present but in unexpected order, which
+// is why we scan rather than indexing.
+func pickFormAndFileviewer(workspace []messageEditWorkspaceComponent) (form, fileviewer *messageEditWorkspaceComponent) {
+	for i := range workspace {
+		w := &workspace[i]
+		switch w.DOMTarget {
+		case domTargetFormMessage:
+			form = w
+		case domTargetFileviewer:
+			fileviewer = w
+		}
+	}
+	return form, fileviewer
+}
+
+// populateMessageFields extracts subject / status / author / date / body
+// from the form panels and assigns them onto msg. Items that don't appear
+// leave the corresponding field at its zero value — the schema-drift
+// guard in parseFullMessage decides whether that's tolerable.
+func populateMessageFields(msg *FullMessage, panels []messageEditPanel, loc *time.Location) {
+	if subject, _ := findFormItem(panels, "name"); subject != nil {
 		msg.Subject = strings.TrimSpace(asString(subject.Val))
 	}
-
-	statusItem, _ := findFormItem(form.Data.FormPanelMain, "object_status")
-	if statusItem != nil {
+	if statusItem, _ := findFormItem(panels, "object_status"); statusItem != nil {
 		msg.Status, msg.Author, msg.Date = parseStatusHTML(asString(statusItem.Val), loc)
 	}
-
-	bodyItem, _ := findFormItem(form.Data.FormPanelMain, "description__editor")
-	if bodyItem != nil {
+	if bodyItem, _ := findFormItem(panels, "description__editor"); bodyItem != nil {
 		// Prefer readValue (single-escaped HTML, ready to render). The .val
 		// field carries the form-submit form which double-escapes entities.
 		msg.BodyHTML = bodyItem.ReadValue
@@ -191,22 +220,25 @@ func parseFullMessage(num int, raw *messageEditResponse, loc *time.Location) (*F
 		}
 		msg.BodyText = htmlToText(msg.BodyHTML)
 	}
+}
 
-	if fileviewer != nil {
-		for _, a := range fileviewer.Data.Data {
-			if a.Trashed {
-				continue // server is hinting "this used to be attached, ignore"
-			}
-			msg.Attachments = append(msg.Attachments, Attachment{
-				ID:   a.ID,
-				Name: a.Name,
-				URL:  a.Link,
-				Date: unixToRFC3339(a.Date, loc),
-			})
+// collectAttachments filters out trashed entries and converts each
+// remaining messageEditAttachment to the public Attachment shape (unix
+// timestamp rendered as RFC3339 in loc).
+func collectAttachments(raw []messageEditAttachment, loc *time.Location) []Attachment {
+	out := make([]Attachment, 0, len(raw))
+	for _, a := range raw {
+		if a.Trashed {
+			continue // server is hinting "this used to be attached, ignore"
 		}
+		out = append(out, Attachment{
+			ID:   a.ID,
+			Name: a.Name,
+			URL:  a.Link,
+			Date: unixToRFC3339(a.Date, loc),
+		})
 	}
-
-	return msg, nil
+	return out
 }
 
 // findFormItem walks the labeled and unlabeled panels of __form_panel_main

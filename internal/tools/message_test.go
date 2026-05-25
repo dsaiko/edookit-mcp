@@ -206,6 +206,64 @@ func TestParseFullMessage_MissingFormComponentErrs(t *testing.T) {
 	}
 }
 
+func TestParseFullMessage_ErrorsWhenSubjectAndBodyBothMissing(t *testing.T) {
+	t.Parallel()
+	// Form panel present but the item names that carry subject and body
+	// have vanished (Edookit renamed them). parseFullMessage must fail
+	// loudly so schema drift doesn't masquerade as "the message is empty".
+	resp := messageEditResponse{
+		Authenticated: boolPtr(true),
+		Components: messageEditComponents{
+			Workspace: []messageEditWorkspaceComponent{{
+				DOMTarget: domTargetFormMessage,
+				Data: messageEditWorkspaceData{
+					FormPanelMain: []messageEditPanel{
+						// only object_status survives — name and description__editor are gone
+						{Label: "Stav:", Items: []messageEditPanelItem{{
+							Name: "object_status", Type: "html",
+							Val: `<span style="color:#77bb00">Publikováno</span>`,
+						}}},
+					},
+				},
+			}},
+		},
+	}
+	_, err := parseFullMessage(1, &resp, testTZ)
+	if err == nil {
+		t.Fatal("expected error when both subject and body are missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "schema") && !strings.Contains(err.Error(), "drifted") {
+		t.Errorf("error %q should hint at schema drift", err.Error())
+	}
+}
+
+func TestParseFullMessage_SubjectOnlyIsAccepted(t *testing.T) {
+	t.Parallel()
+	// As long as subject OR body is present, the message is considered
+	// parseable — empty body is a legitimate "drág & drop attachment only"
+	// message Edookit users sometimes send.
+	resp := messageEditResponse{
+		Authenticated: boolPtr(true),
+		Components: messageEditComponents{
+			Workspace: []messageEditWorkspaceComponent{{
+				DOMTarget: domTargetFormMessage,
+				Data: messageEditWorkspaceData{
+					FormPanelMain: []messageEditPanel{
+						{Label: "Předmět:", Items: []messageEditPanelItem{{Name: "name", Type: "text", Val: "Subject only"}}},
+					},
+				},
+			}},
+		},
+	}
+	msg, err := parseFullMessage(1, &resp, testTZ)
+	if err != nil {
+		t.Fatalf("expected success for subject-only message: %v", err)
+	}
+	if msg.Subject != "Subject only" {
+		t.Errorf("subject = %q", msg.Subject)
+	}
+}
+
 func TestParseFullMessage_AttachmentsEmptyArrayNotNull(t *testing.T) {
 	t.Parallel()
 	// Even without an attachments component, the JSON output must carry
