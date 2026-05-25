@@ -85,6 +85,7 @@ Vytvořte soubor `.env` podle šablony:
 
 ```bash
 cp .env.example .env
+chmod 600 .env       # ať heslo není čitelné pro ostatní uživatele systému
 $EDITOR .env
 ```
 
@@ -143,7 +144,7 @@ Každý nástroj vrací JSON s polem `messages` (ID, datum, odesílatel u příj
 
 ### Bezpečnost a soukromí
 
-- **Heslo** je uloženo v souboru `.env` (s běžnými právy 0600). Pokud používáte FileVault (zapnutý standardně na novějších Macích), je to dostačující ochrana proti odcizenému disku.
+- **Heslo** je uloženo v souboru `.env`. Doporučená oprávnění jsou `0600` — to nastaví krok `chmod 600 .env` v sekci Konfigurace výše (běžné umask `022` by jinak vyrobilo `0644`, tj. soubor čitelný pro ostatní uživatele systému). Pokud používáte FileVault (zapnutý standardně na novějších Macích), je to dostačující ochrana proti odcizenému disku.
 - **Cookies** jsou v uživatelské cache (cesta výše) s právy 0600. Na macOS jsou vyloučeny ze zálohy Time Machine / iCloud — patří totiž do systémové cache. Více v sekci [otázek o šifrování](#proč-nejsou-cookies-šifrované) níže.
 - **Žádné externí servery** — komunikace probíhá pouze mezi vaším počítačem, Edookitem a Plus4U. Žádný telemetrický kanál, žádné cloudové úložiště. Vstupní data od Claudea zpracovává model Anthropic dle [jeho privacy policy](https://www.anthropic.com/privacy).
 
@@ -205,7 +206,7 @@ The Edookit SPA is a thin wrapper over `/handler/page/X` (page descriptors) and 
 - `/handler/grid/objects-for-me-data?object_type_general=object_type_message&object_filter=inbox&page=N` → 100 rows per page. Each row is `[uid, uid, html]` where the HTML blob carries date, sender, subject, attachments count, and body preview.
 - `/handler/grid/created-objects-data?object_type_general=object_type_message&page=N` → same shape, sent messages, but the leading `<span>` holds the publication status instead of the sender.
 
-The package `internal/tools` parses each row's HTML with goquery, extracts structured fields, and returns `[]Message`. Pagination, optional fulltext (`?fulltext=`), and a client-side `since` date floor are all implemented in `fetchAndParse`.
+The package `internal/tools` parses each row's HTML with goquery, extracts structured fields, and returns `ListResult` — a JSON object with `messages` (the parsed rows) and optional `parse_warnings` (one entry per row the server returned that we couldn't parse). When the server returned rows but every one failed to parse, `fetchAndParse` returns an error rather than a silent empty `messages` array. Pagination, optional fulltext (`?fulltext=`), and a client-side `since` date floor are all implemented in `fetchAndParse`.
 
 ### Project layout
 
@@ -216,7 +217,7 @@ The package `internal/tools` parses each row's HTML with goquery, extracts struc
 | `internal/client/login_chromedp.go` | OIDC login via chromedp (Plus4U landing page → fetch interception → form submission → callback) |
 | `internal/client/cookie_store.go` | On-disk cookie persistence (`~/Library/Caches/edookit-mcp/cookies.json`) |
 | `internal/tools/messages.go` | `ListInbox` / `ListSent`, HTML row parsing |
-| `internal/tools/*_test.go` | Unit + integration tests (91.9% coverage) |
+| `internal/tools/*_test.go` | Unit + integration tests (~90% coverage on `internal/tools`; ~42% on `internal/client`, excluding the chromedp login path) |
 | `.goreleaser.yaml` | Cross-platform build matrix + Homebrew formula config |
 | `.github/workflows/ci.yml` | Runs lint / vet / `go test -race` / govulncheck on every push to `main`/`develop` and on every PR |
 | `.github/workflows/release.yml` | Runs the same checks as a gate, then GoReleaser, on `v*` tag push |

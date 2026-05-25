@@ -247,6 +247,9 @@ func runTestMessages(cli *client.Client) {
 	for _, m := range unread.Messages {
 		log.Printf("  [%s] %s | %s | %q", m.ID, m.Date, m.Sender, m.Subject)
 	}
+	for _, w := range unread.ParseWarnings {
+		log.Printf("  [parse-warning] %s", w)
+	}
 }
 
 // cookieCachePath returns the path where session cookies should be persisted:

@@ -40,6 +40,18 @@ const sentRowDigiHTML = `<small><span style="color:#77bb00">Publikováno</span>,
 // UTC keeps assertions stable regardless of where the test host happens to be.
 var testLoc = time.UTC
 
+// mustParseRowHTML wraps a row HTML blob in the same `<div>` envelope
+// parseRow uses before parsing, so tests of parseBodyPreview hand it a doc
+// structurally identical to what production code passes in.
+func mustParseRowHTML(t *testing.T, rowHTML string) *goquery.Document {
+	t.Helper()
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader("<div>" + rowHTML + "</div>"))
+	if err != nil {
+		t.Fatalf("parse row html: %v", err)
+	}
+	return doc
+}
+
 func TestParseRow_Inbox(t *testing.T) {
 	t.Parallel()
 
@@ -310,7 +322,7 @@ func TestParseBodyPreview(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := parseBodyPreview(tc.html)
+			got := parseBodyPreview(mustParseRowHTML(t, tc.html))
 			if tc.wantHas != "" && !strings.Contains(got, tc.wantHas) {
 				t.Errorf("got %q, want substring %q", got, tc.wantHas)
 			}
@@ -331,7 +343,7 @@ func TestParseBodyPreview_HTMLEntitiesDecoded(t *testing.T) {
 	// never have to special-case them.
 	html := `<small>...</small><div>...</div>Caf&eacute; with &amp; and &quot;quotes&quot;<br>`
 	want := `Café with & and "quotes"`
-	got := parseBodyPreview(html)
+	got := parseBodyPreview(mustParseRowHTML(t, html))
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -345,7 +357,7 @@ func TestParseBodyPreview_InlineTagsPreserveText(t *testing.T) {
 	// `<` after </div>, which dropped everything after.
 	html := `<small>...</small><div>...</div>plain <a href="x">linked</a> and <b>bold</b> text<br>`
 	want := `plain linked and bold text`
-	got := parseBodyPreview(html)
+	got := parseBodyPreview(mustParseRowHTML(t, html))
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -359,7 +371,7 @@ func TestParseBodyPreview_RuneAwareTruncation(t *testing.T) {
 	// exactly bodyPreviewMaxRunes + 1 ellipsis = 201 runes.
 	body := strings.Repeat("á", 250)
 	html := `<small>...</small><div>...</div>` + body + `<br>`
-	got := parseBodyPreview(html)
+	got := parseBodyPreview(mustParseRowHTML(t, html))
 
 	gotRunes := utf8.RuneCountInString(got)
 	wantRunes := bodyPreviewMaxRunes + 1 // +1 for the ellipsis suffix
@@ -381,7 +393,7 @@ func TestParseBodyPreview_StopsAtSecondBlockDiv(t *testing.T) {
 	// them, we should still stop at the second top-level <div> rather than
 	// pulling the toolbar's text into the preview.
 	html := `<small>...</small><div>subj</div>body here<div class="cleaner">&nbsp;</div><div>actions</div>`
-	got := parseBodyPreview(html)
+	got := parseBodyPreview(mustParseRowHTML(t, html))
 	if !strings.Contains(got, "body here") {
 		t.Errorf("got %q should contain 'body here'", got)
 	}

@@ -96,7 +96,6 @@ func TestNew_RejectsMissingFields(t *testing.T) {
 		name string
 		cfg  Config
 	}{
-		{name: "no BaseURL", cfg: Config{Username: "u", Password: "p"}},
 		{name: "no Username", cfg: Config{BaseURL: "https://x", Password: "p"}},
 		{name: "no Password", cfg: Config{BaseURL: "https://x", Username: "u"}},
 	}
@@ -112,8 +111,29 @@ func TestNew_RejectsMissingFields(t *testing.T) {
 
 func TestNew_RejectsBadBaseURL(t *testing.T) {
 	t.Parallel()
-	if _, err := New(Config{BaseURL: "://bad-url", Username: "u", Password: "p"}); err == nil {
-		t.Error("expected error for invalid BaseURL, got nil")
+	cases := []struct {
+		name    string
+		baseURL string
+		wantMsg string
+	}{
+		{name: "empty", baseURL: "", wantMsg: "required"},
+		{name: "parse error", baseURL: "://bad-url", wantMsg: "parse"},
+		{name: "schemeless host", baseURL: "school.edookit.net", wantMsg: "http or https"},
+		{name: "unsupported scheme", baseURL: "ftp://school.edookit.net", wantMsg: "http or https"},
+		{name: "hostless authority (port only)", baseURL: "https://:443", wantMsg: "no host"},
+		{name: "missing host with trailing slash", baseURL: "https:///foo", wantMsg: "no host"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := New(Config{BaseURL: tc.baseURL, Username: "u", Password: "p"})
+			if err == nil {
+				t.Fatalf("expected error for %q, got nil", tc.baseURL)
+			}
+			if !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Errorf("error %q should mention %q", err.Error(), tc.wantMsg)
+			}
+		})
 	}
 }
 

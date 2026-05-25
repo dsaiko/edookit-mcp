@@ -292,7 +292,7 @@ func parseRow(uid, rowHTML string, isSent bool, loc *time.Location) (Message, er
 	msg.Attachments = parseAttachmentCount(doc)
 
 	// Body preview: text node between the subject </div> and the first <br>.
-	msg.BodyPreview = parseBodyPreview(rowHTML)
+	msg.BodyPreview = parseBodyPreview(doc)
 
 	if len(missing) > 0 {
 		return msg, fmt.Errorf("row %s missing required field(s): %s", uid, strings.Join(missing, ", "))
@@ -326,17 +326,17 @@ func parseAttachmentCount(doc *goquery.Document) int {
 
 const bodyPreviewMaxRunes = 200
 
-// parseBodyPreview extracts the body preview text from a row's HTML. The
-// preview lives as content between the subject <div> and the first <br>
+// parseBodyPreview extracts the body preview text from a row's parsed DOM.
+// The preview lives as content between the subject <div> and the first <br>
 // separating it from the action toolbar. Walks the parsed DOM rather than
 // regex-matching: this preserves inline tags (<a>, <i>, <b>) in the body,
 // decodes HTML entities natively via the html parser, and truncates by rune
 // count so multi-byte UTF-8 (Czech diacritics) doesn't break mid-character.
-func parseBodyPreview(rowHTML string) string {
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader("<div>" + rowHTML + "</div>"))
-	if err != nil {
-		return ""
-	}
+//
+// Takes the *goquery.Document parseRow already built rather than reparsing
+// the raw HTML — with limit=200 and pagination, reparsing per row was
+// doubling the HTML parse cost.
+func parseBodyPreview(doc *goquery.Document) string {
 	root := doc.Find("body > div").First()
 	if root.Length() == 0 {
 		return ""

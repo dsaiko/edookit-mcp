@@ -57,7 +57,8 @@ func loadCookies(path, baseURL string) ([]*http.Cookie, time.Duration, error) {
 // 0600 permissions so the file is readable only by the owner. Parent dirs are
 // created on demand with 0700.
 func saveCookies(path, baseURL string, cookies []*http.Cookie) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create cookie dir: %w", err)
 	}
 	data, err := json.MarshalIndent(cookieFile{
@@ -68,9 +69,31 @@ func saveCookies(path, baseURL string, cookies []*http.Cookie) error {
 	if err != nil {
 		return fmt.Errorf("marshal cookies: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// Use os.CreateTemp for a unique name so two concurrent edookit-mcp
+	// processes can't clobber each other's in-flight write (which would
+	// produce a partial file under the destination path on rename).
+	f, err := os.CreateTemp(dir, "cookies-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp in %s: %w", dir, err)
+	}
+	tmp := f.Name()
+	// On any failure below we clean up the temp file so we don't accumulate
+	// orphans in the cache dir.
+	defer func() {
+		if tmp != "" {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("chmod %s: %w", tmp, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmp, err)
 	}
 	// os.Rename atomically replaces the destination on Unix and (since Go 1.5)
 	// on Windows via MoveFileEx(MOVEFILE_REPLACE_EXISTING). Older Windows or
@@ -80,17 +103,15 @@ func saveCookies(path, baseURL string, cookies []*http.Cookie) error {
 	// it away would leave the user worse off than just failing the save.
 	if err := os.Rename(tmp, path); err != nil {
 		if !errors.Is(err, fs.ErrExist) {
-			_ = os.Remove(tmp)
 			return fmt.Errorf("rename %s -> %s: %w", tmp, path, err)
 		}
 		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
-			_ = os.Remove(tmp)
 			return fmt.Errorf("rename %s -> %s (fallback remove failed: %w): %w", tmp, path, removeErr, err)
 		}
 		if err := os.Rename(tmp, path); err != nil {
-			_ = os.Remove(tmp)
 			return fmt.Errorf("rename %s -> %s (after fallback remove): %w", tmp, path, err)
 		}
 	}
+	tmp = "" // rename succeeded; the deferred cleanup must not delete the destination
 	return nil
 }

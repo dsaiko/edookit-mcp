@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -76,8 +77,60 @@ type Client struct {
 	http    *http.Client
 	baseURL *url.URL
 
+	// jar is the swappable wrapper held by c.http.Jar when we built the
+	// client ourselves (or filled in the jar on a caller-provided client).
+	// nil when the caller supplied an http.Client with their own jar — in
+	// that case invalidateSession falls back to best-effort cookie deletion
+	// markers, which only cover Path="/" cookies.
+	jar *swappableJar
+
 	mu       sync.Mutex
 	loggedIn bool
+}
+
+// swappableJar wraps an inner cookiejar.Jar behind an atomic.Pointer so the
+// whole jar can be replaced atomically by invalidateSession — concurrent
+// Cookies / SetCookies calls from c.http.Do in other goroutines see either
+// the old jar or the new one, never a torn state.
+//
+// Why a full swap rather than expiring individual cookies: cookiejar.Jar
+// only exposes cookies through Cookies(url), which is filtered by Path. Any
+// cookie scoped to a path other than "/" (e.g. Edookit could install a
+// /handler-scoped auth cookie) cannot be enumerated through that API, so
+// path-scoped credentials would survive a name-based clear and keep being
+// sent on subsequent requests after invalidateSession.
+type swappableJar struct {
+	inner atomic.Pointer[cookiejar.Jar]
+}
+
+func newSwappableJar() (*swappableJar, error) {
+	j, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	s := &swappableJar{}
+	s.inner.Store(j)
+	return s, nil
+}
+
+func (s *swappableJar) Cookies(u *url.URL) []*http.Cookie {
+	return s.inner.Load().Cookies(u)
+}
+
+func (s *swappableJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
+	s.inner.Load().SetCookies(u, cookies)
+}
+
+// reset replaces the inner jar with a fresh empty one. Any in-flight call
+// holding a reference to the previous inner via Load() continues to work
+// against the old jar (which becomes garbage once those calls return).
+func (s *swappableJar) reset() error {
+	j, err := cookiejar.New(nil)
+	if err != nil {
+		return err
+	}
+	s.inner.Store(j)
+	return nil
 }
 
 // New constructs a Client from the given config. It returns an error if
@@ -104,12 +157,12 @@ func New(cfg Config) (*Client, error) {
 		return nil, err
 	}
 
-	httpClient, err := buildHTTPClient(cfg.HTTPClient)
+	httpClient, jar, err := buildHTTPClient(cfg.HTTPClient)
 	if err != nil {
 		return nil, err
 	}
 
-	c := &Client{cfg: cfg, http: httpClient, baseURL: u}
+	c := &Client{cfg: cfg, http: httpClient, baseURL: u, jar: jar}
 
 	if cfg.CookieCachePath != "" {
 		c.preloadCookies()
@@ -133,7 +186,10 @@ func parseBaseURL(raw string) (*url.URL, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("BaseURL %q must use http or https scheme (e.g. https://your-school-login.edookit.net)", raw)
 	}
-	if u.Host == "" {
+	// u.Host != "" is not enough: an authority like ":443" leaves Host set
+	// to ":443" but Hostname() empty, which would fail much later when the
+	// HTTP transport tries to dial. Reject it here.
+	if u.Hostname() == "" {
 		return nil, fmt.Errorf("BaseURL %q has no host", raw)
 	}
 	return u, nil
@@ -218,26 +274,25 @@ func (c *Client) login(ctx context.Context) ([]*http.Cookie, error) {
 	})
 }
 
-// buildHTTPClient returns the *http.Client New should use. If the caller
-// provided one, we honor it and only fill in a fresh cookie jar when none
-// was supplied. If they didn't, we build the whole thing with a 20s timeout
-// and our own jar. Either way the returned client has a non-nil Jar.
-func buildHTTPClient(provided *http.Client) (*http.Client, error) {
-	if provided != nil {
-		if provided.Jar == nil {
-			jar, err := cookiejar.New(nil)
-			if err != nil {
-				return nil, fmt.Errorf("cookiejar: %w", err)
-			}
-			provided.Jar = jar
-		}
-		return provided, nil
+// buildHTTPClient returns the *http.Client New should use along with a
+// swappableJar handle when we control the jar (so invalidateSession can do
+// an atomic full-jar reset). A caller-provided client with its own Jar is
+// honored as-is and the returned swappableJar is nil — in that case
+// invalidateSession falls back to per-cookie deletion markers, which only
+// cover Path="/" cookies.
+func buildHTTPClient(provided *http.Client) (*http.Client, *swappableJar, error) {
+	if provided != nil && provided.Jar != nil {
+		return provided, nil, nil
 	}
-	jar, err := cookiejar.New(nil)
+	jar, err := newSwappableJar()
 	if err != nil {
-		return nil, fmt.Errorf("cookiejar: %w", err)
+		return nil, nil, fmt.Errorf("cookiejar: %w", err)
 	}
-	return &http.Client{Jar: jar, Timeout: 20 * time.Second}, nil
+	if provided != nil {
+		provided.Jar = jar
+		return provided, jar, nil
+	}
+	return &http.Client{Jar: jar, Timeout: 20 * time.Second}, jar, nil
 }
 
 // EnsureLoggedIn forces a login if we don't already have a session. Normally
@@ -342,22 +397,33 @@ func (c *Client) ensureLoggedIn(ctx context.Context) error {
 // tokens the backend has already invalidated, which would yield an infinite
 // no-op retry loop on authenticated=false responses.
 //
-// The jar itself is NOT swapped — concurrent tool calls in c.http.Do may be
-// reading from it via Jar.Cookies(), and reassigning c.http.Jar would race
-// with those reads. Instead we expire each cookie in place via SetCookies
-// with MaxAge=-1; cookiejar.Jar is documented as safe for concurrent access,
-// and a Set during a concurrent Get is properly serialized inside the jar.
+// When we control the jar (the common case) we swap the inner cookiejar via
+// swappableJar.reset(); concurrent c.http.Do calls reading the old inner
+// continue safely against the now-orphaned jar. When a caller supplied
+// their own jar we fall back to per-cookie deletion markers via
+// clearJarCookies — best effort, and known to miss cookies scoped to a path
+// other than "/".
 func (c *Client) invalidateSession() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.loggedIn = false
+	if c.jar != nil {
+		if err := c.jar.reset(); err != nil {
+			log.Printf("[client] swappable jar reset failed (%v); falling back to in-place clear", err)
+			c.clearJarCookies()
+		}
+		return
+	}
 	c.clearJarCookies()
 }
 
-// clearJarCookies expires every cookie the jar currently holds for baseURL.
-// Names are read from the jar (Jar.Cookies strips Domain/Path, but the
-// removal entry's Domain/Path are inferred from the URL we pass, which is
-// the same URL used to store them — so the removal IDs match).
+// clearJarCookies is the fallback invalidation path when we don't own the
+// jar. It expires every cookie the jar reports for baseURL by writing
+// deletion markers. Limitations: Jar.Cookies(c.baseURL) only returns
+// cookies whose Path matches "/", so any cookies scoped to a deeper path
+// won't be enumerated and won't be cleared. The hardcoded Path="/" on the
+// markers reflects that same limitation — there's no Set-Cookie response
+// header for us to learn other paths from.
 func (c *Client) clearJarCookies() {
 	existing := c.http.Jar.Cookies(c.baseURL)
 	if len(existing) == 0 {
