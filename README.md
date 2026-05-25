@@ -218,7 +218,8 @@ The package `internal/tools` parses each row's HTML with goquery, extracts struc
 | `internal/tools/messages.go` | `ListInbox` / `ListSent`, HTML row parsing |
 | `internal/tools/*_test.go` | Unit + integration tests (91.9% coverage) |
 | `.goreleaser.yaml` | Cross-platform build matrix + Homebrew formula config |
-| `.github/workflows/release.yml` | Triggers GoReleaser on `v*` tag push |
+| `.github/workflows/ci.yml` | Runs lint / vet / `go test -race` / govulncheck on every push to `main`/`develop` and on every PR |
+| `.github/workflows/release.yml` | Runs the same checks as a gate, then GoReleaser, on `v*` tag push |
 
 ### Dependencies
 
@@ -267,7 +268,11 @@ git tag -a v0.2.0 -m "Release v0.2.0"
 git push origin v0.2.0
 ```
 
-The [`release` workflow](.github/workflows/release.yml) then runs [GoReleaser](https://goreleaser.com/) (config in [`.goreleaser.yaml`](.goreleaser.yaml)), which:
+The [`release` workflow](.github/workflows/release.yml) runs in two jobs:
+
+**Job 1 — `check` (gate):** identical to the `ci` workflow — `go vet`, `golangci-lint run`, `go test -race`, `govulncheck`. If any step fails the release is aborted; no public artifact is ever produced from a tag that doesn't pass the same checks developers run locally.
+
+**Job 2 — `goreleaser`** (runs only after `check` succeeds, via `needs: check`): invokes [GoReleaser](https://goreleaser.com/) (config in [`.goreleaser.yaml`](.goreleaser.yaml)), which:
 
 1. Cross-compiles for `darwin/{amd64,arm64}`, `linux/{amd64,arm64}`, `windows/amd64`.
 2. Packages each binary into a `.tar.gz` (Unix) or `.zip` (Windows) along with `README.md`, `LICENSE`, and `.env.example`.

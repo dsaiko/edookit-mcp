@@ -9,7 +9,44 @@ permissions:
   contents: write
 
 jobs:
+  # Run the same checks as the `ci` workflow before publishing. A bad tag
+  # should never produce a public release: catch lint/test/vuln regressions
+  # here, exit non-zero, and the `goreleaser` job below will be skipped via
+  # its `needs:` dependency.
+  check:
+    name: pre-release checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules + tool deps
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        run: go tool golangci-lint run -v
+
+      - name: go test
+        run: go test -race -count=1 -cover -coverprofile=coverage.txt ./...
+
+      - name: govulncheck
+        run: go tool govulncheck ./...
+
   goreleaser:
+    needs: check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

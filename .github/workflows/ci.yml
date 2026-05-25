@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+
+# Permissions are read-only — CI never writes to the repo.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: lint, vet, test, vuln
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Full history isn't needed for CI, but a shallow clone (depth=1)
+          # is the default and what we want — keeps the runner fast.
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules + tool deps
+        run: go mod download
+
+      # `go vet` is a fast preflight — runs in ~1s and catches the obvious
+      # stuff before the heavier lint/test passes start.
+      - name: go vet
+        run: go vet ./...
+
+      # Same linter version as developers' make check (pinned in go.mod's
+      # `tool` directive). No `--fix` in CI — we want to fail on diffs, not
+      # silently rewrite them.
+      - name: golangci-lint
+        run: go tool golangci-lint run -v
+
+      # Race detector + coverage matching local `make test`.
+      - name: go test
+        run: go test -race -count=1 -cover -coverprofile=coverage.txt ./...
+
+      # govulncheck against current dependency tree.
+      - name: govulncheck
+        run: go tool govulncheck ./...
