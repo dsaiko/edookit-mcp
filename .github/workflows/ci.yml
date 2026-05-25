@@ -7,9 +7,13 @@ on:
       - develop
   pull_request:
 
-# Permissions are read-only — CI never writes to the repo.
+# contents stays read-only (CI never modifies the repo); pull-requests is
+# write so the coverage-comment step at the bottom can create/update its
+# sticky PR comment. On fork PRs GITHUB_TOKEN is read-only regardless of
+# what we declare here, so that step silently degrades to a no-op there.
 permissions:
   contents: read
+  pull-requests: write
 
 jobs:
   check:
@@ -43,10 +47,84 @@ jobs:
       - name: golangci-lint
         run: go tool golangci-lint run -v
 
-      # Race detector + coverage matching local `make test`.
+      # Race detector + coverage matching local `make test`. The output is
+      # tee'd to a file so the coverage-comment step below can extract the
+      # per-package "coverage: X% of statements" lines without re-running.
+      # set -o pipefail ensures the job fails on test failure despite the tee.
       - name: go test
-        run: go test -race -count=1 -cover -coverprofile=coverage.txt ./...
+        run: |
+          set -o pipefail
+          go test -race -count=1 -cover -coverprofile=coverage.txt ./... \
+            | tee test-output.txt
 
       # govulncheck against current dependency tree.
       - name: govulncheck
         run: go tool govulncheck ./...
+
+      # Coverage visibility on PRs (no gate — see commit history for the
+      # discussion of why "fail if coverage drops" is not a good fit here).
+      # Posts a sticky comment keyed on a hidden HTML marker so re-runs
+      # update the existing comment instead of stacking new ones.
+      - name: Post coverage comment on PR
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          marker='<!-- ci:coverage-report -->'
+
+          # Per-package rows from the captured `go test` output. Pattern
+          # "^ok ... coverage:" deliberately skips packages without tests
+          # (the bare main package prints "coverage: 0.0%" with no leading
+          # "ok" — listing it as 0% would be misleading noise).
+          module=$(go list -m)
+          rows=$(awk -v module="$module" '
+            /^ok[ \t]+.*coverage:/ {
+              pkg = $2
+              # Strip the module prefix for readability; "." for the root.
+              if (pkg == module) {
+                pkg = "."
+              } else if (index(pkg, module "/") == 1) {
+                pkg = substr(pkg, length(module) + 2)
+              }
+              for (i = 1; i <= NF; i++) {
+                if ($i == "coverage:") {
+                  printf "| `%s` | %s |\n", pkg, $(i+1)
+                  break
+                }
+              }
+            }
+          ' test-output.txt)
+
+          # Overall % across all instrumented statements (different from a
+          # simple average of the per-package numbers, which would weight a
+          # tiny package the same as a large one).
+          total=$(go tool cover -func=coverage.txt | awk '/^total:/ {print $NF}')
+
+          {
+            printf '%s\n' "$marker"
+            printf '## Test coverage\n\n'
+            printf '| Package | Coverage |\n'
+            printf '|---|---|\n'
+            printf '%s\n' "$rows"
+            printf '| **Total (statements)** | **%s** |\n\n' "$total"
+            printf '_Visibility only — merge is not gated on coverage. '
+            printf 'Commit `%s`._\n' "${GITHUB_SHA:0:7}"
+          } > coverage-comment.md
+
+          # Sticky comment: find any existing comment carrying our marker and
+          # PATCH it, otherwise POST a new one. Using --jq with startswith()
+          # rather than a full body match so we don't have to escape.
+          existing=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.body | startswith(\"${marker}\")) | .id" \
+            | head -n1)
+
+          if [ -n "$existing" ]; then
+            gh api "repos/${GH_REPO}/issues/comments/${existing}" \
+              -X PATCH -F body=@coverage-comment.md
+          else
+            gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+              -X POST -F body=@coverage-comment.md
+          fi
