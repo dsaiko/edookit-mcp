@@ -22,8 +22,18 @@ GOVULNCHECK_VERSION := v1.3.0
 build: format vet ## Build the binary into bin/
 	go build -o bin/$(BINARY) .
 
-run: ## Run the MCP server locally (expects MCP framing on stdin)
-	go run .
+run: ## Run the MCP server locally with .env loaded (expects MCP framing on stdin)
+	@if [ ! -f .env ]; then echo "missing .env — copy .env.example and fill in credentials"; exit 1; fi
+	@set -a; . ./.env; set +a; go run .
+
+smoke-login: ## Perform the OIDC login once and exit, printing captured cookies (set EDOOKIT_HEADLESS_LOGIN=false to watch)
+	@if [ ! -f .env ]; then echo "missing .env"; exit 1; fi
+	@set -a; . ./.env; set +a; go run . -login-test
+
+dump-html: ## Dump the rendered landing page HTML to stdout (for selector debugging)
+	@if [ ! -f .env ]; then echo "missing .env"; exit 1; fi
+	@set -a; . ./.env; set +a; go run . -dump-html > /tmp/edookit-landing.html
+	@echo "wrote /tmp/edookit-landing.html ($$(wc -c < /tmp/edookit-landing.html) bytes)"
 
 install: ## Install the binary into $GOBIN (or $GOPATH/bin)
 	go install .

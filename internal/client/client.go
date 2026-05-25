@@ -2,13 +2,13 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,21 +17,32 @@ import (
 
 const defaultUserAgent = "edookit-mcp/0.1 (+https://github.com/dsaiko/edookit-mcp)"
 
-// Config controls how Client authenticates against the target site.
+// Config controls how Client authenticates against Edookit.
+//
+// Edookit federates login through Plus4U OIDC (uuidentity.plus4u.net), which is
+// rendered by a JS SPA and protected by reCAPTCHA. There is no static form to
+// POST to, so authentication is performed in a real chromium instance via
+// chromedp; the resulting session cookie is then handed off to net/http for
+// all subsequent reads/writes.
 type Config struct {
-	BaseURL  string
-	Username string
+	BaseURL  string // e.g. https://ssst-login.edookit.net
+	Username string // Plus4U identity (email or login name)
 	Password string
 
-	LoginPath  string // e.g. "/login"
-	UserField  string // form field name for username, e.g. "username"
-	PassField  string // form field name for password, e.g. "password"
-	CSRFField  string // hidden input name on the login page, e.g. "_token"; empty if none
+	// HeadlessLogin controls whether the chromium instance used during login
+	// is invisible. Default is true; set to false to watch the flow during
+	// debugging (requires a desktop session).
+	HeadlessLogin bool
+
+	// LoginTimeout caps the entire login flow. Default 90s.
+	LoginTimeout time.Duration
+
 	HTTPClient *http.Client
 }
 
-// Client is a session-aware HTTP client that performs a form-based login on
-// demand and reuses the resulting cookie for subsequent requests.
+// Client is a session-aware HTTP client. It performs OIDC login in a real
+// browser on demand, captures the Edookit session cookie, and reuses it for
+// subsequent net/http requests.
 type Client struct {
 	cfg     Config
 	http    *http.Client
@@ -49,15 +60,6 @@ func New(cfg Config) (*Client, error) {
 	}
 	if cfg.Username == "" || cfg.Password == "" {
 		return nil, errors.New("username and password are required")
-	}
-	if cfg.LoginPath == "" {
-		cfg.LoginPath = "/login"
-	}
-	if cfg.UserField == "" {
-		cfg.UserField = "username"
-	}
-	if cfg.PassField == "" {
-		cfg.PassField = "password"
 	}
 
 	u, err := url.Parse(cfg.BaseURL)
@@ -102,8 +104,21 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body io.Re
 	return req, nil
 }
 
-// ensureLoggedIn performs a form login if we're not already authenticated.
-// Subsequent requests reuse the session cookie via the shared cookie jar.
+// EnsureLoggedIn forces a login if we don't already have a session. Normally
+// callers don't need this — GetDoc/GetJSON authenticate lazily. Exposed for
+// smoke tests and eager-login flows.
+func (c *Client) EnsureLoggedIn(ctx context.Context) error {
+	return c.ensureLoggedIn(ctx)
+}
+
+// SessionCookies returns the cookies currently held for the target host.
+// Intended for diagnostics; do not log these in production.
+func (c *Client) SessionCookies() []*http.Cookie {
+	return c.http.Jar.Cookies(c.baseURL)
+}
+
+// ensureLoggedIn runs the OIDC login in a real browser if we don't yet have a
+// session cookie. Subsequent calls are no-ops until invalidateSession is hit.
 func (c *Client) ensureLoggedIn(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -111,64 +126,21 @@ func (c *Client) ensureLoggedIn(ctx context.Context) error {
 		return nil
 	}
 
-	form := url.Values{}
-
-	if c.cfg.CSRFField != "" {
-		token, err := c.fetchCSRFToken(ctx)
-		if err != nil {
-			return fmt.Errorf("fetch csrf token: %w", err)
-		}
-		form.Set(c.cfg.CSRFField, token)
-	}
-
-	form.Set(c.cfg.UserField, c.cfg.Username)
-	form.Set(c.cfg.PassField, c.cfg.Password)
-
-	req, err := c.newRequest(ctx, http.MethodPost, c.cfg.LoginPath, strings.NewReader(form.Encode()))
+	cookies, err := loginViaBrowser(ctx, browserLoginConfig{
+		BaseURL:   c.cfg.BaseURL,
+		Username:  c.cfg.Username,
+		Password:  c.cfg.Password,
+		Headless:  c.cfg.HeadlessLogin,
+		Timeout:   c.cfg.LoginTimeout,
+		UserAgent: defaultUserAgent,
+	})
 	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("login request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, resp.Body)
-
-	// Heuristic: if we still landed on the login path after redirects, credentials were rejected.
-	if strings.TrimRight(resp.Request.URL.Path, "/") == strings.TrimRight(c.cfg.LoginPath, "/") {
-		return errors.New("login failed: still on login page after POST (check credentials, CSRF field name, or form field names)")
-	}
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("login failed: HTTP %d", resp.StatusCode)
+		return fmt.Errorf("oidc login: %w", err)
 	}
 
+	c.http.Jar.SetCookies(c.baseURL, cookies)
 	c.loggedIn = true
 	return nil
-}
-
-func (c *Client) fetchCSRFToken(ctx context.Context) (string, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, c.cfg.LoginPath, nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	val, ok := doc.Find(fmt.Sprintf(`input[name=%q]`, c.cfg.CSRFField)).Attr("value")
-	if !ok {
-		return "", fmt.Errorf("csrf field %q not found on login page", c.cfg.CSRFField)
-	}
-	return val, nil
 }
 
 // invalidateSession marks the session as logged out so the next call re-authenticates.
@@ -178,9 +150,58 @@ func (c *Client) invalidateSession() {
 	c.mu.Unlock()
 }
 
-// GetDoc fetches a path as a parsed HTML document, re-authenticating once if the session expired.
+// GetDoc fetches a path as a parsed HTML document, re-authenticating once if
+// the session expired (detected by the site bouncing us to the login host).
+//
+// Use GetJSON instead when calling Edookit's internal JSON APIs (the SPA's
+// XHR endpoints); GetDoc is reserved for the rare server-rendered HTML page.
 func (c *Client) GetDoc(ctx context.Context, path string) (*goquery.Document, error) {
 	return c.getDoc(ctx, path, true)
+}
+
+// GetJSON fetches a path and decodes the JSON response into out. out must be a
+// pointer to the value being populated (the same contract as json.Unmarshal).
+// Re-authenticates once on session expiry, same as GetDoc.
+func (c *Client) GetJSON(ctx context.Context, path string, out any) error {
+	return c.getJSON(ctx, path, out, true)
+}
+
+func (c *Client) getJSON(ctx context.Context, path string, out any, retry bool) error {
+	if err := c.ensureLoggedIn(ctx); err != nil {
+		return err
+	}
+
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	// Mark as XHR so the server returns JSON rather than the SPA loader page.
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Session expired: bounced off-host (to Plus4U identity).
+	if resp.Request.URL.Host != c.baseURL.Host {
+		if !retry {
+			return errors.New("session expired and re-login failed")
+		}
+		c.invalidateSession()
+		return c.getJSON(ctx, path, out, false)
+	}
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("GET %s: HTTP %d", path, resp.StatusCode)
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("decode JSON from %s: %w", path, err)
+	}
+	return nil
 }
 
 func (c *Client) getDoc(ctx context.Context, path string, retry bool) (*goquery.Document, error) {
@@ -198,8 +219,9 @@ func (c *Client) getDoc(ctx context.Context, path string, retry bool) (*goquery.
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Session expired: site bounced us back to the login page.
-	if strings.TrimRight(resp.Request.URL.Path, "/") == strings.TrimRight(c.cfg.LoginPath, "/") {
+	// Session expired: Edookit bounced us off-host (to Plus4U identity). When
+	// that happens, the response's final URL host differs from our base host.
+	if resp.Request.URL.Host != c.baseURL.Host {
 		if !retry {
 			return nil, errors.New("session expired and re-login failed")
 		}
