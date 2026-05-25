@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -263,8 +264,8 @@ func TestWarmupSession_OffHostBounceFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on off-host bounce, got nil")
 	}
-	if !strings.Contains(err.Error(), "bounced off-host") {
-		t.Errorf("error = %q, want it to mention off-host bounce", err.Error())
+	if !strings.Contains(err.Error(), "bounced off-origin") {
+		t.Errorf("error = %q, want it to mention off-origin bounce", err.Error())
 	}
 }
 
@@ -678,6 +679,42 @@ func TestConcurrentRequests_NoRaceUnderInvalidation(t *testing.T) {
 	close(stop)
 	wg.Wait()
 	// Reaching here without `go test -race` complaining is the assertion.
+}
+
+// ---------- sameOrigin ----------
+
+func TestSameOrigin(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{name: "identical", a: "https://x.test", b: "https://x.test", want: true},
+		{name: "default port stripped vs explicit", a: "https://x.test", b: "https://x.test:443", want: true},
+		{name: "http with :80 vs no port", a: "http://x.test:80", b: "http://x.test", want: true},
+		{name: "different scheme", a: "https://x.test", b: "http://x.test", want: false},
+		{name: "different hostname", a: "https://x.test", b: "https://y.test", want: false},
+		{name: "same host, different non-default ports", a: "https://x.test:8443", b: "https://x.test:9443", want: false},
+		{name: "non-default port vs default", a: "https://x.test:8443", b: "https://x.test", want: false},
+		{name: "ipv4 vs hostname even on loopback", a: "http://127.0.0.1:8000", b: "http://localhost:8000", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ua, err := url.Parse(tc.a)
+			if err != nil {
+				t.Fatalf("parse a: %v", err)
+			}
+			ub, err := url.Parse(tc.b)
+			if err != nil {
+				t.Fatalf("parse b: %v", err)
+			}
+			if got := sameOrigin(ua, ub); got != tc.want {
+				t.Errorf("sameOrigin(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
 }
 
 // ---------- retry on transient failures ----------

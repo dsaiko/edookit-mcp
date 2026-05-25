@@ -20,6 +20,11 @@ import (
 
 const defaultUserAgent = "edookit-mcp/0.1 (+https://github.com/dsaiko/edookit-mcp)"
 
+const (
+	schemeHTTP  = "http"
+	schemeHTTPS = "https"
+)
+
 // Config controls how Client authenticates against Edookit.
 //
 // Edookit federates login through Plus4U OIDC (uuidentity.plus4u.net), which is
@@ -203,7 +208,7 @@ func parseBaseURL(raw string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse base url: %w", err)
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
+	if u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS {
 		return nil, fmt.Errorf("BaseURL %q must use http or https scheme (e.g. https://your-school-login.edookit.net)", raw)
 	}
 	// u.Host != "" is not enough: an authority like ":443" leaves Host set
@@ -216,7 +221,7 @@ func parseBaseURL(raw string) (*url.URL, error) {
 	// downstream don't trip on a "https://school.test:443" baseURL vs a
 	// "https://school.test" redirect (both denote the same origin). Custom
 	// ports (:8443 etc.) are preserved verbatim.
-	if (u.Scheme == "http" && u.Port() == "80") || (u.Scheme == "https" && u.Port() == "443") {
+	if (u.Scheme == schemeHTTP && u.Port() == "80") || (u.Scheme == schemeHTTPS && u.Port() == "443") {
 		u.Host = u.Hostname()
 	}
 	return u, nil
@@ -289,8 +294,14 @@ func (c *Client) login(ctx context.Context) ([]*http.Cookie, error) {
 	if c.cfg.LoginFunc != nil {
 		return c.cfg.LoginFunc(ctx)
 	}
+	// Use the normalized baseURL string rather than the raw cfg value.
+	// loginViaBrowser's waitForHost step compares against the parsed
+	// host verbatim — if EDOOKIT_URL had an explicit ":443"/":80" the
+	// raw form would never match Chrome's canonical no-port redirects
+	// and login would time out. parseBaseURL already stripped the
+	// default port at construction.
 	return loginViaBrowser(ctx, browserLoginConfig{
-		BaseURL:  c.cfg.BaseURL,
+		BaseURL:  c.baseURL.String(),
 		Username: c.cfg.Username,
 		Password: c.cfg.Password,
 		Headless: c.cfg.HeadlessLogin,
@@ -394,6 +405,44 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 	return nil, fmt.Errorf("after %d attempt(s): %w", attempts, lastErr)
 }
 
+// sameOrigin reports whether two URLs share the same origin in the
+// browser sense: same scheme, same hostname, same effective port (with
+// http:80 / https:443 stripped to canonical form). Used to detect when
+// a request was bounced to a foreign origin (Plus4U after session
+// expiry, a different port on the same host, a different scheme, etc.) —
+// any of which should trigger re-login rather than be treated as a
+// successful authenticated response.
+//
+// Plain Hostname() comparison is too loose (treats school.test:8443 and
+// school.test:443 as the same site); raw Host comparison is too strict
+// (treats school.test:443 and school.test as different even though they
+// denote the same origin).
+func sameOrigin(a, b *url.URL) bool {
+	if a.Scheme != b.Scheme {
+		return false
+	}
+	if a.Hostname() != b.Hostname() {
+		return false
+	}
+	return effectivePort(a) == effectivePort(b)
+}
+
+// effectivePort returns the explicit port if set, otherwise the default
+// for the URL's scheme. Empty string for schemes other than http/https
+// (we never construct those in this client, but be defensive).
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch u.Scheme {
+	case schemeHTTP:
+		return "80"
+	case schemeHTTPS:
+		return "443"
+	}
+	return ""
+}
+
 // isTransientStatus reports whether an HTTP status code is one we expect
 // to succeed on retry — load-balancer / upstream timeouts and overload
 // signals. Deliberately excludes the rest of the 5xx range: HTTP 500 from
@@ -447,8 +496,8 @@ func (c *Client) warmupSession(ctx context.Context) error {
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body)
 
-	if resp.Request.URL.Hostname() != c.baseURL.Hostname() {
-		return fmt.Errorf("warmup bounced off-host to %s (session expired)", resp.Request.URL.Host)
+	if !sameOrigin(resp.Request.URL, c.baseURL) {
+		return fmt.Errorf("warmup bounced off-origin to %s (session expired)", resp.Request.URL.Host)
 	}
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("warmup got HTTP %d", resp.StatusCode)
@@ -595,10 +644,11 @@ func (c *Client) getJSON(ctx context.Context, path string, out any, retry bool) 
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Session expired: bounced off-host (to Plus4U identity). Compare
-	// hostnames (not URL.Host) so a redirect that drops or adds an
-	// explicit default port isn't mis-detected as off-host.
-	if resp.Request.URL.Hostname() != c.baseURL.Hostname() {
+	// Session expired: bounced off-origin (typically Plus4U identity).
+	// sameOrigin treats default-port differences as equivalent but
+	// distinguishes same-host-different-port redirects, which would
+	// indicate a misrouted response and shouldn't be parsed as ours.
+	if !sameOrigin(resp.Request.URL, c.baseURL) {
 		if !retry {
 			return errors.New("session expired and re-login failed")
 		}
@@ -647,10 +697,10 @@ func (c *Client) getDoc(ctx context.Context, path string, retry bool) (*goquery.
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Session expired: Edookit bounced us off-host (to Plus4U identity).
-	// Hostname-only comparison so a redirect that drops or adds the default
-	// port isn't mis-detected as a bounce. See same check in getJSON.
-	if resp.Request.URL.Hostname() != c.baseURL.Hostname() {
+	// Session expired: bounced off-origin. See sameOrigin's comment for
+	// the scheme + hostname + effective-port comparison rationale and
+	// matching check in getJSON / warmupSession.
+	if !sameOrigin(resp.Request.URL, c.baseURL) {
 		if !retry {
 			return nil, errors.New("session expired and re-login failed")
 		}

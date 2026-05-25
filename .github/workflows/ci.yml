@@ -65,8 +65,12 @@ jobs:
       # discussion of why "fail if coverage drops" is not a good fit here).
       # Posts a sticky comment keyed on a hidden HTML marker so re-runs
       # update the existing comment instead of stacking new ones.
+      #
+      # Skipped on PRs from forks: GITHUB_TOKEN is read-only there, so the
+      # POST/PATCH below would 403 and (under `set -euo pipefail`) fail
+      # otherwise-green CI. Same-repo PRs only.
       - name: Post coverage comment on PR
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}

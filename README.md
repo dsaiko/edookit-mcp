@@ -144,8 +144,8 @@ Každý nástroj vrací JSON s polem `messages` (ID, datum, odesílatel u příj
 
 ### Bezpečnost a soukromí
 
-- **Heslo** je uloženo v souboru `.env`. Doporučená oprávnění jsou `0600` — to nastaví krok `chmod 600 .env` v sekci Konfigurace výše (běžné umask `022` by jinak vyrobilo `0644`, tj. soubor čitelný pro ostatní uživatele systému). Pokud používáte FileVault (zapnutý standardně na novějších Macích), je to dostačující ochrana proti odcizenému disku.
-- **Cookies** jsou v uživatelské cache (cesta výše) s právy 0600. Na macOS jsou vyloučeny ze zálohy Time Machine / iCloud — patří totiž do systémové cache. Více v sekci [otázek o šifrování](#proč-nejsou-cookies-šifrované) níže.
+- **Heslo** je uloženo v souboru `.env`. Na **macOS / Linuxu** doporučená oprávnění jsou `0600` — to nastaví krok `chmod 600 .env` v sekci Konfigurace výše (běžné umask `022` by jinak vyrobilo `0644`, tj. soubor čitelný pro ostatní uživatele systému). Pokud používáte FileVault (zapnutý standardně na novějších Macích), je to dostačující ochrana proti odcizenému disku. Na **Windows** POSIX bity nefungují stejně — soubor je chráněn primárně přes ACL vašeho uživatelského profilu (`%USERPROFILE%`); pro citlivý disk používejte BitLocker.
+- **Cookies** jsou v uživatelské cache (cesta výše). Na **macOS / Linuxu** se ukládají s oprávněními `0600` a na macOS jsou vyloučeny ze zálohy Time Machine / iCloud (patří do systémové cache). Na **Windows** Go neumí POSIX bity vynutit (`os.Chmod` je tam v podstatě no-op kromě read-only flagu) — ochranou je standardní ACL na `%LocalAppData%\edookit-mcp\`, který je čitelný jen pro vlastníka profilu. Více v sekci [otázek o šifrování](#proč-nejsou-cookies-šifrované) níže.
 - **Žádné externí servery** — komunikace probíhá pouze mezi vaším počítačem, Edookitem a Plus4U. Žádný telemetrický kanál, žádné cloudové úložiště. Vstupní data od Claudea zpracovává model Anthropic dle [jeho privacy policy](https://www.anthropic.com/privacy).
 
 #### Proč nejsou cookies šifrované?
