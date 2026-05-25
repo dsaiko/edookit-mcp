@@ -185,12 +185,14 @@ Po napojení by se v konverzaci měly objevit nástroje `edookit_list_inbox` a `
 
 ### Co umí (dostupné nástroje)
 
-K dispozici jsou dva nástroje:
+K dispozici jsou čtyři nástroje:
 
 | Nástroj | Co dělá |
 |---|---|
 | `edookit_list_inbox` | Vypíše zprávy z **Přijaté** (volitelně jen Nepřečtené, S hvězdičkou, Archiv, Vše). Podporuje fulltext a filtrování podle data. |
 | `edookit_list_sent` | Vypíše zprávy z **Vytvořené** (odeslané). Stejné filtry kromě "view". |
+| `edookit_get_message` | Stáhne **plný text** jedné konkrétní zprávy podle ID — to, co `list_*` vrací jen jako ~200znakový preview. Funguje pro přijaté i odeslané. Vrací subject, status, autora, datum, body_text (plain text), body_html (originál) a metadata všech příloh. |
+| `edookit_download_attachments` | **Stáhne všechny přílohy** jedné zprávy do lokálního adresáře. Funguje pro přijaté i odeslané. Defaultně ukládá do `<os-temp>/edookit-mcp/<id>/` (přenositelné napříč OS); explicitní cestu lze předat parametrem. |
 
 Nástroje **nevoláte přímo** — píšete Claudovi normálním jazykem a on sám rozhodne, kdy a s jakými parametry je použít. Níže jsou příklady promptů a co se pod nimi typicky děje.
 
@@ -218,11 +220,24 @@ Nástroje **nevoláte přímo** — píšete Claudovi normálním jazykem a on s
 
 → Claude předá `since="7d"`, `since="2026-05-01"` apod.
 
-**Zprávy s přílohou:**
+**Plný text jedné zprávy:**
+> *"Otevři mi tu zprávu od ředitele a přečti, co píše."*
+> *"Co přesně píše paní učitelka Nováková v té zprávě o exkurzi?"*
+
+→ Po vyhledání ID přes `edookit_list_inbox` zavolá Claude `edookit_get_message` s konkrétním ID a dostane plné tělo (`body_text` čistý text, `body_html` originál). Funguje stejně pro přijaté i odeslané.
+
+**Stažení příloh:**
+> *"Stáhni přílohy té zprávy ze školy."*
+> *"Ulož si to PDF od paní učitelky někam na disk."*
+> *"Stáhni přílohy do ~/Documents/skola/."*
+
+→ Claude zavolá `edookit_download_attachments` — defaultně uloží soubory do `<os-temp>/edookit-mcp/<message-id>/` (na macOS/Linuxu typicky `/tmp/...`, na Windows `%TMP%\...`). Pokud chcete jinam, zmiňte cílový adresář v promptu; Claude předá hodnotu jako parametr `destination_dir`. Návratová hodnota obsahuje konkrétní cesty k souborům.
+
+**Zprávy s přílohou (jen seznam, bez stahování):**
 > *"Která nepřečtená zpráva ze školy má přílohu?"*
 > *"Najdi mi v Edookitu PDF, co mi nedávno přišlo."*
 
-→ Claude vytáhne nepřečtené (`view=unread`) a pak vyfiltruje ty, které mají `attachments > 0`. Samotnou přílohu zatím konektor stáhnout neumí — vrátí jen informaci, že existuje a kolik jich je (otevřete je ručně v Edookitu nebo v notifikačním mailu).
+→ Claude vytáhne nepřečtené (`view=unread`) a vyfiltruje ty, které mají `attachments > 0`. Samotné soubory nestahuje, dokud si o to neřeknete — viz "Stažení příloh" výše.
 
 **Odeslané zprávy:**
 > *"Co jsem v poslední době někomu v Edookitu posílal?"*
@@ -239,6 +254,8 @@ Nástroje **nevoláte přímo** — píšete Claudovi normálním jazykem a on s
 
 Pokud chcete Claudovi pomoci přesně, můžete parametry zmínit explicitně ("za posledních 30 dní", "jen nepřečtené", "max 20 zpráv"). Akceptované hodnoty:
 
+**`edookit_list_inbox` / `edookit_list_sent`:**
+
 | Parametr | Hodnoty | Default |
 |---|---|---|
 | `view` (jen `edookit_list_inbox`) | `inbox` (Přijaté), `unread` (Nepřečtené), `starred` (S hvězdičkou), `archived` (Archiv), `all` (Vše) | `inbox` |
@@ -246,18 +263,49 @@ Pokud chcete Claudovi pomoci přesně, můžete parametry zmínit explicitně ("
 | `since` | relativní (`7d`, `1w`, `2m`, `1y`) nebo absolutní (`YYYY-MM-DD`, popř. RFC 3339) | bez omezení |
 | `limit` | 1–200 (interně se stránkuje po 100) | 50 |
 
+**`edookit_get_message`:**
+
+| Parametr | Hodnoty | Default |
+|---|---|---|
+| `id` (povinné) | `m-NNNNNN` nebo bare `NNNNNN` — ID zprávy z `list_inbox`/`list_sent` | — |
+
+**`edookit_download_attachments`:**
+
+| Parametr | Hodnoty | Default |
+|---|---|---|
+| `id` (povinné) | jako u `get_message` | — |
+| `destination_dir` | absolutní cesta nebo cesta začínající `~/` (rozvine se do home dir) | `<os-temp>/edookit-mcp/<id>/` (na macOS/Linuxu typicky `/tmp/...`, na Windows `%TMP%\...`) |
+| `overwrite` | `true` / `false` — má se existující soubor přepsat? | `false` (existující soubor se přeskočí) |
+
 #### Co dostanete zpět
 
-Každá zpráva v odpovědi obsahuje:
+**Z `edookit_list_inbox` / `edookit_list_sent`** — pole `messages`, kde každá položka má:
 
 - **`id`** + **`number`** — vnitřní identifikátor (`m-290491` / `290491`)
 - **`date`** — datum a čas (RFC 3339, podle časové zóny školy — default Europe/Prague, lze přebít přes `EDOOKIT_TIMEZONE`)
 - **`sender`** (v Přijatých) nebo **`status`** (v Odeslaných, např. „Publikováno")
 - **`subject`** — předmět zprávy v originálním jazyce (typicky česky)
-- **`body_preview`** — prvních ~200 znaků textu zprávy (vystačí na rychlý přehled, plný text Edookit posílá až po otevření konkrétní zprávy v UI)
-- **`attachments`** — počet příloh (samotné soubory se zatím nestahují)
+- **`body_preview`** — prvních ~200 znaků textu zprávy
+- **`attachments`** — **počet** příloh (jen číslo; pro samotné soubory použijte `edookit_download_attachments`)
 
 Vedle `messages` může přijít i `parse_warnings` — to jsou řádky, které Edookit vrátil v neočekávaném formátu (typicky když změnili layout). Když Claude něco takového dostane, většinou na to upozorní. Pokud parser selže úplně na všech řádcích, místo prázdného seznamu se vrátí chyba — jinak by Claude nemohl odlišit „schránka je prázdná" od „parser je rozbitý".
+
+**Z `edookit_get_message`** — jeden objekt:
+
+- **`id`** + **`number`** — stejné jako výše
+- **`subject`** — předmět
+- **`status`** — slovo z UI (typicky „Publikováno" / „Nepublikováno")
+- **`author`** — odesílatel u přijatých, publikující uživatel u odeslaných (typicky vy sami)
+- **`date`** — RFC 3339, pokud je v hlavičce zprávy parseable; jinak chybí
+- **`body_text`** — plain text těla (entity dekódované, tagy odstraněné, paragraf/`<br>` převedené na konce řádků)
+- **`body_html`** — originální HTML, jak ho Edookit posílá (užitečné, když chcete zachovat odkazy a formátování)
+- **`attachments`** — pole `{id, name, url, date}` — `url` je plně kvalifikovaná, ale download přes browser by vyžadoval přihlášenou session; pro spolehlivé stažení použijte `edookit_download_attachments`
+
+**Z `edookit_download_attachments`** — jeden objekt:
+
+- **`message_id`** — ID zprávy, ke které se to stáhlo
+- **`directory`** — absolutní cesta k výslednému adresáři
+- **`files`** — pole `{name, path, bytes, skipped?, error?}`. `path` je absolutní cesta k uloženému souboru; `bytes` je velikost. `skipped: true` znamená, že soubor už v adresáři existoval a nepřepisuje se (předejte `overwrite=true` pro vynucený přepis). `error: "..."` na jedné položce znamená, že **ta jedna příloha** selhala; ostatní pokračovaly — Claude obvykle shrne, co se stáhlo a co ne.
 
 ### Bezpečnost a soukromí
 
@@ -338,16 +386,37 @@ The Edookit SPA is a thin wrapper over `/handler/page/X` (page descriptors) and 
 
 The package `internal/tools` parses each row's HTML with goquery, extracts structured fields, and returns `ListResult` — a JSON object with `messages` (the parsed rows) and optional `parse_warnings` (one entry per row the server returned that we couldn't parse). When the server returned rows but every one failed to parse, `fetchAndParse` returns an error rather than a silent empty `messages` array. Pagination, optional fulltext (`?fulltext=`), and a client-side `since` date floor are all implemented in `fetchAndParse`.
 
+### Data flow for `edookit_get_message` / `edookit_download_attachments`
+
+Edookit serves the full message body and attachment list from a single shared endpoint:
+
+- `/handler/page/message-edit?__index=N` → JSON whose `components.workspace[]` array contains both the message form (`DOMTarget="__lc_Form_Message"`) and the attachment list (`DOMTarget="__lc_Fileviewer_Slave_datatemplate_message"`). The endpoint is the same for received and sent messages — only the embedded `object_status` HTML differs slightly (received messages carry an extra `Od DD.MM.YYYY HH:MM` inline date).
+
+The form panel exposes:
+
+- `__form_panel_main[*]` is an array of labeled sub-panels. The parser locates required fields by `items[].name`:
+  - `name` → `subject` (subject line, plain text)
+  - `object_status` → HTML carrying `status` word ("Publikováno" / "Nepublikováno"), `author` (bold-span text), and optionally a parseable `date` (`Od …` line on received messages)
+  - `description__editor` → `readValue` is the rendered body HTML; `val` carries the same content double-encoded for form-submit. We use `readValue`.
+
+The fileviewer panel exposes:
+
+- `data[]` array of `{id, name, link, date, trashed}`. Trashed entries are filtered out. `link` is a fully-qualified `https://<host>/handler/download/file<uuid>` URL that the authenticated session can GET directly.
+
+`GetMessage` (in `internal/tools/message.go`) does the JSON fetch + parse and returns a `FullMessage`. `DownloadAttachments` (in `internal/tools/attachments.go`) calls `GetMessage` then streams each attachment URL via `client.GetTo` into `<dest>/<filename>`. Path-traversal is neutralized by taking `filepath.Base` of the server-supplied name; existing files are skipped unless the caller passes `overwrite=true`; partial-write failures clean up the partial file. Per-attachment errors don't abort the loop — each attachment's outcome is captured in the result entry so a single broken file doesn't lose the rest.
+
 ### Project layout
 
 | Path | Purpose |
 |---|---|
 | `main.go` | Flag parsing, MCP server bootstrap, tool registration |
-| `internal/client/client.go` | Session-aware HTTP client (`GetJSON`, `GetDoc`, warmup, cookie cache) |
+| `internal/client/client.go` | Session-aware HTTP client (`GetJSON`, `GetDoc`, `GetTo` for binary downloads, warmup, cookie cache, retry on transient failures) |
 | `internal/client/login_chromedp.go` | OIDC login via chromedp (Plus4U landing page → fetch interception → form submission → callback) |
 | `internal/client/cookie_store.go` | On-disk cookie persistence (`~/Library/Caches/edookit-mcp/cookies.json`) |
-| `internal/tools/messages.go` | `ListInbox` / `ListSent`, HTML row parsing |
-| `internal/tools/*_test.go` | Unit + integration tests (~90% coverage on `internal/tools`; ~42% on `internal/client`, excluding the chromedp login path) |
+| `internal/tools/messages.go` | `ListInbox` / `ListSent` — paginated list of inbox / sent rows with HTML parsing |
+| `internal/tools/message.go` | `GetMessage` — full body + attachment metadata for one message (shared inbox/sent endpoint) |
+| `internal/tools/attachments.go` | `DownloadAttachments` — streams each attachment URL into a destination dir |
+| `internal/tools/*_test.go` | Unit + integration tests (~89% coverage on `internal/tools`; ~46% on `internal/client`, excluding the chromedp login path) |
 | `.goreleaser.yaml` | Cross-platform build matrix + Homebrew formula config |
 | `.github/workflows/ci.yml` | Runs lint / vet / `go test -race` / govulncheck on every push to `main`/`develop` and on every PR |
 | `.github/workflows/release.yml` | Runs the same checks as a gate, then GoReleaser, on `v*` tag push |
@@ -368,6 +437,7 @@ make run                   # run the MCP server (waits for stdio framing)
 make smoke-login           # one-shot OIDC login + dashboard probe
 make test-messages         # one-shot list inbox + sent (smoke for the tools)
 make dump-html             # dump the rendered landing page (selector debugging)
+make smoke-message MSG=m-N # (dev) dump raw /handler/page/message-edit JSON for ID N; used to reverse-engineer endpoint shapes
 make clear-cookies         # delete the session cache; forces re-login
 ```
 

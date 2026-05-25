@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	// Embed the IANA tzdata so time.LoadLocation works on hosts without
@@ -32,6 +33,7 @@ func main() {
 	dumpHTML := flag.Bool("dump-html", false, "navigate to EDOOKIT_URL, dump body HTML, exit (selector debugging)")
 	clearCookies := flag.Bool("clear-cookies", false, "delete the cached session cookies and exit")
 	testMessages := flag.Bool("test-messages", false, "list a few inbox + sent messages and exit (smoke test for the tools)")
+	dumpMessage := flag.String("dump-message", "", "(dev) fetch the full body of the given message ID (e.g. m-290491 or 290491) and dump the raw JSON response across all plausible endpoints — used to reverse-engineer the full-message + attachments API shape")
 	showVersion := flag.Bool("version", false, "print version and commit, then exit")
 	flag.Parse()
 
@@ -68,6 +70,10 @@ func main() {
 		runTestMessages(cli)
 		return
 	}
+	if *dumpMessage != "" {
+		runDumpMessage(cli, *dumpMessage)
+		return
+	}
 
 	s := server.NewMCPServer(
 		"edookit-mcp",
@@ -77,6 +83,8 @@ func main() {
 
 	registerInboxTool(s, cli)
 	registerSentTool(s, cli)
+	registerGetMessageTool(s, cli)
+	registerDownloadAttachmentsTool(s, cli)
 
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("serve stdio: %v", err)
@@ -181,6 +189,101 @@ func registerSentTool(s *server.MCPServer, cli *client.Client) {
 	)
 }
 
+func registerGetMessageTool(s *server.MCPServer, cli *client.Client) {
+	s.AddTool(
+		mcp.NewTool("edookit_get_message",
+			mcp.WithDescription("Fetch the full body and attachment list of a single message "+
+				"from the **Edookit school information system** (works for both received "+
+				"and sent messages — Edookit serves them via the same endpoint). Use this "+
+				"after edookit_list_inbox or edookit_list_sent has surfaced a message ID "+
+				"the user is interested in: the list tools return only a ~200-character "+
+				"body preview, while this tool returns the full message body in both "+
+				"plain text and HTML form, plus the metadata needed to download attachments. "+
+				"Returns a JSON object with id, number, subject, status (e.g. 'Publikováno'), "+
+				"author (sender for received messages, publisher for sent), date (RFC3339), "+
+				"body_text (plain text), body_html (original HTML), and attachments — an "+
+				"array of {id, name, url, date}. To actually save attachment files to disk, "+
+				"use edookit_download_attachments instead (this tool only lists them)."),
+			mcp.WithString("id",
+				mcp.Required(),
+				mcp.Description("Message identifier as returned by edookit_list_inbox / edookit_list_sent. "+
+					"Accepts either the 'm-NNNNNN' UID form or the bare 'NNNNNN' number."),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id := req.GetString("id", "")
+			if id == "" {
+				return mcp.NewToolResultError("missing required parameter: id"), nil
+			}
+			msg, err := tools.GetMessage(ctx, cli, id)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			b, err := json.Marshal(msg)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("marshal: %v", err)), nil
+			}
+			return mcp.NewToolResultText(string(b)), nil
+		},
+	)
+}
+
+func registerDownloadAttachmentsTool(s *server.MCPServer, cli *client.Client) {
+	s.AddTool(
+		mcp.NewTool("edookit_download_attachments",
+			mcp.WithDescription("Download every attachment of a single Edookit message to "+
+				"a local directory and return the saved file paths. Works for both received "+
+				"and sent messages. Files are written with the original filenames Edookit "+
+				"reports, into the directory given by `destination_dir`. The directory is "+
+				"created if it doesn't exist (mode 0700). If the same filename already "+
+				"exists in the directory it is left alone (download is skipped) unless "+
+				"`overwrite=true` is also passed. Returns a JSON object with message_id, "+
+				"directory, and a files array of {name, path, bytes, skipped?, error?} — "+
+				"a per-attachment outcome. A populated `error` on one entry means just "+
+				"that file failed; the others continue. Use this when the user asks to "+
+				"download, save, or open attachments — for example after edookit_get_message "+
+				"surfaces an attachment list."),
+			mcp.WithString("id",
+				mcp.Required(),
+				mcp.Description("Message identifier as returned by edookit_list_inbox / "+
+					"edookit_list_sent / edookit_get_message. Accepts 'm-NNNNNN' or 'NNNNNN'."),
+			),
+			mcp.WithString("destination_dir",
+				mcp.Description("Local filesystem directory where attachments will be saved. "+
+					"Optional — defaults to <os-temp-dir>/edookit-mcp/<message-id>/, which "+
+					"is portable across operating systems (/tmp/... on Linux/macOS, "+
+					"%TMP%\\... on Windows) and gets garbage-collected by the OS. Pass an "+
+					"explicit path for persistent storage (e.g. ~/Downloads/edookit/, where "+
+					"a leading ~ is expanded to the user's home dir). The directory is "+
+					"created if missing."),
+			),
+			mcp.WithBoolean("overwrite",
+				mcp.Description("If true, existing files at the destination are overwritten. "+
+					"Default false — existing files are kept and reported as skipped."),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id := req.GetString("id", "")
+			if id == "" {
+				return mcp.NewToolResultError("missing required parameter: id"), nil
+			}
+			opts := tools.DownloadOptions{
+				DestDir:   req.GetString("destination_dir", ""),
+				Overwrite: req.GetBool("overwrite", false),
+			}
+			res, err := tools.DownloadAttachments(ctx, cli, id, opts)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			b, err := json.Marshal(res)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("marshal: %v", err)), nil
+			}
+			return mcp.NewToolResultText(string(b)), nil
+		},
+	)
+}
+
 func runDumpHTML(baseURL string, headless bool) {
 	ctx := context.Background()
 	log.Printf("dumping landing HTML from %s (headless=%t)...", baseURL, headless)
@@ -263,6 +366,57 @@ func runTestMessages(cli *client.Client) {
 	for _, w := range unread.ParseWarnings {
 		log.Printf("  [parse-warning] %s", w)
 	}
+}
+
+// runDumpMessage is a development-only helper used to reverse-engineer the
+// full-message endpoint shape. It strips the optional "m-" prefix from the
+// ID and walks a list of plausible URL patterns (derived from the SPA hash
+// route #handler/window/message-edit?__index=N seen in inbox row HTML),
+// printing whichever ones return JSON. Output goes to stdout (the JSON
+// body) and stderr (probe progress) so the caller can redirect them
+// independently. No retention — pure investigation aid.
+func runDumpMessage(cli *client.Client, idArg string) {
+	ctx := context.Background()
+	id := strings.TrimPrefix(idArg, "m-")
+	if id == "" {
+		log.Fatalf("--dump-message: empty ID (use m-NNNNNN or NNNNNN)")
+	}
+
+	// Likely endpoint patterns. SPA hash routes follow #handler/window/<X>,
+	// and the JSON layer typically lives at /handler/page/<X> (we already
+	// know that from how list_inbox works: SPA #handler/window/objects-for-me
+	// is served by /handler/page/objects-for-me). Try a handful of plausible
+	// path forms in case Edookit uses singular vs plural or message vs mail.
+	paths := []string{
+		"/handler/page/message-edit?__index=" + id,
+		"/handler/page/message-view?__index=" + id,
+		"/handler/page/message?__index=" + id,
+		"/handler/window/message-edit?__index=" + id,
+		"/handler/page/mail-edit?__index=" + id,
+		"/handler/page/object-view?__index=" + id,
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+
+	successes := 0
+	for _, p := range paths {
+		log.Printf("[probe] GET %s ...", p)
+		var resp map[string]any
+		if err := cli.GetJSON(ctx, p, &resp); err != nil {
+			log.Printf("  -> ERR: %v", err)
+			continue
+		}
+		log.Printf("  -> OK (%d top-level keys)", len(resp))
+		fmt.Printf("\n===== response for %s =====\n", p)
+		_ = enc.Encode(resp)
+		successes++
+	}
+
+	if successes == 0 {
+		log.Fatalf("all %d candidate endpoints failed — Edookit URL scheme may have moved", len(paths))
+	}
+	log.Printf("done — %d/%d endpoints returned JSON", successes, len(paths))
 }
 
 // cookieCachePath returns the path where session cookies should be persisted:
