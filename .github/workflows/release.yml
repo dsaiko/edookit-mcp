@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so GoReleaser can build the changelog from commits.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          # Always present; used to create the release on this repo.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional; required only to push the Homebrew formula to dsaiko/homebrew-tap.
+          # See README "Distribution and releases" for how to create this PAT.
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        with:
+          distribution: goreleaser
+          version: latest
+          # If the Homebrew PAT is missing, skip the brew section so the binary
+          # release still succeeds. The formula will be regenerated whenever
+          # the secret is added and a subsequent tag is pushed.
+          args: >-
+            release --clean
+            ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN == '' && '--skip=homebrew' || '' }}

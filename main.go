@@ -16,13 +16,24 @@ import (
 	"github.com/dsaiko/edookit-mcp/internal/tools"
 )
 
+// Build-time metadata, populated by GoReleaser via -ldflags. Empty in dev builds.
+var (
+	version = "dev"
+	commit  = "none"
+)
+
 func main() {
 	loginTest := flag.Bool("login-test", false, "perform OIDC login once and exit (smoke test)")
 	dumpHTML := flag.Bool("dump-html", false, "navigate to EDOOKIT_URL, dump body HTML, exit (selector debugging)")
 	clearCookies := flag.Bool("clear-cookies", false, "delete the cached session cookies and exit")
 	testMessages := flag.Bool("test-messages", false, "list a few inbox + sent messages and exit (smoke test for the tools)")
+	showVersion := flag.Bool("version", false, "print version and commit, then exit")
 	flag.Parse()
 
+	if *showVersion {
+		fmt.Printf("edookit-mcp %s (commit %s)\n", version, commit)
+		return
+	}
 	if *clearCookies {
 		runClearCookies()
 		return
