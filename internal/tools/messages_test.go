@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -316,6 +317,72 @@ func TestParseBodyPreview(t *testing.T) {
 				t.Errorf("body length %d > max %d", len(got), tc.maxBytes)
 			}
 		})
+	}
+}
+
+func TestParseBodyPreview_HTMLEntitiesDecoded(t *testing.T) {
+	t.Parallel()
+
+	// The html package decodes named and numeric entities natively — we should
+	// never have to special-case them.
+	html := `<small>...</small><div>...</div>Caf&eacute; with &amp; and &quot;quotes&quot;<br>`
+	want := `Café with & and "quotes"`
+	got := parseBodyPreview(html)
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestParseBodyPreview_InlineTagsPreserveText(t *testing.T) {
+	t.Parallel()
+
+	// Inline tags like <a>, <b>, <i> in the body region must contribute their
+	// text content to the preview — the previous regex stopped at the first
+	// `<` after </div>, which dropped everything after.
+	html := `<small>...</small><div>...</div>plain <a href="x">linked</a> and <b>bold</b> text<br>`
+	want := `plain linked and bold text`
+	got := parseBodyPreview(html)
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestParseBodyPreview_RuneAwareTruncation(t *testing.T) {
+	t.Parallel()
+
+	// 'á' is 2 bytes in UTF-8 — a byte-counting truncator at 200 would yield
+	// ~100 characters and could land mid-rune. Rune-counting must yield
+	// exactly bodyPreviewMaxRunes + 1 ellipsis = 201 runes.
+	body := strings.Repeat("á", 250)
+	html := `<small>...</small><div>...</div>` + body + `<br>`
+	got := parseBodyPreview(html)
+
+	gotRunes := utf8.RuneCountInString(got)
+	wantRunes := bodyPreviewMaxRunes + 1 // +1 for the ellipsis suffix
+	if gotRunes != wantRunes {
+		t.Errorf("got %d runes, want %d", gotRunes, wantRunes)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("got %q should end with ellipsis", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("got %q is not valid UTF-8 — truncated mid-rune", got)
+	}
+}
+
+func TestParseBodyPreview_StopsAtSecondBlockDiv(t *testing.T) {
+	t.Parallel()
+
+	// Action-toolbar divs sit AFTER the body. If there's no <br> separating
+	// them, we should still stop at the second top-level <div> rather than
+	// pulling the toolbar's text into the preview.
+	html := `<small>...</small><div>subj</div>body here<div class="cleaner">&nbsp;</div><div>actions</div>`
+	got := parseBodyPreview(html)
+	if !strings.Contains(got, "body here") {
+		t.Errorf("got %q should contain 'body here'", got)
+	}
+	if strings.Contains(got, "actions") {
+		t.Errorf("got %q must not contain action toolbar text", got)
 	}
 }
 

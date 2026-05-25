@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"golang.org/x/net/html"
 
 	"github.com/dsaiko/edookit-mcp/internal/client"
 )
@@ -284,28 +285,91 @@ func parseAttachmentCount(doc *goquery.Document) int {
 	return count
 }
 
-var bodyPreviewRe = regexp.MustCompile(`(?s)</div>([^<]+)<br>`)
+const bodyPreviewMaxRunes = 200
 
-// parseBodyPreview extracts the body preview text (truncated to ~200 chars)
-// from the row HTML. The preview sits as a bare text node between the subject
-// </div> and the first <br> separating it from the action toolbar.
+// parseBodyPreview extracts the body preview text from a row's HTML. The
+// preview lives as content between the subject <div> and the first <br>
+// separating it from the action toolbar. Walks the parsed DOM rather than
+// regex-matching: this preserves inline tags (<a>, <i>, <b>) in the body,
+// decodes HTML entities natively via the html parser, and truncates by rune
+// count so multi-byte UTF-8 (Czech diacritics) doesn't break mid-character.
 func parseBodyPreview(rowHTML string) string {
-	m := bodyPreviewRe.FindStringSubmatch(rowHTML)
-	if len(m) != 2 {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader("<div>" + rowHTML + "</div>"))
+	if err != nil {
 		return ""
 	}
-	body := strings.ReplaceAll(m[1], "&nbsp;", " ")
-	body = strings.Join(strings.Fields(body), " ")
-	const previewMax = 200
-	if len(body) > previewMax {
-		// Cut at a rune boundary to avoid invalid UTF-8 mid-sequence.
-		cut := previewMax
-		for cut > 0 && (body[cut]&0xC0) == 0x80 {
-			cut--
-		}
-		body = body[:cut] + "…"
+	root := doc.Find("body > div").First()
+	if root.Length() == 0 {
+		return ""
 	}
-	return body
+
+	var (
+		sb            strings.Builder
+		sawSubjectDiv bool
+		done          bool
+	)
+	root.Contents().EachWithBreak(func(_ int, s *goquery.Selection) bool {
+		if done {
+			return false
+		}
+		n := s.Get(0)
+		if n == nil {
+			return true
+		}
+
+		switch n.Type {
+		case html.ElementNode:
+			switch n.Data {
+			case "div":
+				// The first top-level <div> is the subject + attachments
+				// container; everything before it is metadata (the <small>
+				// with date/sender) and everything after it up to the first
+				// <br> is the body preview.
+				if !sawSubjectDiv {
+					sawSubjectDiv = true
+					return true
+				}
+				// A subsequent <div> (action toolbar, cleaner) — body ended.
+				done = true
+				return false
+			case "br":
+				if sawSubjectDiv {
+					done = true
+					return false
+				}
+			default:
+				// Inline element (a, b, i, span, …) inside the body region.
+				if sawSubjectDiv {
+					sb.WriteString(s.Text())
+				}
+			}
+		case html.TextNode:
+			if sawSubjectDiv {
+				sb.WriteString(n.Data)
+			}
+		}
+		return true
+	})
+
+	// strings.Fields splits on any Unicode whitespace including U+00A0 (NBSP
+	// produced by the html parser from &nbsp;), so we never need to special-case
+	// HTML entities ourselves.
+	body := strings.Join(strings.Fields(sb.String()), " ")
+	return truncateRunes(body, bodyPreviewMaxRunes)
+}
+
+// truncateRunes returns s truncated to at most maxRunes runes, suffixed with
+// an ellipsis if anything was cut. Counting in runes (not bytes) keeps
+// multi-byte UTF-8 sequences from being sliced mid-character.
+func truncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "…"
 }
 
 // parseSince accepts "7d", "1w", "2m", "1y", or an ISO date (YYYY-MM-DD or RFC3339).
