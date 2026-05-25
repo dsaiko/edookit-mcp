@@ -86,13 +86,20 @@ func main() {
 func registerInboxTool(s *server.MCPServer, cli *client.Client) {
 	s.AddTool(
 		mcp.NewTool("list_inbox",
-			mcp.WithDescription("List messages in the Edookit inbox (Komunikace → Přijaté). "+
-				"Returns a JSON object with two keys: `messages` is an array of message "+
-				"objects (id, date, sender, subject, body_preview ~200 chars, attachments "+
-				"count) in newest-first order; `parse_warnings` (optional) lists any rows "+
-				"the server returned that couldn't be parsed — usually means Edookit's row "+
-				"HTML changed. An empty messages array with no warnings means the mailbox "+
-				"itself is empty; an error is returned if every fetched row failed to parse."),
+			mcp.WithDescription("List received messages from the **Edookit school information system** "+
+				"(Komunikace → Přijaté). Edookit is a Czech educational platform used by "+
+				"schools to communicate with parents and students. Use this tool when the "+
+				"user asks about school messages — anything from teachers, the school "+
+				"office, the head teacher (třídní učitel), the principal (ředitel), or "+
+				"about school topics like grades, attendance, parent-teacher meetings, "+
+				"trips, exams. This is NOT a general email inbox — for Gmail / Outlook / "+
+				"Slack DMs use those dedicated tools instead. Returns a JSON object with "+
+				"two keys: `messages` is an array of message objects (id, date, sender, "+
+				"subject, body_preview ~200 chars, attachments count) in newest-first "+
+				"order; `parse_warnings` (optional) lists any rows the server returned "+
+				"that couldn't be parsed — usually means Edookit's row HTML changed. An "+
+				"empty messages array with no warnings means the mailbox itself is empty; "+
+				"an error is returned if every fetched row failed to parse."),
 			mcp.WithString("view",
 				mcp.Description("Which subset to list: 'inbox' (default), 'unread' (Nepřečtené), "+
 					"'starred' (S hvězdičkou), 'archived' (Archiv), 'all' (Vše)."),
@@ -131,13 +138,19 @@ func registerInboxTool(s *server.MCPServer, cli *client.Client) {
 func registerSentTool(s *server.MCPServer, cli *client.Client) {
 	s.AddTool(
 		mcp.NewTool("list_sent",
-			mcp.WithDescription("List messages the user has sent (Komunikace → Vytvořené). "+
-				"Returns a JSON object with two keys: `messages` is an array of message "+
-				"objects (id, date, status like 'Publikováno', subject, body_preview, "+
-				"attachments count) in newest-first order; `parse_warnings` (optional) lists "+
-				"any rows the server returned that couldn't be parsed. An empty messages "+
-				"array with no warnings means nothing has been sent; an error is returned "+
-				"if every fetched row failed to parse."),
+			mcp.WithDescription("List messages the user has sent via the **Edookit school "+
+				"information system** (Komunikace → Vytvořené). Edookit is a Czech "+
+				"educational platform used by schools to communicate with parents and "+
+				"students. Use this tool when the user asks about messages they sent to "+
+				"the school — to teachers, the head teacher (třídní), the principal, or "+
+				"about school topics. This is NOT a general sent-mail folder — for Gmail "+
+				"/ Outlook / Slack DMs use those dedicated tools instead. Returns a JSON "+
+				"object with two keys: `messages` is an array of message objects (id, "+
+				"date, status like 'Publikováno', subject, body_preview, attachments "+
+				"count) in newest-first order; `parse_warnings` (optional) lists any rows "+
+				"the server returned that couldn't be parsed. An empty messages array "+
+				"with no warnings means nothing has been sent; an error is returned if "+
+				"every fetched row failed to parse."),
 			mcp.WithString("fulltext",
 				mcp.Description("Optional server-side full-text search across subjects and bodies."),
 			),

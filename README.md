@@ -135,12 +135,79 @@ Restartujte Claude Code a v konverzaci by se měly objevit nástroje `list_inbox
 
 ### Co umí (dostupné nástroje)
 
+K dispozici jsou dva nástroje:
+
 | Nástroj | Co dělá |
 |---|---|
 | `list_inbox` | Vypíše zprávy z **Přijaté** (volitelně jen Nepřečtené, S hvězdičkou, Archiv, Vše). Podporuje fulltext a filtrování podle data. |
 | `list_sent` | Vypíše zprávy z **Vytvořené** (odeslané). Stejné filtry kromě "view". |
 
-Každý nástroj vrací JSON s polem `messages` (ID, datum, odesílatel u příjmu / stav u odeslaných, předmět, prvních ~200 znaků textu, počet příloh) a volitelným polem `parse_warnings`, kde se objeví řádky, které server vrátil ale konektor je nedokázal naparsovat (typicky když Edookit změní formát řádku). Pokud selže parser u úplně všech řádků, vrátí se chyba místo prázdného výsledku — jinak by Claude nemohl odlišit "schránka je prázdná" od "parser je rozbitý".
+Nástroje **nevoláte přímo** — píšete Claudovi normálním jazykem a on sám rozhodne, kdy a s jakými parametry je použít. Níže jsou příklady promptů a co se pod nimi typicky děje.
+
+> **Jak Claude pozná, že má použít Edookit?** Rozhoduje se podle popisu nástroje, podle toho jaké další MCP máte k Claudovi připojené, a podle kontextu konverzace. Když máte připojený jen edookit-mcp, je to jednoznačné a stačí psát přirozeně. Když máte i Gmail / Outlook / Slack MCP, pomáhá v promptu **zmínit „v Edookitu" nebo „ze školy"** — Claude pak nepřesměruje dotaz omylem do mailu. Slova jako „paní učitelka", „třídní", „ředitel", „pololetí" obvykle stačí sama o sobě, ale **explicitní zmínka je nejjistější**.
+
+#### Příklady, jak se zeptat
+
+**Přehled nepřečtených:**
+> *"Mám něco nového v Edookitu?"*
+> *"Kolik mám nepřečtených zpráv ze školy?"*
+
+→ Claude zavolá `list_inbox` s `view=unread` a shrne, kolik zpráv máte, od koho a o čem.
+
+**Hledání podle odesílatele nebo tématu:**
+> *"Co mi v poslední době psala paní učitelka Nováková?"*
+> *"Najdi v Edookitu všechny zprávy, kde se píše o maturitách."*
+> *"Které zprávy od ředitele mám z posledního měsíce?"*
+
+→ Claude použije `list_inbox` s `fulltext="..."` (server-side hledání napříč odesílateli, předměty i těly).
+
+**Filtrování podle data:**
+> *"Co mi přišlo ze školy za poslední týden?"*
+> *"Ukaž mi všechny zprávy z Edookitu od 1. května."*
+> *"Co bylo v Edookitu za poslední tři dny?"*
+
+→ Claude předá `since="7d"`, `since="2026-05-01"` apod.
+
+**Zprávy s přílohou:**
+> *"Která nepřečtená zpráva ze školy má přílohu?"*
+> *"Najdi mi v Edookitu PDF, co mi nedávno přišlo."*
+
+→ Claude vytáhne nepřečtené (`view=unread`) a pak vyfiltruje ty, které mají `attachments > 0`. Samotnou přílohu zatím konektor stáhnout neumí — vrátí jen informaci, že existuje a kolik jich je (otevřete je ručně v Edookitu nebo v notifikačním mailu).
+
+**Odeslané zprávy:**
+> *"Co jsem v poslední době někomu v Edookitu posílal?"*
+> *"Poslal jsem už paní Novákové ten dotaz na exkurzi?"*
+
+→ `list_sent` (případně s `fulltext="Nováková"` nebo `since="2w"`).
+
+**Souhrn za období:**
+> *"Udělej mi přehled komunikace s třídní za poslední pololetí."*
+
+→ Claude může zavolat oba nástroje, případně několikrát s různými filtry, a sestaví souvislé shrnutí.
+
+#### Parametry
+
+Pokud chcete Claudovi pomoci přesně, můžete parametry zmínit explicitně ("za posledních 30 dní", "jen nepřečtené", "max 20 zpráv"). Akceptované hodnoty:
+
+| Parametr | Hodnoty | Default |
+|---|---|---|
+| `view` (jen `list_inbox`) | `inbox` (Přijaté), `unread` (Nepřečtené), `starred` (S hvězdičkou), `archived` (Archiv), `all` (Vše) | `inbox` |
+| `fulltext` | libovolný text — hledá se na straně serveru napříč odesílatelem, předmětem i tělem | — |
+| `since` | relativní (`7d`, `1w`, `2m`, `1y`) nebo absolutní (`YYYY-MM-DD`, popř. RFC 3339) | bez omezení |
+| `limit` | 1–200 (interně se stránkuje po 100) | 50 |
+
+#### Co dostanete zpět
+
+Každá zpráva v odpovědi obsahuje:
+
+- **`id`** + **`number`** — vnitřní identifikátor (`m-290491` / `290491`)
+- **`date`** — datum a čas (RFC 3339, podle časové zóny školy — default Europe/Prague, lze přebít přes `EDOOKIT_TIMEZONE`)
+- **`sender`** (v Přijatých) nebo **`status`** (v Odeslaných, např. „Publikováno")
+- **`subject`** — předmět zprávy v originálním jazyce (typicky česky)
+- **`body_preview`** — prvních ~200 znaků textu zprávy (vystačí na rychlý přehled, plný text Edookit posílá až po otevření konkrétní zprávy v UI)
+- **`attachments`** — počet příloh (samotné soubory se zatím nestahují)
+
+Vedle `messages` může přijít i `parse_warnings` — to jsou řádky, které Edookit vrátil v neočekávaném formátu (typicky když změnili layout). Když Claude něco takového dostane, většinou na to upozorní. Pokud parser selže úplně na všech řádcích, místo prázdného seznamu se vrátí chyba — jinak by Claude nemohl odlišit „schránka je prázdná" od „parser je rozbitý".
 
 ### Bezpečnost a soukromí
 
