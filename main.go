@@ -85,7 +85,7 @@ func main() {
 
 func registerInboxTool(s *server.MCPServer, cli *client.Client) {
 	s.AddTool(
-		mcp.NewTool("list_inbox",
+		mcp.NewTool("edookit_list_inbox",
 			mcp.WithDescription("List received messages from the **Edookit school information system** "+
 				"(Komunikace → Přijaté). Edookit is a Czech educational platform used by "+
 				"schools to communicate with parents and students. Use this tool when the "+
@@ -137,7 +137,7 @@ func registerInboxTool(s *server.MCPServer, cli *client.Client) {
 
 func registerSentTool(s *server.MCPServer, cli *client.Client) {
 	s.AddTool(
-		mcp.NewTool("list_sent",
+		mcp.NewTool("edookit_list_sent",
 			mcp.WithDescription("List messages the user has sent via the **Edookit school "+
 				"information system** (Komunikace → Vytvořené). Edookit is a Czech "+
 				"educational platform used by schools to communicate with parents and "+
