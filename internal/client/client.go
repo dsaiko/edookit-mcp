@@ -107,9 +107,12 @@ func New(cfg Config) (*Client, error) {
 		cookies, age, err := loadCookies(cfg.CookieCachePath, cfg.BaseURL)
 		switch {
 		case err == nil && age < cfg.CookieMaxAge:
+			// Populate the jar but leave loggedIn=false so the first
+			// ensureLoggedIn call does a cheap GET / warmup to validate +
+			// resurrect the PHP session before any /handler/page/* request.
 			c.http.Jar.SetCookies(c.baseURL, cookies)
-			c.loggedIn = true
-			log.Printf("[client] loaded %d cached cookies (age %s)", len(cookies), age.Round(time.Minute))
+			log.Printf("[client] loaded %d cached cookies (age %s); will verify on first call",
+				len(cookies), age.Round(time.Minute))
 		case err == nil:
 			log.Printf("[client] cached cookies are stale (age %s > max %s); will re-login on first request",
 				age.Round(time.Minute), cfg.CookieMaxAge)
@@ -149,13 +152,52 @@ func (c *Client) SessionCookies() []*http.Cookie {
 	return c.http.Jar.Cookies(c.baseURL)
 }
 
-// ensureLoggedIn runs the OIDC login in a real browser if we don't yet have a
-// session cookie. Subsequent calls are no-ops until invalidateSession is hit.
+// warmupSession performs a GET / which Edookit needs to "resurrect" a PHP
+// session from the persistent X-EdooAuthToken / X-Auth-Id cookies. Subsequent
+// /handler/page/* calls return HTTP 200 with authenticated:false until this
+// has happened. Also detects a dead session (bounce to Plus4U) so callers can
+// trigger a fresh chromedp login.
+func (c *Client) warmupSession(ctx context.Context) error {
+	req, err := c.newRequest(ctx, http.MethodGet, "/", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("warmup GET /: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.Request.URL.Host != c.baseURL.Host {
+		return fmt.Errorf("warmup bounced off-host to %s (session expired)", resp.Request.URL.Host)
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("warmup got HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// ensureLoggedIn brings the client into the authenticated state. If cookies
+// are already in the jar (loaded from cache), a single warmup GET / verifies
+// them — that's typically ~100ms. If the jar is empty or warmup fails, a full
+// chromedp login is performed (~4s) and then warmed up.
 func (c *Client) ensureLoggedIn(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.loggedIn {
 		return nil
+	}
+
+	// Fast path: cookies already loaded (from cache). Warm them up; if the
+	// session is still alive, we're done without launching chromium.
+	if len(c.http.Jar.Cookies(c.baseURL)) > 0 {
+		if err := c.warmupSession(ctx); err == nil {
+			c.loggedIn = true
+			return nil
+		} else {
+			log.Printf("[client] cached session invalid (%v); falling back to fresh login", err)
+		}
 	}
 
 	cookies, err := loginViaBrowser(ctx, browserLoginConfig{
@@ -171,13 +213,22 @@ func (c *Client) ensureLoggedIn(ctx context.Context) error {
 	}
 
 	c.http.Jar.SetCookies(c.baseURL, cookies)
+
+	// Warm up so /handler/page/* calls find a valid PHP session.
+	if err := c.warmupSession(ctx); err != nil {
+		return fmt.Errorf("warmup after login failed: %w", err)
+	}
+
 	c.loggedIn = true
 
 	if c.cfg.CookieCachePath != "" {
-		if err := saveCookies(c.cfg.CookieCachePath, c.cfg.BaseURL, cookies); err != nil {
+		// Persist the post-login cookies (PHPSESSID will rotate again on each
+		// subsequent request, but X-EdooAuthToken / X-Auth-Id stay constant
+		// and are what actually authenticate the next session).
+		if err := saveCookies(c.cfg.CookieCachePath, c.cfg.BaseURL, c.http.Jar.Cookies(c.baseURL)); err != nil {
 			log.Printf("[client] failed to cache cookies (non-fatal): %v", err)
 		} else {
-			log.Printf("[client] cached %d cookies to %s", len(cookies), c.cfg.CookieCachePath)
+			log.Printf("[client] cached cookies to %s", c.cfg.CookieCachePath)
 		}
 	}
 	return nil

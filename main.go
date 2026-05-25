@@ -98,10 +98,19 @@ func runLoginTest(cli *client.Client) {
 		log.Fatalf("login failed: %v", err)
 	}
 	cookies := cli.SessionCookies()
-	log.Printf("session ready — %d cookie(s) available for target host:", len(cookies))
-	for _, c := range cookies {
-		log.Printf("  %s (len=%d, secure=%t, httpOnly=%t, sameSite=%d)",
-			c.Name, len(c.Value), c.Secure, c.HttpOnly, c.SameSite)
+	log.Printf("session ready — %d cookie(s) available for target host", len(cookies))
+
+	// End-to-end check: GET /handler/page/dashboard via the authenticated client
+	// and confirm the server returns authenticated content (not the "not logged
+	// in" fallback). This proves the warmup wired the session correctly.
+	var probe map[string]any
+	if err := cli.GetJSON(ctx, "/handler/page/dashboard", &probe); err != nil {
+		log.Fatalf("dashboard probe failed: %v", err)
+	}
+	if auth, _ := probe["authenticated"].(bool); auth {
+		log.Printf("authenticated session verified via /handler/page/dashboard")
+	} else {
+		log.Printf("WARNING: /handler/page/dashboard returned authenticated=false despite successful login")
 	}
 }
 
