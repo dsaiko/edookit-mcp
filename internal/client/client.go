@@ -192,6 +192,13 @@ func parseBaseURL(raw string) (*url.URL, error) {
 	if u.Hostname() == "" {
 		return nil, fmt.Errorf("BaseURL %q has no host", raw)
 	}
+	// Strip the default port for the scheme so off-host comparisons
+	// downstream don't trip on a "https://school.test:443" baseURL vs a
+	// "https://school.test" redirect (both denote the same origin). Custom
+	// ports (:8443 etc.) are preserved verbatim.
+	if (u.Scheme == "http" && u.Port() == "80") || (u.Scheme == "https" && u.Port() == "443") {
+		u.Host = u.Hostname()
+	}
 	return u, nil
 }
 
@@ -295,6 +302,24 @@ func buildHTTPClient(provided *http.Client) (*http.Client, *swappableJar, error)
 	return &http.Client{Jar: jar, Timeout: 20 * time.Second}, jar, nil
 }
 
+// do dispatches req through c.http while fencing the request's cookie
+// lifecycle against a concurrent invalidateSession swap. net/http calls
+// Jar.Cookies before sending and Jar.SetCookies after the response — if
+// reset() happens between those, the response's Set-Cookie headers would
+// pollute the freshly-installed jar. We snapshot the current inner here
+// and bind it to a request-scoped client copy so both calls target the
+// same jar generation; the snapshot becomes garbage when the request
+// finishes. Falls through to plain c.http.Do when we don't own the jar
+// (caller-supplied client with its own jar), where the issue is theirs.
+func (c *Client) do(req *http.Request) (*http.Response, error) {
+	if c.jar == nil {
+		return c.http.Do(req)
+	}
+	snap := *c.http
+	snap.Jar = c.jar.inner.Load()
+	return snap.Do(req)
+}
+
 // EnsureLoggedIn forces a login if we don't already have a session. Normally
 // callers don't need this — GetDoc/GetJSON authenticate lazily. Exposed for
 // smoke tests and eager-login flows.
@@ -325,14 +350,14 @@ func (c *Client) warmupSession(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("warmup GET /: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body)
 
-	if resp.Request.URL.Host != c.baseURL.Host {
+	if resp.Request.URL.Hostname() != c.baseURL.Hostname() {
 		return fmt.Errorf("warmup bounced off-host to %s (session expired)", resp.Request.URL.Host)
 	}
 	if resp.StatusCode >= 400 {
@@ -474,14 +499,16 @@ func (c *Client) getJSON(ctx context.Context, path string, out any, retry bool) 
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("GET %s: %w", path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Session expired: bounced off-host (to Plus4U identity).
-	if resp.Request.URL.Host != c.baseURL.Host {
+	// Session expired: bounced off-host (to Plus4U identity). Compare
+	// hostnames (not URL.Host) so a redirect that drops or adds an
+	// explicit default port isn't mis-detected as off-host.
+	if resp.Request.URL.Hostname() != c.baseURL.Hostname() {
 		if !retry {
 			return errors.New("session expired and re-login failed")
 		}
@@ -524,15 +551,16 @@ func (c *Client) getDoc(ctx context.Context, path string, retry bool) (*goquery.
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("GET %s: %w", path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Session expired: Edookit bounced us off-host (to Plus4U identity). When
-	// that happens, the response's final URL host differs from our base host.
-	if resp.Request.URL.Host != c.baseURL.Host {
+	// Session expired: Edookit bounced us off-host (to Plus4U identity).
+	// Hostname-only comparison so a redirect that drops or adds the default
+	// port isn't mis-detected as a bounce. See same check in getJSON.
+	if resp.Request.URL.Hostname() != c.baseURL.Hostname() {
 		if !retry {
 			return nil, errors.New("session expired and re-login failed")
 		}

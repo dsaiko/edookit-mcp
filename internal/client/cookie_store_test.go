@@ -88,7 +88,8 @@ func TestLoadCookies_RejectsEmptyCookieList(t *testing.T) {
 func TestSaveCookies_AtomicReplace(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join(t.TempDir(), "cookies.json")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cookies.json")
 	base := "https://example.test"
 
 	// Write once.
@@ -108,10 +109,15 @@ func TestSaveCookies_AtomicReplace(t *testing.T) {
 		t.Errorf("got %+v, want one cookie named B", got)
 	}
 
-	// Ensure no .tmp file was left behind from the rename.
-	tmp := path + ".tmp"
-	if _, statErr := os.Stat(tmp); statErr == nil {
-		t.Errorf("temp file %s still exists after successful rename", tmp)
+	// Ensure no temp files (os.CreateTemp generates "cookies-<random>.tmp"
+	// names — the previous fixed-name "cookies.json.tmp" check became
+	// trivially true after the CreateTemp switch, so glob the dir instead).
+	leftovers, globErr := filepath.Glob(filepath.Join(dir, "cookies-*.tmp"))
+	if globErr != nil {
+		t.Fatalf("glob: %v", globErr)
+	}
+	if len(leftovers) > 0 {
+		t.Errorf("temp file(s) still present after successful save: %v", leftovers)
 	}
 }
 

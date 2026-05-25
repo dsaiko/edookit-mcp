@@ -75,6 +75,33 @@ func TestNew_DefaultsTimezoneToEuropePrague(t *testing.T) {
 	}
 }
 
+func TestNew_NormalizesDefaultPortInBaseURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   string
+		want string // expected u.Host on the parsed baseURL
+	}{
+		{name: "https with :443 stripped", in: "https://school.test:443", want: "school.test"},
+		{name: "http with :80 stripped", in: "http://school.test:80", want: "school.test"},
+		{name: "https without port unchanged", in: "https://school.test", want: "school.test"},
+		{name: "custom port preserved", in: "https://school.test:8443", want: "school.test:8443"},
+		{name: "http with :443 preserved (not default)", in: "http://school.test:443", want: "school.test:443"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cli, err := New(Config{BaseURL: tc.in, Username: "u", Password: "p"})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if cli.baseURL.Host != tc.want {
+				t.Errorf("baseURL.Host = %q, want %q", cli.baseURL.Host, tc.want)
+			}
+		})
+	}
+}
+
 func TestNew_PreservesProvidedTimezone(t *testing.T) {
 	t.Parallel()
 	cli, err := New(Config{
@@ -208,15 +235,21 @@ func TestWarmupSession_HTTPErrorFails(t *testing.T) {
 func TestWarmupSession_OffHostBounceFails(t *testing.T) {
 	t.Parallel()
 
-	// "Plus4U" — the foreign host warmup would bounce to.
+	// "Plus4U" — the foreign host warmup would bounce to. httptest binds
+	// to 127.0.0.1, so we swap the host portion of its URL to "localhost"
+	// before handing it to Redirect — both resolve to loopback, but they
+	// are lexically distinct hostnames so the client's host check sees a
+	// real bounce (matching what happens in production, where Plus4U is on
+	// a different DNS name from Edookit).
 	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("login page"))
 	}))
 	defer foreign.Close()
+	foreignURL := strings.Replace(foreign.URL, "127.0.0.1", "localhost", 1)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		http.Redirect(w, &http.Request{}, foreign.URL, http.StatusFound)
+		http.Redirect(w, &http.Request{}, foreignURL, http.StatusFound)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -332,10 +365,14 @@ func TestGetJSON_PersistentAuthFalseGivesUp(t *testing.T) {
 func TestGetJSON_OffHostBounceTriggersRelogin(t *testing.T) {
 	t.Parallel()
 
+	// Same 127.0.0.1 ↔ localhost swap trick as TestWarmupSession_OffHostBounceFails:
+	// httptest binds to 127.0.0.1 so we need a lexically different hostname
+	// for the bounce check (which compares URL.Hostname()) to fire.
 	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("plus4u login page"))
 	}))
 	defer foreign.Close()
+	foreignURL := strings.Replace(foreign.URL, "127.0.0.1", "localhost", 1)
 
 	var (
 		apiCalls atomic.Int32
@@ -345,7 +382,7 @@ func TestGetJSON_OffHostBounceTriggersRelogin(t *testing.T) {
 	mux.HandleFunc("/handler/page/dashboard", func(w http.ResponseWriter, r *http.Request) {
 		n := apiCalls.Add(1)
 		if n == 1 {
-			http.Redirect(w, r, foreign.URL, http.StatusFound)
+			http.Redirect(w, r, foreignURL, http.StatusFound)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
