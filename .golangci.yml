@@ -1,0 +1,126 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+
+  enable:
+    # --- Core (golangci-lint's default "standard" set) ---
+    - errcheck       # unchecked errors
+    - govet          # stdlib vet: suspicious constructs
+    - ineffassign    # ineffectual assignments
+    - staticcheck    # comprehensive static analysis
+    - unused         # dead code
+
+    # --- Error handling ---
+    - errorlint      # correct error wrapping (errors.Is/As, %w in fmt.Errorf)
+    - nilerr         # function returns nil even though error is non-nil
+    - nilnil         # returning nil value + nil error simultaneously
+
+    # --- Resource & correctness ---
+    - bodyclose      # http.Response.Body not closed
+    - rowserrcheck   # sql.Rows.Err() not checked
+    - sqlclosecheck  # sql.Rows / sql.Stmt not closed
+    - noctx          # net/http requests without context
+
+    # --- Modern Go idioms ---
+    - copyloopvar    # Go 1.22+ loop variable semantics
+    - intrange       # use Go 1.22+ `for i := range N`
+    - usestdlibvars  # use stdlib constants (e.g. http.StatusOK over 200)
+
+    # --- Code quality ---
+    - gocritic       # broad opinionated rule set
+    - revive         # configurable golint successor
+    - gocyclo        # cyclomatic complexity
+    - unconvert      # unnecessary type conversions
+    - unparam        # unused function parameters
+    - wastedassign   # value assigned but never used
+    - prealloc       # slices that could be preallocated
+    - goconst        # repeated strings worth promoting to constants
+    - misspell       # misspellings
+    - predeclared    # identifiers that shadow predeclared names
+    - dupword        # repeated words ("the the")
+
+    # --- Security ---
+    - gosec
+
+    # --- Testing ---
+    - thelper        # t.Helper() in test helpers
+    - tparallel      # incorrect use of t.Parallel
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      exclude-functions:
+        - (io.Closer).Close
+
+    gocyclo:
+      min-complexity: 15
+
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+      disabled-checks:
+        - ifElseChain  # too aggressive about switching
+        - hugeParam    # noisy when passing structs by value intentionally
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: empty-block
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: exported
+        - name: indent-error-flow
+        - name: increment-decrement
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: unused-parameter
+        - name: var-declaration
+        - name: var-naming
+
+    gosec:
+      excludes:
+        - G104  # duplicate of errcheck
+
+    misspell:
+      locale: US
+
+  exclusions:
+    rules:
+      # Tests get latitude on a few style/complexity rules
+      - path: _test\.go
+        linters:
+          - dupl
+          - gocyclo
+          - goconst
+          - gosec
+          - unparam
+          - revive
+
+formatters:
+  enable:
+    - gofumpt    # stricter gofmt
+    - goimports  # group + sort imports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/dsaiko/edookit-mcp

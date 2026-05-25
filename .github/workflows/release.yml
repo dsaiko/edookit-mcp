@@ -1,0 +1,80 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # Run the same checks as the `ci` workflow before publishing. A bad tag
+  # should never produce a public release: catch lint/test/vuln regressions
+  # here, exit non-zero, and the `goreleaser` job below will be skipped via
+  # its `needs:` dependency.
+  check:
+    name: pre-release checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules + tool deps
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        run: go tool golangci-lint run -v
+
+      - name: go test
+        run: go test -race -count=1 -cover -coverprofile=coverage.txt ./...
+
+      - name: govulncheck
+        run: go tool govulncheck ./...
+
+  goreleaser:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Full history so GoReleaser can build the changelog from commits.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        env:
+          # Always present; used to create the release on this repo.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional; required only to push the Homebrew formula to dsaiko/homebrew-tap.
+          # See README "Distribution and releases" for how to create this PAT.
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          # If the Homebrew PAT is missing, skip the brew section so the binary
+          # release still succeeds. The formula will be regenerated whenever
+          # the secret is added and a subsequent tag is pushed.
+          args: >-
+            release --clean
+            ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN == '' && '--skip=homebrew' || '' }}
