@@ -42,6 +42,15 @@ test-messages: ## Fetch and print a few inbox + sent messages (smoke test for th
 	@if [ ! -f .env ]; then echo "missing .env"; exit 1; fi
 	@set -a; . ./.env; set +a; go run . -test-messages
 
+smoke-message: ## (dev) Dump the raw JSON of full-message endpoints for one message — usage: make smoke-message MSG=m-NNNNNN
+	@if [ -z "$(MSG)" ]; then echo "usage: make smoke-message MSG=m-NNNNNN (try 'make find-message-with-attachments' to pick one)"; exit 1; fi
+	@if [ ! -f .env ]; then echo "missing .env"; exit 1; fi
+	@set -a; . ./.env; set +a; go run . -dump-message "$(MSG)"
+
+find-message-with-attachments: ## (dev) Scan the inbox and print IDs of messages that have at least one attachment
+	@if [ ! -f .env ]; then echo "missing .env"; exit 1; fi
+	@set -a; . ./.env; set +a; go run . -test-messages 2>&1 | awk '/attachments=[1-9]/ {print}'
+
 install: ## Install the binary into $GOBIN (or $GOPATH/bin)
 	go install .
 

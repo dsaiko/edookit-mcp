@@ -11,6 +11,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -273,12 +274,17 @@ func (c *Client) resolve(path string) (string, error) {
 	return c.baseURL.ResolveReference(ref).String(), nil
 }
 
-func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
+// newRequest builds an authenticated GET against path (relative or
+// absolute). Every Edookit endpoint this client touches is a GET with no
+// body, so neither method nor body is parameterized; if a future flow
+// needs POST/PUT it should grow a sibling helper that explicitly accepts
+// them (and audits retry/cookie semantics for non-idempotent verbs).
+func (c *Client) newRequest(ctx context.Context, path string) (*http.Request, error) {
 	abs, err := c.resolve(path)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, method, abs, body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, abs, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
@@ -485,7 +491,7 @@ func (c *Client) Timezone() *time.Location {
 // has happened. Also detects a dead session (bounce to Plus4U) so callers can
 // trigger a fresh chromedp login.
 func (c *Client) warmupSession(ctx context.Context) error {
-	req, err := c.newRequest(ctx, http.MethodGet, "/", nil)
+	req, err := c.newRequest(ctx, "/")
 	if err != nil {
 		return err
 	}
@@ -616,6 +622,93 @@ func (c *Client) GetJSON(ctx context.Context, path string, out any) error {
 	return c.getJSON(ctx, path, out, true)
 }
 
+// GetTo streams the response body of GET <path> into dst. Returns the number
+// of bytes written and any error. Used for binary downloads — attachments,
+// images — where we don't want to buffer the whole file in memory. Path may
+// be relative (resolved against baseURL) or absolute (e.g. a fully-qualified
+// attachment URL from a message JSON); both work because newRequest resolves
+// via url.ResolveReference. Re-authenticates once on session expiry, same
+// as GetJSON / GetDoc.
+func (c *Client) GetTo(ctx context.Context, path string, dst io.Writer) (int64, error) {
+	return c.getTo(ctx, path, dst, true)
+}
+
+func (c *Client) getTo(ctx context.Context, path string, dst io.Writer, retry bool) (int64, error) {
+	if err := c.ensureLoggedIn(ctx); err != nil {
+		return 0, err
+	}
+
+	// Pre-flight origin check: GetTo accepts absolute URLs (attachment
+	// `link` values come back fully qualified from Edookit), so a drifted
+	// or malicious link pointing off-origin would otherwise be dispatched
+	// once, caught by the post-response sameOrigin check, retried after
+	// invalidate, and dispatched a second time before failing. Verify the
+	// resolved URL is same-origin BEFORE c.do so the bogus link never
+	// leaves the process. The post-response check below still catches
+	// redirects that happen mid-flight.
+	resolved, err := c.resolve(path)
+	if err != nil {
+		return 0, err
+	}
+	resolvedURL, err := url.Parse(resolved)
+	if err != nil {
+		return 0, fmt.Errorf("parse resolved URL %q: %w", resolved, err)
+	}
+	if !sameOrigin(resolvedURL, c.baseURL) {
+		return 0, fmt.Errorf("GET %s: refusing off-origin URL %s (must be same origin as %s)", path, resolvedURL.Host, c.baseURL.Host)
+	}
+
+	req, err := c.newRequest(ctx, path)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, fmt.Errorf("GET %s: %w", path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Session expired: bounced off-origin mid-flight. Same handling as
+	// getJSON / getDoc — the pre-flight check above only covers the
+	// initial dispatch.
+	if !sameOrigin(resp.Request.URL, c.baseURL) {
+		if !retry {
+			return 0, errors.New("session expired and re-login failed")
+		}
+		c.invalidateSession()
+		return c.getTo(ctx, path, dst, false)
+	}
+
+	if resp.StatusCode >= 400 {
+		return 0, fmt.Errorf("GET %s: HTTP %d", path, resp.StatusCode)
+	}
+
+	// Non-file response on a download endpoint: Edookit can answer a
+	// binary download URL with HTTP 200 plus either a text/html login
+	// page (stale cookies, no off-origin redirect) or an
+	// application/json envelope like {"authenticated":false} or a
+	// generic API error. Without this check we'd stream the HTML/JSON
+	// into the destination file. No legitimate Edookit download (PDF /
+	// DOCX / image / octet-stream / etc.) reports either Content-Type.
+	//
+	// text/html → almost certainly the login page → invalidate + retry.
+	// application/json → deterministic API response → propagate as-is
+	//                    (a retry would just hit the same JSON again).
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	switch {
+	case strings.HasPrefix(ct, "text/html"):
+		if !retry {
+			return 0, fmt.Errorf("GET %s: server returned text/html (likely login page) — re-login failed", path)
+		}
+		c.invalidateSession()
+		return c.getTo(ctx, path, dst, false)
+	case strings.HasPrefix(ct, "application/json"):
+		return 0, fmt.Errorf("GET %s: server returned application/json on a binary download endpoint (likely an API error envelope, not a file)", path)
+	}
+
+	return io.Copy(dst, resp.Body)
+}
+
 // authEnvelope is the subset of every /handler/page/* and /handler/grid/*
 // response we read to detect a server-side session expiry that did NOT cause
 // an off-host bounce — when this happens the server returns HTTP 200 with a
@@ -630,7 +723,7 @@ func (c *Client) getJSON(ctx context.Context, path string, out any, retry bool) 
 		return err
 	}
 
-	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	req, err := c.newRequest(ctx, path)
 	if err != nil {
 		return err
 	}
@@ -687,7 +780,7 @@ func (c *Client) getDoc(ctx context.Context, path string, retry bool) (*goquery.
 		return nil, err
 	}
 
-	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	req, err := c.newRequest(ctx, path)
 	if err != nil {
 		return nil, err
 	}
