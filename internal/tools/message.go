@@ -349,52 +349,77 @@ func htmlToText(rawHTML string) string {
 		return ""
 	}
 
-	var sb strings.Builder
-	walkHTMLForText(root.Get(0), &sb)
-	return collapseTextLines(sb.String())
+	r := &textRenderer{}
+	r.walk(root.Get(0))
+	return collapseTextLines(r.sb.String())
 }
 
-// walkHTMLForText walks the DOM appending text content to sb, treating
-// <br> and block-level tags (<p>, <div>, <li>) as newline boundaries so
-// the caller can later collapse the result into clean lines.
-func walkHTMLForText(n *html.Node, sb *strings.Builder) {
+// textRenderer accumulates the plain-text rendering of a DOM tree. It
+// tracks lastWasNewline alongside the builder so block-level tags can
+// avoid emitting redundant newlines without re-stringing the buffer on
+// every call (strings.Builder.String() is O(1) but the suffix check
+// downstream still added noise — explicit state is clearer and harder
+// to get subtly wrong as the renderer grows).
+type textRenderer struct {
+	sb             strings.Builder
+	lastWasNewline bool
+}
+
+func (r *textRenderer) writeByte(b byte) {
+	r.sb.WriteByte(b)
+	r.lastWasNewline = b == '\n'
+}
+
+func (r *textRenderer) writeString(s string) {
+	if s == "" {
+		return
+	}
+	r.sb.WriteString(s)
+	r.lastWasNewline = s[len(s)-1] == '\n'
+}
+
+// ensureNewline appends a '\n' unless we just wrote one or the buffer is
+// empty (no point starting the output with a blank line).
+func (r *textRenderer) ensureNewline() {
+	if !r.lastWasNewline && r.sb.Len() > 0 {
+		r.writeByte('\n')
+	}
+}
+
+// walk renders the DOM rooted at n. Block-level tags (<p>, <div>, <li>)
+// emit newline boundaries before and after their content; <br> emits one
+// inline; everything else is transparent.
+func (r *textRenderer) walk(n *html.Node) {
 	if n == nil {
 		return
 	}
 	switch n.Type {
 	case html.ElementNode:
-		appendElementText(n, sb)
+		r.appendElement(n)
 	case html.TextNode:
-		sb.WriteString(n.Data)
+		r.writeString(n.Data)
 	default:
-		walkChildrenForText(n, sb)
+		r.walkChildren(n)
 	}
 }
 
-// appendElementText handles the per-element cases (block tags emit
-// newline boundaries; everything else is transparent). Kept separate from
-// walkHTMLForText so the parent function stays under gocyclo's limit.
-func appendElementText(n *html.Node, sb *strings.Builder) {
+func (r *textRenderer) appendElement(n *html.Node) {
 	switch n.Data {
 	case "br":
-		sb.WriteByte('\n')
+		r.writeByte('\n')
 		return
 	case "p", "div", "li":
-		if sb.Len() > 0 && !strings.HasSuffix(sb.String(), "\n") {
-			sb.WriteByte('\n')
-		}
-		walkChildrenForText(n, sb)
-		if !strings.HasSuffix(sb.String(), "\n") {
-			sb.WriteByte('\n')
-		}
+		r.ensureNewline()
+		r.walkChildren(n)
+		r.ensureNewline()
 		return
 	}
-	walkChildrenForText(n, sb)
+	r.walkChildren(n)
 }
 
-func walkChildrenForText(n *html.Node, sb *strings.Builder) {
+func (r *textRenderer) walkChildren(n *html.Node) {
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		walkHTMLForText(c, sb)
+		r.walk(c)
 	}
 }
 

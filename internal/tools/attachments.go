@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/dsaiko/edookit-mcp/internal/client"
@@ -45,7 +46,7 @@ type DownloadedFile struct {
 // inside come from a private school account).
 type DownloadOptions struct {
 	DestDir   string
-	Overwrite bool // if false, an existing file with the same byte count is left untouched
+	Overwrite bool // if false, an existing file at the destination path is left untouched (no size check — we have no Content-Length up-front)
 }
 
 // DownloadAttachments resolves the given message ID, downloads every
@@ -93,41 +94,14 @@ func DownloadAttachments(ctx context.Context, cli *client.Client, messageID stri
 func downloadOne(ctx context.Context, cli *client.Client, a Attachment, destDir string, overwrite bool, usedNames map[string]int) DownloadedFile {
 	out := DownloadedFile{Name: a.Name}
 
-	// Server-supplied URL validation: an empty / whitespace-only link
-	// would otherwise resolve through Client.resolve("") to the base URL
-	// itself, so we'd happily save the Edookit landing page as the
-	// "attachment". Fail per-file instead.
-	if strings.TrimSpace(a.URL) == "" {
-		out.Error = "attachment has no download URL"
+	if errMsg := validateAttachment(a); errMsg != "" {
+		out.Error = errMsg
 		return out
 	}
 
-	// Path-traversal defense, step 1: keep just the base name. Edookit
-	// shouldn't send "../" but treating server-supplied filenames as path
-	// components is the kind of mistake worth not making once.
-	safeName := filepath.Base(a.Name)
-	if safeName == "" || safeName == "." || safeName == ".." || safeName == string(os.PathSeparator) {
-		out.Error = fmt.Sprintf("attachment name %q is not safe to use as a filename", a.Name)
-		return out
-	}
-
-	// Within-call collision: if a previous attachment in this same message
-	// already claimed this filename, bump a "-N" suffix until free. The
-	// skip-if-exists check below handles previous-run files separately
-	// (that's pre-existing-file semantics, not dedup), so this only looks
-	// at usedNames.
-	safeName = uniqueFilename(safeName, usedNames)
-	usedNames[safeName]++
-
-	dst := filepath.Join(destDir, safeName)
-
-	// Path-traversal defense, step 2: even after filepath.Base, a Windows
-	// volume-rooted name like "C:foo" can survive Join in ways that escape
-	// destDir. Verify dst is inside destDir via filepath.Rel; a result
-	// starting with ".." means containment was broken.
-	rel, relErr := filepath.Rel(destDir, dst)
-	if relErr != nil || strings.HasPrefix(rel, "..") || rel == ".." {
-		out.Error = fmt.Sprintf("attachment name %q would escape destination dir", a.Name)
+	dst, errMsg := planDestination(a.Name, destDir, usedNames)
+	if errMsg != "" {
+		out.Error = errMsg
 		return out
 	}
 	out.Path = dst
@@ -144,17 +118,92 @@ func downloadOne(ctx context.Context, cli *client.Client, a Attachment, destDir 
 		}
 	}
 
-	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // G304: dst is filepath.Join(destDir, base(a.Name)) with a filepath.Rel containment check above
+	return streamToDest(ctx, cli, a.URL, destDir, dst, out)
+}
+
+// validateAttachment performs the cheap up-front checks that don't depend
+// on the destination directory: a present download URL, and a base name
+// that isn't a directory-traversal sentinel or Windows-reserved. Returns
+// an error message string (empty = OK) so the caller can stuff it into
+// the result entry without an error allocation.
+func validateAttachment(a Attachment) string {
+	// Server-supplied URL validation: an empty / whitespace-only link
+	// would otherwise resolve through Client.resolve("") to the base URL
+	// itself, so we'd happily save the Edookit landing page as the
+	// "attachment". Fail per-file instead.
+	if strings.TrimSpace(a.URL) == "" {
+		return "attachment has no download URL"
+	}
+	safeName := filepath.Base(a.Name)
+	if safeName == "" || safeName == "." || safeName == ".." || safeName == string(os.PathSeparator) {
+		return fmt.Sprintf("attachment name %q is not safe to use as a filename", a.Name)
+	}
+	if reason := windowsUnsafeName(safeName); reason != "" {
+		return fmt.Sprintf("attachment name %q rejected: %s", a.Name, reason)
+	}
+	return ""
+}
+
+// planDestination computes the final on-disk path for an attachment,
+// applying within-call filename deduplication and verifying the result
+// stays inside destDir. Returns (dst, "") on success or ("", errMsg) if
+// the name can't be placed safely. Mutates usedNames to claim the chosen
+// filename so subsequent attachments in the same call get disambiguated.
+func planDestination(name, destDir string, usedNames map[string]int) (dst, errMsg string) {
+	safeName := filepath.Base(name)
+	// Within-call collision: if a previous attachment in this same message
+	// already claimed this filename, bump a "-N" suffix until free. The
+	// skip-if-exists check in the caller handles previous-run files
+	// separately (that's pre-existing-file semantics, not dedup), so this
+	// only looks at usedNames.
+	safeName = uniqueFilename(safeName, usedNames)
+	usedNames[safeName]++
+
+	dst = filepath.Join(destDir, safeName)
+
+	// Path-traversal defense, step 2: even after filepath.Base, a Windows
+	// volume-rooted name like "C:foo" can survive Join in ways that escape
+	// destDir. Verify dst is inside destDir via filepath.Rel; a result
+	// starting with ".." means containment was broken.
+	rel, relErr := filepath.Rel(destDir, dst)
+	if relErr != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+		return "", fmt.Sprintf("attachment name %q would escape destination dir", name)
+	}
+	return dst, ""
+}
+
+// streamToDest writes the body of url to a unique temp file in destDir
+// and atomically renames to dst on success. The temp-then-rename pattern
+// has two motivations:
+//   - If the download (or its close) fails partway, dst stays intact —
+//     important under overwrite=true, where directly truncating dst would
+//     lose the user's previous version on any failure.
+//   - The skip-if-exists check in the caller only ever sees finished
+//     files, never a half-written one from a previous crash.
+//
+// `out` is the already-populated result entry — we layer Bytes / Error
+// onto it and return.
+func streamToDest(ctx context.Context, cli *client.Client, url, destDir, dst string, out DownloadedFile) DownloadedFile {
+	tmpf, err := os.CreateTemp(destDir, ".edookit-download-*.part")
 	if err != nil {
-		out.Error = fmt.Sprintf("create %s: %v", dst, err)
+		out.Error = fmt.Sprintf("create temp in %s: %v", destDir, err)
+		return out
+	}
+	tmpPath := tmpf.Name()
+	defer func() {
+		if tmpPath != "" {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmpf.Chmod(0o600); err != nil {
+		_ = tmpf.Close()
+		out.Error = fmt.Sprintf("chmod %s: %v", tmpPath, err)
 		return out
 	}
 
-	n, copyErr := cli.GetTo(ctx, a.URL, f)
-	closeErr := f.Close()
+	n, copyErr := cli.GetTo(ctx, url, tmpf)
+	closeErr := tmpf.Close()
 	if copyErr != nil {
-		// Remove the partial file so a retry doesn't see it as "complete enough".
-		_ = os.Remove(dst)
 		out.Error = fmt.Sprintf("download: %v", copyErr)
 		return out
 	}
@@ -162,6 +211,11 @@ func downloadOne(ctx context.Context, cli *client.Client, a Attachment, destDir 
 		out.Error = fmt.Sprintf("close: %v", closeErr)
 		return out
 	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		out.Error = fmt.Sprintf("rename %s -> %s: %v", tmpPath, dst, err)
+		return out
+	}
+	tmpPath = "" // rename succeeded; deferred cleanup must not remove dst
 	out.Bytes = n
 	log.Printf("[tools] downloaded %d bytes -> %s", n, dst)
 	return out
@@ -215,4 +269,30 @@ func resolveDestDir(raw, msgID string) (string, error) {
 		return "", fmt.Errorf("destination_dir %q must be absolute or start with ~/ (the MCP server's cwd is not a stable anchor)", raw)
 	}
 	return raw, nil
+}
+
+// windowsUnsafeName returns a non-empty reason string when name contains a
+// character that would misbehave on Windows: ":" (creates an NTFS
+// Alternate Data Stream inside destDir instead of a normal file) or one
+// of the other reserved characters per
+// https://learn.microsoft.com/windows/win32/fileio/naming-a-file. Control
+// bytes (0-31) are also rejected. Always returns "" on non-Windows GOOS;
+// blocking otherwise-valid Unix filenames containing "abc:def" would be
+// over-strict.
+func windowsUnsafeName(name string) string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	for _, r := range name {
+		if r < 32 {
+			return "contains a control character (Windows-reserved)"
+		}
+		switch r {
+		case ':':
+			return "contains ':' (would create an NTFS Alternate Data Stream on Windows)"
+		case '<', '>', '"', '|', '?', '*':
+			return fmt.Sprintf("contains Windows-reserved character %q", r)
+		}
+	}
+	return ""
 }
