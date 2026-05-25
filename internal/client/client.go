@@ -27,7 +27,7 @@ const defaultUserAgent = "edookit-mcp/0.1 (+https://github.com/dsaiko/edookit-mc
 // chromedp; the resulting session cookie is then handed off to net/http for
 // all subsequent reads/writes.
 type Config struct {
-	BaseURL  string // e.g. https://ssst-login.edookit.net
+	BaseURL  string // your school's Edookit URL, e.g. https://your-school-login.edookit.net
 	Username string // Plus4U identity (email or login name)
 	Password string
 
@@ -192,12 +192,12 @@ func (c *Client) ensureLoggedIn(ctx context.Context) error {
 	// Fast path: cookies already loaded (from cache). Warm them up; if the
 	// session is still alive, we're done without launching chromium.
 	if len(c.http.Jar.Cookies(c.baseURL)) > 0 {
-		if err := c.warmupSession(ctx); err == nil {
+		warmupErr := c.warmupSession(ctx)
+		if warmupErr == nil {
 			c.loggedIn = true
 			return nil
-		} else {
-			log.Printf("[client] cached session invalid (%v); falling back to fresh login", err)
 		}
+		log.Printf("[client] cached session invalid (%v); falling back to fresh login", warmupErr)
 	}
 
 	cookies, err := loginViaBrowser(ctx, browserLoginConfig{

@@ -80,7 +80,7 @@ func captureLocation(ctx context.Context) string {
 
 // browserLoginConfig controls how the headless browser performs OIDC login.
 type browserLoginConfig struct {
-	BaseURL   string        // e.g. https://ssst-login.edookit.net
+	BaseURL   string        // your school's Edookit URL, e.g. https://your-school-login.edookit.net
 	Username  string        // Plus4U identity (email or login name)
 	Password  string        // Plus4U password
 	Headless  bool          // false = visible browser (debugging); true = production

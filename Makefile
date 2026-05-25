@@ -38,6 +38,10 @@ dump-html: ## Dump the rendered landing page HTML to stdout (for selector debugg
 clear-cookies: ## Delete the cached session cookies (forces re-login on next run)
 	@go run . -clear-cookies
 
+test-messages: ## Fetch and print a few inbox + sent messages (smoke test for the MCP tools)
+	@if [ ! -f .env ]; then echo "missing .env"; exit 1; fi
+	@set -a; . ./.env; set +a; go run . -test-messages
+
 install: ## Install the binary into $GOBIN (or $GOPATH/bin)
 	go install .
 

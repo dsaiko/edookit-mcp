@@ -20,6 +20,7 @@ func main() {
 	loginTest := flag.Bool("login-test", false, "perform OIDC login once and exit (smoke test)")
 	dumpHTML := flag.Bool("dump-html", false, "navigate to EDOOKIT_URL, dump body HTML, exit (selector debugging)")
 	clearCookies := flag.Bool("clear-cookies", false, "delete the cached session cookies and exit")
+	testMessages := flag.Bool("test-messages", false, "list a few inbox + sent messages and exit (smoke test for the tools)")
 	flag.Parse()
 
 	if *clearCookies {
@@ -46,6 +47,10 @@ func main() {
 		runLoginTest(cli)
 		return
 	}
+	if *testMessages {
+		runTestMessages(cli)
+		return
+	}
 
 	s := server.NewMCPServer(
 		"edookit-mcp",
@@ -53,30 +58,89 @@ func main() {
 		server.WithToolCapabilities(true),
 	)
 
+	registerInboxTool(s, cli)
+	registerSentTool(s, cli)
+
+	if err := server.ServeStdio(s); err != nil {
+		log.Fatalf("serve stdio: %v", err)
+	}
+}
+
+func registerInboxTool(s *server.MCPServer, cli *client.Client) {
 	s.AddTool(
-		mcp.NewTool("get_grades",
-			mcp.WithDescription("Fetch the user's grades from Edookit, optionally filtered by period."),
-			mcp.WithString("period",
-				mcp.Description("Period identifier as used by the site, e.g. '2025-spring'. Optional."),
+		mcp.NewTool("list_inbox",
+			mcp.WithDescription("List messages in the Edookit inbox (Komunikace → Přijaté). "+
+				"Returns the most recent messages first. Each result has id, date, sender, "+
+				"subject, body_preview (first ~200 chars), and attachments count."),
+			mcp.WithString("view",
+				mcp.Description("Which subset to list: 'inbox' (default), 'unread' (Nepřečtené), "+
+					"'starred' (S hvězdičkou), 'archived' (Archiv), 'all' (Vše)."),
+			),
+			mcp.WithString("fulltext",
+				mcp.Description("Optional server-side full-text search across senders, subjects, and bodies."),
+			),
+			mcp.WithString("since",
+				mcp.Description("Optional client-side date floor. Accepts '7d', '1w', '2m', '1y', "+
+					"or an ISO date 'YYYY-MM-DD'. Messages older than this are excluded."),
+			),
+			mcp.WithNumber("limit",
+				mcp.Description("Max messages to return. Default 50, max 200. Paginates internally if needed."),
 			),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			period := req.GetString("period", "")
-			grades, err := tools.GetGrades(ctx, cli, period)
+			opts := tools.InboxOptions{
+				View:     req.GetString("view", ""),
+				Fulltext: req.GetString("fulltext", ""),
+				Since:    req.GetString("since", ""),
+				Limit:    int(req.GetFloat("limit", 0)),
+			}
+			msgs, err := tools.ListInbox(ctx, cli, opts)
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			b, err := json.Marshal(grades)
+			b, err := json.Marshal(msgs)
 			if err != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("marshal: %v", err)), nil
 			}
 			return mcp.NewToolResultText(string(b)), nil
 		},
 	)
+}
 
-	if err := server.ServeStdio(s); err != nil {
-		log.Fatalf("serve stdio: %v", err)
-	}
+func registerSentTool(s *server.MCPServer, cli *client.Client) {
+	s.AddTool(
+		mcp.NewTool("list_sent",
+			mcp.WithDescription("List messages the user has sent (Komunikace → Vytvořené). "+
+				"Returns the most recent first. Each result has id, date, status (e.g. 'Publikováno'), "+
+				"subject, body_preview, and attachments count."),
+			mcp.WithString("fulltext",
+				mcp.Description("Optional server-side full-text search across subjects and bodies."),
+			),
+			mcp.WithString("since",
+				mcp.Description("Optional client-side date floor. Accepts '7d', '1w', '2m', '1y', "+
+					"or an ISO date 'YYYY-MM-DD'. Messages older than this are excluded."),
+			),
+			mcp.WithNumber("limit",
+				mcp.Description("Max messages to return. Default 50, max 200. Paginates internally if needed."),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			opts := tools.SentOptions{
+				Fulltext: req.GetString("fulltext", ""),
+				Since:    req.GetString("since", ""),
+				Limit:    int(req.GetFloat("limit", 0)),
+			}
+			msgs, err := tools.ListSent(ctx, cli, opts)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			b, err := json.Marshal(msgs)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("marshal: %v", err)), nil
+			}
+			return mcp.NewToolResultText(string(b)), nil
+		},
+	)
 }
 
 func runDumpHTML(baseURL string, headless bool) {
@@ -100,9 +164,6 @@ func runLoginTest(cli *client.Client) {
 	cookies := cli.SessionCookies()
 	log.Printf("session ready — %d cookie(s) available for target host", len(cookies))
 
-	// End-to-end check: GET /handler/page/dashboard via the authenticated client
-	// and confirm the server returns authenticated content (not the "not logged
-	// in" fallback). This proves the warmup wired the session correctly.
 	var probe map[string]any
 	if err := cli.GetJSON(ctx, "/handler/page/dashboard", &probe); err != nil {
 		log.Fatalf("dashboard probe failed: %v", err)
@@ -111,6 +172,46 @@ func runLoginTest(cli *client.Client) {
 		log.Printf("authenticated session verified via /handler/page/dashboard")
 	} else {
 		log.Printf("WARNING: /handler/page/dashboard returned authenticated=false despite successful login")
+	}
+}
+
+func runTestMessages(cli *client.Client) {
+	ctx := context.Background()
+
+	log.Printf("=== INBOX (3 most recent) ===")
+	inbox, err := tools.ListInbox(ctx, cli, tools.InboxOptions{Limit: 3})
+	if err != nil {
+		log.Fatalf("list inbox: %v", err)
+	}
+	for _, m := range inbox {
+		log.Printf("  [%s] %s | %s | %q | attachments=%d",
+			m.ID, m.Date, m.Sender, m.Subject, m.Attachments)
+		if m.BodyPreview != "" {
+			log.Printf("    %s", m.BodyPreview)
+		}
+	}
+
+	log.Printf("=== SENT (3 most recent) ===")
+	sent, err := tools.ListSent(ctx, cli, tools.SentOptions{Limit: 3})
+	if err != nil {
+		log.Fatalf("list sent: %v", err)
+	}
+	for _, m := range sent {
+		log.Printf("  [%s] %s | %s | %q | attachments=%d",
+			m.ID, m.Date, m.Status, m.Subject, m.Attachments)
+		if m.BodyPreview != "" {
+			log.Printf("    %s", m.BodyPreview)
+		}
+	}
+
+	log.Printf("=== INBOX UNREAD ===")
+	unread, err := tools.ListInbox(ctx, cli, tools.InboxOptions{View: "unread", Limit: 5})
+	if err != nil {
+		log.Fatalf("list unread: %v", err)
+	}
+	log.Printf("%d unread message(s)", len(unread))
+	for _, m := range unread {
+		log.Printf("  [%s] %s | %s | %q", m.ID, m.Date, m.Sender, m.Subject)
 	}
 }
 
