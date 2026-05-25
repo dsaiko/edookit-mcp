@@ -26,7 +26,7 @@ run: ## Run the MCP server locally with .env loaded (expects MCP framing on stdi
 	@if [ ! -f .env ]; then echo "missing .env — copy .env.example and fill in credentials"; exit 1; fi
 	@set -a; . ./.env; set +a; go run .
 
-smoke-login: ## Perform the OIDC login once and exit, printing captured cookies (set EDOOKIT_HEADLESS_LOGIN=false to watch)
+smoke-login: ## Perform the OIDC login once and exit, logging the cookie count and verifying the dashboard probe (set EDOOKIT_HEADLESS_LOGIN=false to watch)
 	@if [ ! -f .env ]; then echo "missing .env"; exit 1; fi
 	@set -a; . ./.env; set +a; go run . -login-test
 

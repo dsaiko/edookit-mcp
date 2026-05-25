@@ -121,7 +121,8 @@ type gridResponse struct {
 }
 
 func fetchAndParse(ctx context.Context, cli *client.Client, path string, baseQuery url.Values, since string, limit int, isSent bool) ([]Message, error) {
-	sinceTime, err := parseSince(since)
+	loc := cli.Timezone()
+	sinceTime, err := parseSince(since, loc)
 	if err != nil {
 		return nil, fmt.Errorf("invalid since %q: %w", since, err)
 	}
@@ -149,7 +150,7 @@ func fetchAndParse(ctx context.Context, cli *client.Client, path string, baseQue
 				log.Printf("[tools] skipping row %d on page %d: only %d cells (expected ≥3)", len(results)+1, page, len(row))
 				continue
 			}
-			msg, perr := parseRow(row[0], row[2], isSent)
+			msg, perr := parseRow(row[0], row[2], isSent, loc)
 			if perr != nil {
 				// Surface the schema drift so it's visible in logs instead of
 				// returning a short result with no explanation.
@@ -190,7 +191,12 @@ var czechDateRe = regexp.MustCompile(`(\d{1,2})\.(\d{1,2})\.(\d{4}) (\d{1,2}):(\
 // missing fields so callers can log and skip the row instead of silently
 // emitting a malformed Message (which would also slip past the `since`
 // filter, since its RFC3339 parse fails for empty Date and falls through).
-func parseRow(uid, rowHTML string, isSent bool) (Message, error) {
+//
+// loc is the school's wall-clock timezone. Edookit row dates come without
+// offset suffix ("21.05.2026 12:31"), so we have to anchor them to an
+// explicit Location before formatting as RFC3339 — otherwise running the
+// MCP on a host outside the school's TZ would emit the wrong UTC offsets.
+func parseRow(uid, rowHTML string, isSent bool, loc *time.Location) (Message, error) {
 	msg := Message{ID: uid}
 	if uid == "" {
 		return msg, errors.New("empty row UID")
@@ -214,7 +220,7 @@ func parseRow(uid, rowHTML string, isSent bool) (Message, error) {
 		y, _ := strconv.Atoi(m[3])
 		h, _ := strconv.Atoi(m[4])
 		mi, _ := strconv.Atoi(m[5])
-		msg.Date = time.Date(y, time.Month(mo), d, h, mi, 0, 0, time.Local).Format(time.RFC3339)
+		msg.Date = time.Date(y, time.Month(mo), d, h, mi, 0, 0, loc).Format(time.RFC3339)
 	} else {
 		missing = append(missing, "date")
 	}
@@ -373,12 +379,17 @@ func truncateRunes(s string, maxRunes int) string {
 }
 
 // parseSince accepts "7d", "1w", "2m", "1y", or an ISO date (YYYY-MM-DD or
-// RFC3339). Empty string means "no floor". For relative durations and bare
-// YYYY-MM-DD the returned time is in time.Local; for RFC3339 it preserves
-// whatever offset the input carried (e.g. "...Z" stays UTC). Either way the
-// downstream comparison via time.Time.Before/After is TZ-correct because it
-// compares the underlying instant, not wall-clock fields.
-func parseSince(s string) (time.Time, error) {
+// RFC3339). Empty string means "no floor".
+//
+// For bare YYYY-MM-DD the date is interpreted in loc (the school's TZ) so
+// "2026-05-01" lines up with how Edookit would render that wall-clock day.
+// For RFC3339 the input's own offset is preserved (e.g. "...Z" stays UTC).
+// Relative durations (7d/1w/2m/1y) are computed off time.Now() in the host's
+// TZ — semantically "exactly N days ago to the minute". All three cases
+// produce instants and the downstream time.Before/After comparison is
+// instant-based, so the result is correct regardless of which TZ each side
+// carries.
+func parseSince(s string, loc *time.Location) (time.Time, error) {
 	if s == "" {
 		return time.Time{}, nil
 	}
@@ -398,11 +409,7 @@ func parseSince(s string) (time.Time, error) {
 			}
 		}
 	}
-	// ISO date (no TZ) must be interpreted in the local TZ so it matches the
-	// message timestamps we generate via time.Date(..., time.Local). Otherwise
-	// the boundary shifts by the local offset and messages around midnight get
-	// the wrong side of the cutoff.
-	if t, err := time.ParseInLocation("2006-01-02", s, time.Local); err == nil {
+	if t, err := time.ParseInLocation("2006-01-02", s, loc); err == nil {
 		return t, nil
 	}
 	if t, err := time.Parse(time.RFC3339, s); err == nil {

@@ -8,6 +8,11 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"time"
+
+	// Embed the IANA tzdata so time.LoadLocation works on hosts without
+	// /usr/share/zoneinfo (Windows binaries, slim containers).
+	_ "time/tzdata"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -49,6 +54,7 @@ func main() {
 		Password:        getenvRequired("EDOOKIT_PASS"),
 		HeadlessLogin:   getenvBool("EDOOKIT_HEADLESS_LOGIN", true),
 		CookieCachePath: cookieCachePath(),
+		Timezone:        loadTimezone(),
 	})
 	if err != nil {
 		log.Fatalf("init client: %v", err)
@@ -248,6 +254,24 @@ func cookieCachePath() string {
 		return ""
 	}
 	return p
+}
+
+// loadTimezone resolves EDOOKIT_TIMEZONE (defaulting to Europe/Prague) into
+// a *time.Location. Edookit row dates are rendered in the school's wall-clock
+// time with no offset suffix, so we have to anchor parsing to an explicit
+// Location — otherwise the MCP would emit wrong UTC offsets when running on
+// a host outside the school's timezone. tzdata is embedded via `time/tzdata`
+// so this works on hosts without /usr/share/zoneinfo (Windows, slim images).
+func loadTimezone() *time.Location {
+	name := os.Getenv("EDOOKIT_TIMEZONE")
+	if name == "" {
+		name = "Europe/Prague"
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		log.Fatalf("invalid EDOOKIT_TIMEZONE: %v", err)
+	}
+	return loc
 }
 
 func runClearCookies() {

@@ -36,10 +36,14 @@ const sentRowDigiHTML = `<small><span style="color:#77bb00">Publikováno</span>,
 	` <span style="vertical-align:50%"><span style="color:#0c9ce1"><b>(1)</b></span></span></div>` +
 	`Dobrý den, posílám informace.<br>`
 
+// testLoc is the timezone the unit tests pass to parseRow/parseSince. Using
+// UTC keeps assertions stable regardless of where the test host happens to be.
+var testLoc = time.UTC
+
 func TestParseRow_Inbox(t *testing.T) {
 	t.Parallel()
 
-	msg, err := parseRow("m-290491", inboxRowKaliskovaHTML, false)
+	msg, err := parseRow("m-290491", inboxRowKaliskovaHTML, false, testLoc)
 	if err != nil {
 		t.Fatalf("parseRow: %v", err)
 	}
@@ -66,12 +70,12 @@ func TestParseRow_Inbox(t *testing.T) {
 		t.Errorf("BodyPreview = %q, want prefix 'Ahoj Dušane'", msg.BodyPreview)
 	}
 
-	// Date should round-trip via RFC3339 to 2026-05-21 12:31 local.
+	// Date should round-trip via RFC3339 to 2026-05-21 12:31 in testLoc.
 	gotTime, err := time.Parse(time.RFC3339, msg.Date)
 	if err != nil {
 		t.Fatalf("parse Date %q: %v", msg.Date, err)
 	}
-	want := time.Date(2026, 5, 21, 12, 31, 0, 0, time.Local)
+	want := time.Date(2026, 5, 21, 12, 31, 0, 0, testLoc)
 	if !gotTime.Equal(want) {
 		t.Errorf("Date parsed to %v, want %v", gotTime, want)
 	}
@@ -80,7 +84,7 @@ func TestParseRow_Inbox(t *testing.T) {
 func TestParseRow_InboxWithAttachments(t *testing.T) {
 	t.Parallel()
 
-	msg, err := parseRow("m-289862", inboxRowNovinkyHTML, false)
+	msg, err := parseRow("m-289862", inboxRowNovinkyHTML, false, testLoc)
 	if err != nil {
 		t.Fatalf("parseRow: %v", err)
 	}
@@ -98,7 +102,7 @@ func TestParseRow_InboxWithAttachments(t *testing.T) {
 func TestParseRow_Sent(t *testing.T) {
 	t.Parallel()
 
-	msg, err := parseRow("m-290462", sentRowDigiHTML, true)
+	msg, err := parseRow("m-290462", sentRowDigiHTML, true, testLoc)
 	if err != nil {
 		t.Fatalf("parseRow: %v", err)
 	}
@@ -120,7 +124,7 @@ func TestParseRow_BadUID(t *testing.T) {
 	t.Parallel()
 
 	// Non-numeric UID should still parse but Number stays 0.
-	msg, err := parseRow("custom-id", inboxRowKaliskovaHTML, false)
+	msg, err := parseRow("custom-id", inboxRowKaliskovaHTML, false, testLoc)
 	if err != nil {
 		t.Fatalf("parseRow: %v", err)
 	}
@@ -135,7 +139,7 @@ func TestParseRow_BadUID(t *testing.T) {
 func TestParseRow_EmptyUIDIsError(t *testing.T) {
 	t.Parallel()
 
-	_, err := parseRow("", inboxRowKaliskovaHTML, false)
+	_, err := parseRow("", inboxRowKaliskovaHTML, false, testLoc)
 	if err == nil {
 		t.Fatal("expected error for empty UID, got nil")
 	}
@@ -187,7 +191,7 @@ func TestParseRow_ValidationErrors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := parseRow("m-1", tc.html, tc.isSent)
+			_, err := parseRow("m-1", tc.html, tc.isSent, testLoc)
 			if err == nil {
 				t.Fatalf("expected error for missing %q, got nil", tc.wantMissing)
 			}
@@ -206,7 +210,7 @@ func TestParseRow_MultipleMissingFieldsReported(t *testing.T) {
 
 	// A row that's missing several required fields at once should name them all.
 	html := `<small></small><div></div><br>`
-	_, err := parseRow("m-2", html, false)
+	_, err := parseRow("m-2", html, false, testLoc)
 	if err == nil {
 		t.Fatal("expected error for empty row, got nil")
 	}
@@ -404,7 +408,7 @@ func TestParseSince(t *testing.T) {
 		{name: "1w", input: "1w", wantOK: true, within: 7*24*time.Hour + time.Minute},
 		{name: "2m", input: "2m", wantOK: true, within: 65 * 24 * time.Hour}, // ~2 months, loose
 		{name: "1y", input: "1y", wantOK: true, within: 366 * 24 * time.Hour},
-		{name: "iso date (local TZ)", input: "2026-05-01", wantOK: true, exactT: time.Date(2026, 5, 1, 0, 0, 0, 0, time.Local)},
+		{name: "iso date in testLoc", input: "2026-05-01", wantOK: true, exactT: time.Date(2026, 5, 1, 0, 0, 0, 0, testLoc)},
 		{name: "garbage", input: "not-a-date", wantOK: false},
 		{name: "zero count", input: "0d", wantOK: false},
 		{name: "negative", input: "-5d", wantOK: false},
@@ -413,7 +417,7 @@ func TestParseSince(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := parseSince(tc.input)
+			got, err := parseSince(tc.input, testLoc)
 			if (err == nil) != tc.wantOK {
 				t.Fatalf("parseSince(%q) error = %v, wantOK = %v", tc.input, err, tc.wantOK)
 			}

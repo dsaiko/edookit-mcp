@@ -192,35 +192,38 @@ func loginViaBrowser(ctx context.Context, cfg browserLoginConfig) ([]*http.Cooki
 			action: chromedp.WaitVisible(plus4uButton, chromedp.ByQuery),
 		},
 		{
-			name: "wait for OIDC client library to load",
+			// Wait for everything we need before the click:
+			//   1. idmLoginClick defined — the onclick handler we're going to invoke
+			//   2. libraryImportPromise defined — Plus4U's OIDC lib is at least started
+			//   3. UU5.Environment.uu_app_oidc_providers_oidcg02_client_id populated —
+			//      the value we need to extract. uu5loader can reassign UU5.Environment
+			//      partway through init, so we check the actual field is non-empty
+			//      rather than assuming "lib loaded" implies "config populated".
+			name: "wait for OIDC client library + environment to populate",
 			action: chromedp.ActionFunc(func(ctx context.Context) error {
 				return waitForJSCondition(ctx,
-					`typeof idmLoginClick === 'function' && typeof libraryImportPromise !== 'undefined'`,
+					`typeof idmLoginClick === 'function' && typeof libraryImportPromise !== 'undefined' && !!(window.UU5 && window.UU5.Environment && window.UU5.Environment.uu_app_oidc_providers_oidcg02_client_id)`,
 					30*time.Second)
 			}),
 		},
 		{
-			// Pull the per-tenant OIDC client_id straight out of the landing
-			// page's embedded UU5.Environment block, so the fetch interceptor
-			// strips prompt=none from THIS school's auth request and leaves
-			// any other client's (notably the IdM SPA's silent renewal)
-			// alone. Different Edookit tenants get different client IDs;
-			// hardcoding would break the flow for any school other than the
-			// one this MCP was first built against.
-			//
-			// Runs AFTER waiting for the lib to finish initializing — reading
-			// the property during the lib's async init can race with its
-			// internal getMetadata() call and trigger a "must be invoked
-			// async" error in the lib.
+			// Pull the per-tenant OIDC client_id from the landing page's
+			// UU5.Environment block. Each Edookit tenant has its own value,
+			// so the fetch interceptor below can target THIS school's auth
+			// request and leave the IdM SPA's nested silent renewal (a
+			// different client_id) alone.
 			name: "extract OIDC client_id from landing page",
 			action: chromedp.ActionFunc(func(ctx context.Context) error {
-				const js = `(window.UU5 && window.UU5.Environment && window.UU5.Environment.uu_app_oidc_providers_oidcg02_client_id) || ""`
+				const js = `window.UU5.Environment.uu_app_oidc_providers_oidcg02_client_id`
 				var got string
 				if err := chromedp.Run(ctx, chromedp.Evaluate(js, &got)); err != nil {
 					return fmt.Errorf("evaluate client_id: %w", err)
 				}
 				if got == "" {
-					return errors.New("OIDC client_id not found in landing page (expected window.UU5.Environment.uu_app_oidc_providers_oidcg02_client_id)")
+					// Belt-and-braces: the readiness step above gated on a
+					// non-empty value, but defend against a race where the
+					// field is reset between the gate and our read.
+					return errors.New("OIDC client_id empty (UU5.Environment may have been reset between readiness check and read)")
 				}
 				clientIDStore.Store(got)
 				log.Printf("[login] OIDC client_id: %s", got)

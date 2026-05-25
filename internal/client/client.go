@@ -50,6 +50,14 @@ type Config struct {
 	// Default 10h, sized for Edookit's ~12h session window.
 	CookieMaxAge time.Duration
 
+	// Timezone is the school's wall-clock timezone. Edookit row dates are
+	// rendered in tenant-local time ("21.05.2026 12:31") with no offset
+	// suffix, so we need an explicit Location to interpret them correctly —
+	// otherwise the MCP would emit wrong RFC3339 offsets when running on a
+	// host outside the school's timezone (e.g. a cloud VM in UTC).
+	// Default: Europe/Prague.
+	Timezone *time.Location
+
 	HTTPClient *http.Client
 }
 
@@ -67,9 +75,12 @@ type Client struct {
 
 // New constructs a Client from the given config. It returns an error if
 // required fields (BaseURL, Username, Password) are missing. If a cached
-// cookie file exists and is within CookieMaxAge, it is loaded eagerly and
-// the client starts in the logged-in state — no chromium launch needed
-// until the session expires.
+// cookie file exists and is within CookieMaxAge, the cookies are preloaded
+// into the jar but the client deliberately starts as `loggedIn=false`: the
+// first call to ensureLoggedIn performs a cheap GET / warmup that verifies
+// the cached session is still valid and resurrects the PHP session before
+// any /handler/page/* hit. Only when warmup fails does chromium relaunch
+// for a full OIDC login.
 func New(cfg Config) (*Client, error) {
 	if cfg.BaseURL == "" {
 		return nil, errors.New("BaseURL is required")
@@ -80,25 +91,28 @@ func New(cfg Config) (*Client, error) {
 	if cfg.CookieMaxAge == 0 {
 		cfg.CookieMaxAge = 10 * time.Hour
 	}
+	if cfg.Timezone == nil {
+		// "Europe/Prague" is the school's TZ for the schools this MCP targets.
+		// time/tzdata is imported in main.go so this works on Windows / locked
+		// down containers that lack /usr/share/zoneinfo.
+		loc, err := time.LoadLocation("Europe/Prague")
+		if err != nil {
+			// Should never happen with time/tzdata embedded, but fall back to
+			// the host's local TZ rather than erroring out on construction.
+			log.Printf("[client] LoadLocation(Europe/Prague) failed (%v); falling back to time.Local", err)
+			loc = time.Local
+		}
+		cfg.Timezone = loc
+	}
 
 	u, err := url.Parse(cfg.BaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse base url: %w", err)
 	}
 
-	httpClient := cfg.HTTPClient
-	if httpClient == nil {
-		jar, err := cookiejar.New(nil)
-		if err != nil {
-			return nil, fmt.Errorf("cookiejar: %w", err)
-		}
-		httpClient = &http.Client{Jar: jar, Timeout: 20 * time.Second}
-	} else if httpClient.Jar == nil {
-		jar, err := cookiejar.New(nil)
-		if err != nil {
-			return nil, fmt.Errorf("cookiejar: %w", err)
-		}
-		httpClient.Jar = jar
+	httpClient, err := buildHTTPClient(cfg.HTTPClient)
+	if err != nil {
+		return nil, err
 	}
 
 	c := &Client{cfg: cfg, http: httpClient, baseURL: u}
@@ -139,6 +153,28 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body io.Re
 	return req, nil
 }
 
+// buildHTTPClient returns the *http.Client New should use. If the caller
+// provided one, we honor it and only fill in a fresh cookie jar when none
+// was supplied. If they didn't, we build the whole thing with a 20s timeout
+// and our own jar. Either way the returned client has a non-nil Jar.
+func buildHTTPClient(provided *http.Client) (*http.Client, error) {
+	if provided != nil {
+		if provided.Jar == nil {
+			jar, err := cookiejar.New(nil)
+			if err != nil {
+				return nil, fmt.Errorf("cookiejar: %w", err)
+			}
+			provided.Jar = jar
+		}
+		return provided, nil
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("cookiejar: %w", err)
+	}
+	return &http.Client{Jar: jar, Timeout: 20 * time.Second}, nil
+}
+
 // EnsureLoggedIn forces a login if we don't already have a session. Normally
 // callers don't need this — GetDoc/GetJSON authenticate lazily. Exposed for
 // smoke tests and eager-login flows.
@@ -150,6 +186,13 @@ func (c *Client) EnsureLoggedIn(ctx context.Context) error {
 // Intended for diagnostics; do not log these in production.
 func (c *Client) SessionCookies() []*http.Cookie {
 	return c.http.Jar.Cookies(c.baseURL)
+}
+
+// Timezone returns the Location callers should use when interpreting
+// Edookit's wall-clock timestamps (row dates have no offset suffix).
+// Configured via Config.Timezone — default Europe/Prague.
+func (c *Client) Timezone() *time.Location {
+	return c.cfg.Timezone
 }
 
 // warmupSession performs a GET / which Edookit needs to "resurrect" a PHP
@@ -236,19 +279,39 @@ func (c *Client) ensureLoggedIn(ctx context.Context) error {
 	return nil
 }
 
-// invalidateSession marks the session as logged out AND clears the cookie jar
-// so the next ensureLoggedIn skips the cached-cookies fast path and runs the
-// full chromedp login. Just flipping loggedIn=false isn't enough — warmup can
-// still succeed (server hands out a new PHPSESSID) with auth tokens that the
-// backend has already invalidated, which would yield an infinite no-op retry
-// loop on authenticated=false responses.
+// invalidateSession marks the session as logged out AND drops the cached
+// auth cookies so the next ensureLoggedIn skips the warmup-only fast path
+// and runs a full chromedp login. Just flipping loggedIn=false isn't enough
+// — warmup can still succeed (server hands out a new PHPSESSID) with auth
+// tokens the backend has already invalidated, which would yield an infinite
+// no-op retry loop on authenticated=false responses.
+//
+// The jar itself is NOT swapped — concurrent tool calls in c.http.Do may be
+// reading from it via Jar.Cookies(), and reassigning c.http.Jar would race
+// with those reads. Instead we expire each cookie in place via SetCookies
+// with MaxAge=-1; cookiejar.Jar is documented as safe for concurrent access,
+// and a Set during a concurrent Get is properly serialized inside the jar.
 func (c *Client) invalidateSession() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.loggedIn = false
-	if jar, err := cookiejar.New(nil); err == nil {
-		c.http.Jar = jar
+	c.clearJarCookies()
+}
+
+// clearJarCookies expires every cookie the jar currently holds for baseURL.
+// Names are read from the jar (Jar.Cookies strips Domain/Path, but the
+// removal entry's Domain/Path are inferred from the URL we pass, which is
+// the same URL used to store them — so the removal IDs match).
+func (c *Client) clearJarCookies() {
+	existing := c.http.Jar.Cookies(c.baseURL)
+	if len(existing) == 0 {
+		return
 	}
+	toRemove := make([]*http.Cookie, len(existing))
+	for i, ck := range existing {
+		toRemove[i] = &http.Cookie{Name: ck.Name, Path: "/", MaxAge: -1} //nolint:gosec // G124: deletion markers; cookiejar drops entries with MaxAge<0 regardless of secure-flag attributes
+	}
+	c.http.Jar.SetCookies(c.baseURL, toRemove)
 }
 
 // GetDoc fetches a path as a parsed HTML document, re-authenticating once if
