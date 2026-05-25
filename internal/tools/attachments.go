@@ -281,14 +281,32 @@ func resolveDestDir(raw, msgID string) (string, error) {
 	return raw, nil
 }
 
-// windowsUnsafeName returns a non-empty reason string when name contains a
-// character that would misbehave on Windows: ":" (creates an NTFS
-// Alternate Data Stream inside destDir instead of a normal file) or one
-// of the other reserved characters per
-// https://learn.microsoft.com/windows/win32/fileio/naming-a-file. Control
-// bytes (0-31) are also rejected. Always returns "" on non-Windows GOOS;
-// blocking otherwise-valid Unix filenames containing "abc:def" would be
-// over-strict.
+// windowsReservedBasenames is the set of DOS device names Windows refuses
+// to create as regular files, applied case-insensitively and regardless
+// of extension (CON.txt is reserved too). Sourced from
+// https://learn.microsoft.com/windows/win32/fileio/naming-a-file.
+var windowsReservedBasenames = map[string]bool{
+	"CON": true, "PRN": true, "AUX": true, "NUL": true,
+	"COM0": true, "COM1": true, "COM2": true, "COM3": true, "COM4": true,
+	"COM5": true, "COM6": true, "COM7": true, "COM8": true, "COM9": true,
+	"LPT0": true, "LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true,
+	"LPT5": true, "LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true,
+}
+
+// windowsUnsafeName returns a non-empty reason string when name would
+// misbehave on Windows. Catches:
+//
+//   - Reserved characters: ":" (creates an NTFS Alternate Data Stream
+//     inside destDir instead of a normal file), plus < > " | ? * and
+//     control bytes (0-31).
+//   - Reserved DOS device basenames: CON, PRN, AUX, NUL, COM0-9, LPT0-9
+//     — case-insensitive, with or without an extension.
+//   - Names ending in space or '.' (Windows silently strips them and
+//     creates a file under a name the user can't reliably re-open).
+//
+// All checks per https://learn.microsoft.com/windows/win32/fileio/naming-a-file.
+// Always returns "" on non-Windows GOOS so otherwise-valid Unix filenames
+// (containing "abc:def" or named "CON") aren't blocked.
 func windowsUnsafeName(name string) string {
 	if runtime.GOOS != "windows" {
 		return ""
@@ -303,6 +321,21 @@ func windowsUnsafeName(name string) string {
 		case '<', '>', '"', '|', '?', '*':
 			return fmt.Sprintf("contains Windows-reserved character %q", r)
 		}
+	}
+	// Trailing space or dot: Windows quietly strips them, so the actual
+	// on-disk name doesn't match what was requested and re-opening by
+	// the requested name fails.
+	if last := name[len(name)-1]; last == ' ' || last == '.' {
+		return "ends with space or '.' (Windows silently strips trailing space/dot)"
+	}
+	// DOS device basename: reserved regardless of extension. Strip
+	// extension and compare uppercase against the well-known list.
+	stem := name
+	if dot := strings.LastIndexByte(name, '.'); dot >= 0 {
+		stem = name[:dot]
+	}
+	if windowsReservedBasenames[strings.ToUpper(stem)] {
+		return fmt.Sprintf("basename %q is a reserved Windows device name", stem)
 	}
 	return ""
 }

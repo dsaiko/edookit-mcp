@@ -406,18 +406,29 @@ func TestDownloadAttachments_OverwriteTruePreservesOldFileOnFailure(t *testing.T
 	}
 }
 
-// U3: windowsUnsafeName is a no-op on non-Windows and flags reserved chars
-// on Windows. We can't easily test the Windows branch from a Unix CI host,
-// but we can at least verify the GOOS gate and the per-char detection
-// when forced.
+// U3 + W3: windowsUnsafeName is a no-op on non-Windows and flags reserved
+// chars / reserved DOS basenames / trailing-space-or-dot on Windows. We
+// can't easily test the Windows-positive branch from a Unix CI host
+// (runtime.GOOS is fixed at build), but we can verify the GOOS gate by
+// asserting that NONE of the per-rule cases trigger on a non-Windows host.
 func TestWindowsUnsafeName(t *testing.T) {
 	t.Parallel()
 	// On the test host (not Windows in any plausible CI / dev setup) the
 	// function should always return "" — Unix users with file names like
-	// "report 12:00.pdf" should not be blocked.
-	for _, name := range []string{"report:stream", "file<x>.txt", "ok.pdf", "../escape"} {
+	// "report 12:00.pdf", "CON", or "trailing space " should not be blocked.
+	cases := []string{
+		// reserved chars
+		"report:stream", `file<x>.txt`, `"quoted".pdf`, "weird|name.txt", "what?.txt", "star*.bin",
+		// reserved basenames
+		"CON", "con.txt", "PRN.pdf", "AUX", "NUL.log", "COM1", "COM9.docx", "LPT0", "lpt9.bin",
+		// trailing space / dot
+		"trailing space ", "trailing-dot.", "ok.pdf.",
+		// negative controls — should always pass
+		"ok.pdf", "../escape", "ContentList.json",
+	}
+	for _, name := range cases {
 		if got := windowsUnsafeName(name); got != "" {
-			t.Errorf("non-Windows: windowsUnsafeName(%q) = %q, want empty", name, got)
+			t.Errorf("non-Windows: windowsUnsafeName(%q) = %q, want empty (GOOS gate must keep all Unix names passing)", name, got)
 		}
 	}
 }

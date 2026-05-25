@@ -274,7 +274,7 @@ Pokud chcete Claudovi pomoci přesně, můžete parametry zmínit explicitně ("
 | Parametr | Hodnoty | Default |
 |---|---|---|
 | `id` (povinné) | jako u `get_message` | — |
-| `destination_dir` | absolutní cesta, cesta začínající `~/` (rozvine se do home dir), nebo holé `~` (home dir samotný); relativní cesty server odmítne s chybou — cwd MCP serveru není stabilní | `<os-temp>/edookit-mcp/<id>/` (na macOS/Linuxu typicky `/tmp/...`, na Windows `%TMP%\...`) |
+| `destination_dir` | absolutní cesta, cesta začínající `~/` (rozvine se do home dir), nebo holé `~` (home dir samotný); relativní cesty server odmítne s chybou — cwd MCP serveru není stabilní | `<os-temp>/edookit-mcp/m-<číslo>/` — `m-` prefix je vždy přítomen, i když jste do `id` parametru předali bare číslo (na macOS/Linuxu typicky `/tmp/...`, na Windows `%TMP%\...`) |
 | `overwrite` | `true` / `false` — má se existující soubor přepsat? | `false` (existující soubor se přeskočí) |
 
 #### Co dostanete zpět

@@ -250,12 +250,14 @@ func registerDownloadAttachmentsTool(s *server.MCPServer, cli *client.Client) {
 			),
 			mcp.WithString("destination_dir",
 				mcp.Description("Local filesystem directory where attachments will be saved. "+
-					"Optional — defaults to <os-temp-dir>/edookit-mcp/<message-id>/, which "+
-					"is portable across operating systems (/tmp/... on Linux/macOS, "+
-					"%TMP%\\... on Windows) and gets garbage-collected by the OS. Pass an "+
-					"explicit path for persistent storage. Accepted: an absolute path, a "+
-					"path starting with ~/ (expanded to under the user's home dir), or "+
-					"a bare ~ (the home dir itself). Relative paths are rejected because "+
+					"Optional — defaults to <os-temp-dir>/edookit-mcp/m-<number>/, "+
+					"where <number> is the numeric portion of the message id (so "+
+					"id='m-289862' AND id='289862' both land in 'm-289862/'). Portable "+
+					"across operating systems (/tmp/... on Linux/macOS, %TMP%\\... on "+
+					"Windows) and gets garbage-collected by the OS. Pass an explicit "+
+					"path for persistent storage. Accepted: an absolute path, a path "+
+					"starting with ~/ (expanded to under the user's home dir), or a "+
+					"bare ~ (the home dir itself). Relative paths are rejected because "+
 					"the MCP server's cwd is whatever started the host application and "+
 					"not a stable anchor. The directory is created if missing."),
 			),
