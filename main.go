@@ -234,7 +234,9 @@ func runTestMessages(cli *client.Client) {
 // EDOOKIT_COOKIE_CACHE=<path> overrides the default; otherwise we use
 // client.DefaultCookieCachePath().
 func cookieCachePath() string {
-	if b, _ := strconv.ParseBool(os.Getenv("EDOOKIT_NO_COOKIE_CACHE")); b {
+	// getenvBool Fatalfs on invalid values like "yes" or "1.5", so a typo in
+	// .env surfaces immediately instead of silently leaving the cache on.
+	if getenvBool("EDOOKIT_NO_COOKIE_CACHE", false) {
 		return ""
 	}
 	if v := os.Getenv("EDOOKIT_COOKIE_CACHE"); v != "" {

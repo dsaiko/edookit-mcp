@@ -64,7 +64,7 @@ Homebrew si o aktualizace řekne sám při `brew upgrade`. Bez problémů s Gate
 
 #### 3. Sestavit ze zdrojáků
 
-Pokud máte Go 1.25+ nainstalované a chcete poslední vývojovou verzi:
+Pokud máte Go 1.26+ nainstalované a chcete poslední vývojovou verzi:
 
 ```bash
 go install github.com/dsaiko/edookit-mcp@latest

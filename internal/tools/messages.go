@@ -372,8 +372,12 @@ func truncateRunes(s string, maxRunes int) string {
 	return string(runes[:maxRunes]) + "…"
 }
 
-// parseSince accepts "7d", "1w", "2m", "1y", or an ISO date (YYYY-MM-DD or RFC3339).
-// Empty string means "no floor". Returned time is in local TZ.
+// parseSince accepts "7d", "1w", "2m", "1y", or an ISO date (YYYY-MM-DD or
+// RFC3339). Empty string means "no floor". For relative durations and bare
+// YYYY-MM-DD the returned time is in time.Local; for RFC3339 it preserves
+// whatever offset the input carried (e.g. "...Z" stays UTC). Either way the
+// downstream comparison via time.Time.Before/After is TZ-correct because it
+// compares the underlying instant, not wall-clock fields.
 func parseSince(s string) (time.Time, error) {
 	if s == "" {
 		return time.Time{}, nil

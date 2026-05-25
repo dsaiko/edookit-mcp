@@ -314,13 +314,15 @@ func loginViaBrowser(ctx context.Context, cfg browserLoginConfig) ([]*http.Cooki
 // render, and returns the outer HTML of <body>. Intended for selector
 // debugging — call from a smoke target, never from production code paths.
 func DumpLandingHTML(ctx context.Context, baseURL string, headless bool) (string, error) {
+	// Keep chromium's default sandbox enabled, same as loginViaBrowser. This is
+	// a debugging-only path but still drives a real browser against a
+	// user-provided URL — there's no reason to weaken isolation here.
 	opts := append([]chromedp.ExecAllocatorOption{},
 		chromedp.DefaultExecAllocatorOptions[:]...)
 	opts = append(opts,
 		chromedp.Flag("headless", headless),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
 	)
 
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, opts...)
