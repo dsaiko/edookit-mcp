@@ -35,6 +35,9 @@ dump-html: ## Dump the rendered landing page HTML to stdout (for selector debugg
 	@set -a; . ./.env; set +a; go run . -dump-html > /tmp/edookit-landing.html
 	@echo "wrote /tmp/edookit-landing.html ($$(wc -c < /tmp/edookit-landing.html) bytes)"
 
+clear-cookies: ## Delete the cached session cookies (forces re-login on next run)
+	@go run . -clear-cookies
+
 install: ## Install the binary into $GOBIN (or $GOPATH/bin)
 	go install .
 

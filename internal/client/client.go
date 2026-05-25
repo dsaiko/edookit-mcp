@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"sync"
 	"time"
 
@@ -37,6 +39,17 @@ type Config struct {
 	// LoginTimeout caps the entire login flow. Default 90s.
 	LoginTimeout time.Duration
 
+	// CookieCachePath is where session cookies are persisted between runs so
+	// chromium doesn't have to launch on every startup. Empty disables
+	// persistence. Default (when New is called via DefaultCookieCachePath):
+	// <UserCacheDir>/edookit-mcp/cookies.json.
+	CookieCachePath string
+
+	// CookieMaxAge bounds how long cached cookies are trusted before a fresh
+	// login is forced, regardless of the cookies' own Expires attribute.
+	// Default 10h, sized for Edookit's ~12h session window.
+	CookieMaxAge time.Duration
+
 	HTTPClient *http.Client
 }
 
@@ -53,13 +66,19 @@ type Client struct {
 }
 
 // New constructs a Client from the given config. It returns an error if
-// required fields (BaseURL, Username, Password) are missing.
+// required fields (BaseURL, Username, Password) are missing. If a cached
+// cookie file exists and is within CookieMaxAge, it is loaded eagerly and
+// the client starts in the logged-in state — no chromium launch needed
+// until the session expires.
 func New(cfg Config) (*Client, error) {
 	if cfg.BaseURL == "" {
 		return nil, errors.New("BaseURL is required")
 	}
 	if cfg.Username == "" || cfg.Password == "" {
 		return nil, errors.New("username and password are required")
+	}
+	if cfg.CookieMaxAge == 0 {
+		cfg.CookieMaxAge = 10 * time.Hour
 	}
 
 	u, err := url.Parse(cfg.BaseURL)
@@ -82,11 +101,24 @@ func New(cfg Config) (*Client, error) {
 		httpClient.Jar = jar
 	}
 
-	return &Client{
-		cfg:     cfg,
-		http:    httpClient,
-		baseURL: u,
-	}, nil
+	c := &Client{cfg: cfg, http: httpClient, baseURL: u}
+
+	if cfg.CookieCachePath != "" {
+		cookies, age, err := loadCookies(cfg.CookieCachePath, cfg.BaseURL)
+		switch {
+		case err == nil && age < cfg.CookieMaxAge:
+			c.http.Jar.SetCookies(c.baseURL, cookies)
+			c.loggedIn = true
+			log.Printf("[client] loaded %d cached cookies (age %s)", len(cookies), age.Round(time.Minute))
+		case err == nil:
+			log.Printf("[client] cached cookies are stale (age %s > max %s); will re-login on first request",
+				age.Round(time.Minute), cfg.CookieMaxAge)
+		case !errors.Is(err, os.ErrNotExist):
+			log.Printf("[client] cookie cache load failed: %v", err)
+		}
+	}
+
+	return c, nil
 }
 
 func (c *Client) resolve(path string) string {
@@ -140,6 +172,14 @@ func (c *Client) ensureLoggedIn(ctx context.Context) error {
 
 	c.http.Jar.SetCookies(c.baseURL, cookies)
 	c.loggedIn = true
+
+	if c.cfg.CookieCachePath != "" {
+		if err := saveCookies(c.cfg.CookieCachePath, c.cfg.BaseURL, cookies); err != nil {
+			log.Printf("[client] failed to cache cookies (non-fatal): %v", err)
+		} else {
+			log.Printf("[client] cached %d cookies to %s", len(cookies), c.cfg.CookieCachePath)
+		}
+	}
 	return nil
 }
 

@@ -19,18 +19,24 @@ import (
 func main() {
 	loginTest := flag.Bool("login-test", false, "perform OIDC login once and exit (smoke test)")
 	dumpHTML := flag.Bool("dump-html", false, "navigate to EDOOKIT_URL, dump body HTML, exit (selector debugging)")
+	clearCookies := flag.Bool("clear-cookies", false, "delete the cached session cookies and exit")
 	flag.Parse()
 
+	if *clearCookies {
+		runClearCookies()
+		return
+	}
 	if *dumpHTML {
 		runDumpHTML(getenvRequired("EDOOKIT_URL"), getenvBool("EDOOKIT_HEADLESS_LOGIN", true))
 		return
 	}
 
 	cli, err := client.New(client.Config{
-		BaseURL:       getenvRequired("EDOOKIT_URL"),
-		Username:      getenvRequired("EDOOKIT_USER"),
-		Password:      getenvRequired("EDOOKIT_PASS"),
-		HeadlessLogin: getenvBool("EDOOKIT_HEADLESS_LOGIN", true),
+		BaseURL:         getenvRequired("EDOOKIT_URL"),
+		Username:        getenvRequired("EDOOKIT_USER"),
+		Password:        getenvRequired("EDOOKIT_PASS"),
+		HeadlessLogin:   getenvBool("EDOOKIT_HEADLESS_LOGIN", true),
+		CookieCachePath: cookieCachePath(),
 	})
 	if err != nil {
 		log.Fatalf("init client: %v", err)
@@ -87,15 +93,50 @@ func runDumpHTML(baseURL string, headless bool) {
 
 func runLoginTest(cli *client.Client) {
 	ctx := context.Background()
-	log.Printf("running OIDC login (this launches chromium)...")
+	log.Printf("ensuring login session (chromium launches only if cache is cold)...")
 	if err := cli.EnsureLoggedIn(ctx); err != nil {
 		log.Fatalf("login failed: %v", err)
 	}
 	cookies := cli.SessionCookies()
-	log.Printf("login OK — %d cookie(s) captured for target host:", len(cookies))
+	log.Printf("session ready — %d cookie(s) available for target host:", len(cookies))
 	for _, c := range cookies {
 		log.Printf("  %s (len=%d, secure=%t, httpOnly=%t, sameSite=%d)",
 			c.Name, len(c.Value), c.Secure, c.HttpOnly, c.SameSite)
+	}
+}
+
+// cookieCachePath returns the path where session cookies should be persisted:
+// EDOOKIT_NO_COOKIE_CACHE=true disables caching entirely (returns "");
+// EDOOKIT_COOKIE_CACHE=<path> overrides the default; otherwise we use
+// client.DefaultCookieCachePath().
+func cookieCachePath() string {
+	if b, _ := strconv.ParseBool(os.Getenv("EDOOKIT_NO_COOKIE_CACHE")); b {
+		return ""
+	}
+	if v := os.Getenv("EDOOKIT_COOKIE_CACHE"); v != "" {
+		return v
+	}
+	p, err := client.DefaultCookieCachePath()
+	if err != nil {
+		log.Printf("warning: cannot determine default cookie cache path (%v); persistence disabled", err)
+		return ""
+	}
+	return p
+}
+
+func runClearCookies() {
+	path := cookieCachePath()
+	if path == "" {
+		log.Printf("cookie cache is disabled — nothing to clear")
+		return
+	}
+	switch err := os.Remove(path); {
+	case err == nil:
+		log.Printf("removed %s", path)
+	case os.IsNotExist(err):
+		log.Printf("no cached cookies at %s", path)
+	default:
+		log.Fatalf("remove %s: %v", path, err)
 	}
 }
 
