@@ -2,7 +2,9 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -143,11 +145,15 @@ func fetchAndParse(ctx context.Context, cli *client.Client, path string, baseQue
 
 		for _, row := range rows {
 			if len(row) < 3 {
+				log.Printf("[tools] skipping row %d on page %d: only %d cells (expected ≥3)", len(results)+1, page, len(row))
 				continue
 			}
 			msg, perr := parseRow(row[0], row[2], isSent)
 			if perr != nil {
-				continue // skip malformed rows rather than failing the whole list
+				// Surface the schema drift so it's visible in logs instead of
+				// returning a short result with no explanation.
+				log.Printf("[tools] skipping malformed row: %v", perr)
+				continue
 			}
 			if !sinceTime.IsZero() {
 				if t, terr := time.Parse(time.RFC3339, msg.Date); terr == nil && t.Before(sinceTime) {
@@ -176,10 +182,18 @@ func cloneValues(v url.Values) url.Values {
 
 var czechDateRe = regexp.MustCompile(`(\d{1,2})\.(\d{1,2})\.(\d{4}) (\d{1,2}):(\d{1,2})`)
 
-// parseRow extracts structured fields from one row of the grid response.
-// The row's third cell is an HTML blob; the first cell is the UID.
+// parseRow extracts structured fields from one row of the grid response. The
+// row's third cell is an HTML blob; the first cell is the UID. Required
+// fields (date, subject, and sender-or-status depending on isSent) must all
+// be present — if any are missing, parseRow returns an error naming the
+// missing fields so callers can log and skip the row instead of silently
+// emitting a malformed Message (which would also slip past the `since`
+// filter, since its RFC3339 parse fails for empty Date and falls through).
 func parseRow(uid, rowHTML string, isSent bool) (Message, error) {
 	msg := Message{ID: uid}
+	if uid == "" {
+		return msg, errors.New("empty row UID")
+	}
 	if n, _ := strconv.Atoi(strings.TrimPrefix(uid, "m-")); n > 0 {
 		msg.Number = n
 	}
@@ -190,6 +204,8 @@ func parseRow(uid, rowHTML string, isSent bool) (Message, error) {
 	}
 	small := doc.Find("small").First()
 
+	var missing []string
+
 	// Date: DD.MM.YYYY HH:MM somewhere in the <small> text.
 	if m := czechDateRe.FindStringSubmatch(small.Text()); len(m) == 6 {
 		d, _ := strconv.Atoi(m[1])
@@ -198,6 +214,8 @@ func parseRow(uid, rowHTML string, isSent bool) (Message, error) {
 		h, _ := strconv.Atoi(m[4])
 		mi, _ := strconv.Atoi(m[5])
 		msg.Date = time.Date(y, time.Month(mo), d, h, mi, 0, 0, time.Local).Format(time.RFC3339)
+	} else {
+		missing = append(missing, "date")
 	}
 
 	// First span in <small> is either the sender (inbox) or the status (sent).
@@ -210,6 +228,10 @@ func parseRow(uid, rowHTML string, isSent bool) (Message, error) {
 		} else {
 			msg.Sender = first
 		}
+	} else if isSent {
+		missing = append(missing, "status")
+	} else {
+		missing = append(missing, "sender")
 	}
 
 	// Subject is the <b> inside one of the row's main-area <a> tags.
@@ -222,6 +244,9 @@ func parseRow(uid, rowHTML string, isSent bool) (Message, error) {
 		}
 		return true
 	})
+	if msg.Subject == "" {
+		missing = append(missing, "subject")
+	}
 
 	// Attachment count: text "Přílohy" followed by "<b>(N)</b>" nearby.
 	msg.Attachments = parseAttachmentCount(doc)
@@ -229,6 +254,9 @@ func parseRow(uid, rowHTML string, isSent bool) (Message, error) {
 	// Body preview: text node between the subject </div> and the first <br>.
 	msg.BodyPreview = parseBodyPreview(rowHTML)
 
+	if len(missing) > 0 {
+		return msg, fmt.Errorf("row %s missing required field(s): %s", uid, strings.Join(missing, ", "))
+	}
 	return msg, nil
 }
 

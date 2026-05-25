@@ -131,6 +131,91 @@ func TestParseRow_BadUID(t *testing.T) {
 	}
 }
 
+func TestParseRow_EmptyUIDIsError(t *testing.T) {
+	t.Parallel()
+
+	_, err := parseRow("", inboxRowKaliskovaHTML, false)
+	if err == nil {
+		t.Fatal("expected error for empty UID, got nil")
+	}
+}
+
+func TestParseRow_ValidationErrors(t *testing.T) {
+	t.Parallel()
+
+	// Each case strips one required piece of the row HTML and asserts that
+	// parseRow surfaces a wrapped error naming the missing field.
+	cases := []struct {
+		name        string
+		html        string
+		isSent      bool
+		wantMissing string
+	}{
+		{
+			name: "missing date (no <b> in small)",
+			html: `<small><span style="color:#212121;font-weight:bold">Some Sender</span></small>` +
+				`<div><a href="x"><span class="ico50 menu_icon"></span></a>` +
+				`<a href="x"><b>Subj</b></a></div>Body<br>`,
+			isSent:      false,
+			wantMissing: "date",
+		},
+		{
+			name: "missing sender on inbox (no span in small)",
+			html: `<small><b>21.05.2026 12:31</b></small>` +
+				`<div><a href="x"><span class="ico50 menu_icon"></span></a>` +
+				`<a href="x"><b>Subj</b></a></div>Body<br>`,
+			isSent:      false,
+			wantMissing: "sender",
+		},
+		{
+			name: "missing status on sent (no span in small)",
+			html: `<small><b>21.05.2026 7:54</b></small>` +
+				`<div><a href="x"><span class="ico50 menu_icon"></span></a>` +
+				`<a href="x"><b>Subj</b></a></div>Body<br>`,
+			isSent:      true,
+			wantMissing: "status",
+		},
+		{
+			name: "missing subject (no <b> inside any div anchor)",
+			html: `<small><b>21.05.2026 12:31</b>, <span style="color:#212121;font-weight:bold">Sender</span></small>` +
+				`<div><a href="x"><span class="ico50 menu_icon"></span></a></div>Body<br>`,
+			isSent:      false,
+			wantMissing: "subject",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := parseRow("m-1", tc.html, tc.isSent)
+			if err == nil {
+				t.Fatalf("expected error for missing %q, got nil", tc.wantMissing)
+			}
+			if !strings.Contains(err.Error(), tc.wantMissing) {
+				t.Errorf("error %q should mention %q", err.Error(), tc.wantMissing)
+			}
+			if !strings.Contains(err.Error(), "m-1") {
+				t.Errorf("error %q should include row UID for diagnostics", err.Error())
+			}
+		})
+	}
+}
+
+func TestParseRow_MultipleMissingFieldsReported(t *testing.T) {
+	t.Parallel()
+
+	// A row that's missing several required fields at once should name them all.
+	html := `<small></small><div></div><br>`
+	_, err := parseRow("m-2", html, false)
+	if err == nil {
+		t.Fatal("expected error for empty row, got nil")
+	}
+	for _, want := range []string{"date", "sender", "subject"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should list missing %q", err.Error(), want)
+		}
+	}
+}
+
 func TestParseAttachmentCount(t *testing.T) {
 	t.Parallel()
 
