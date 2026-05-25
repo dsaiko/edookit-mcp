@@ -2,7 +2,9 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -157,7 +159,7 @@ func planDestination(name, destDir string, usedNames map[string]int) (dst, errMs
 	// separately (that's pre-existing-file semantics, not dedup), so this
 	// only looks at usedNames.
 	safeName = uniqueFilename(safeName, usedNames)
-	usedNames[safeName]++
+	usedNames[strings.ToLower(safeName)]++
 
 	dst = filepath.Join(destDir, safeName)
 
@@ -211,7 +213,7 @@ func streamToDest(ctx context.Context, cli *client.Client, url, destDir, dst str
 		out.Error = fmt.Sprintf("close: %v", closeErr)
 		return out
 	}
-	if err := os.Rename(tmpPath, dst); err != nil {
+	if err := atomicRename(tmpPath, dst); err != nil {
 		out.Error = fmt.Sprintf("rename %s -> %s: %v", tmpPath, dst, err)
 		return out
 	}
@@ -225,15 +227,23 @@ func streamToDest(ctx context.Context, cli *client.Client, url, destDir, dst str
 // "<stem>-N.<ext>" with the smallest N >= 2 that is free. Operates on the
 // usedNames map only — pre-existing files on disk are handled by the
 // skip-if-exists / overwrite policy in downloadOne, not here.
+//
+// Keys in usedNames are normalized to lowercase so "Report.pdf" and
+// "report.pdf" collide as they would on case-insensitive filesystems
+// (macOS APFS default, Windows NTFS). Doing it unconditionally is harmless
+// on case-sensitive ones (Linux ext4) — at worst it picks "-2" when the
+// strict semantics would have allowed both names to coexist, which is a
+// negligible loss of distinguishability vs. the silent corruption it
+// prevents on case-insensitive volumes.
 func uniqueFilename(base string, usedNames map[string]int) string {
-	if _, taken := usedNames[base]; !taken {
+	if _, taken := usedNames[strings.ToLower(base)]; !taken {
 		return base
 	}
 	ext := filepath.Ext(base)
 	stem := strings.TrimSuffix(base, ext)
 	for n := 2; ; n++ {
 		candidate := fmt.Sprintf("%s-%d%s", stem, n, ext)
-		if _, taken := usedNames[candidate]; !taken {
+		if _, taken := usedNames[strings.ToLower(candidate)]; !taken {
 			return candidate
 		}
 	}
@@ -295,4 +305,25 @@ func windowsUnsafeName(name string) string {
 		}
 	}
 	return ""
+}
+
+// atomicRename os.Renames tmp to dst with one fallback: on older Windows
+// or restrictive ACL configs, Rename can return fs.ErrExist when dst
+// already exists (overwrite=true case) — even though Go 1.5+ MoveFileEx
+// is supposed to replace it. In that case only, remove dst and retry.
+// Other errors (perms, I/O, cross-device, disk full) propagate without
+// touching dst so the user's previous file is preserved. Same pattern
+// internal/client/cookie_store.go uses.
+func atomicRename(tmp, dst string) error {
+	err := os.Rename(tmp, dst)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	if removeErr := os.Remove(dst); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+		return fmt.Errorf("remove existing dst before rename retry: %w (original rename error: %w)", removeErr, err)
+	}
+	return os.Rename(tmp, dst)
 }

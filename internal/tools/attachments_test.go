@@ -646,3 +646,146 @@ func TestDownloadAttachments_SessionExpiryDetectedOnHTMLResponse(t *testing.T) {
 		t.Errorf("file at %s should not have been created", res.Files[0].Path)
 	}
 }
+
+// V2: an application/json response on a download endpoint (e.g.
+// {"authenticated":false} or a generic API error envelope) must NOT be
+// written into the destination file. Unlike text/html, JSON is treated
+// as deterministic so we propagate the error rather than triggering
+// invalidate+retry.
+func TestDownloadAttachments_JSONResponseRejected(t *testing.T) {
+	t.Parallel()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	mux.HandleFunc("/handler/download/file-json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"authenticated":false}`))
+	})
+	var msgJSON []byte
+	mux.HandleFunc("/handler/page/message-edit", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(msgJSON)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	msgJSON = buildMessageEditJSON(t, 1, []messageEditAttachment{
+		{ID: "1@j", Name: "doc.pdf", Link: srv.URL + "/handler/download/file-json"},
+	})
+	cli := buildClient(t, srv)
+	destDir := t.TempDir()
+
+	res, err := DownloadAttachments(context.Background(), cli, "m-1", DownloadOptions{DestDir: destDir})
+	if err != nil {
+		t.Fatalf("DownloadAttachments: %v", err)
+	}
+	if res.Files[0].Error == "" {
+		t.Fatal("expected per-file error for JSON response on download endpoint")
+	}
+	if !strings.Contains(strings.ToLower(res.Files[0].Error), "json") {
+		t.Errorf("error %q should mention json", res.Files[0].Error)
+	}
+	if _, err := os.Stat(res.Files[0].Path); err == nil {
+		t.Errorf("file at %s should not have been created", res.Files[0].Path)
+	}
+}
+
+// V3: GetTo pre-flight origin check — an attachment URL pointing
+// off-origin must be refused before any request is dispatched. Without
+// this guard the bogus URL would be requested twice (once + retry after
+// invalidate) before the post-response check failed.
+func TestDownloadAttachments_OffOriginURLRefusedPreFlight(t *testing.T) {
+	t.Parallel()
+
+	// "Plus4U" lookalike served on a different host. localhost vs 127.0.0.1
+	// are DNS-equivalent but lexically distinct, matching what sameOrigin
+	// would treat as cross-origin.
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("evil payload"))
+	}))
+	defer foreign.Close()
+	foreignURL := strings.Replace(foreign.URL, "127.0.0.1", "localhost", 1)
+
+	var foreignHits int
+	foreignMux := http.NewServeMux()
+	foreignMux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		foreignHits++
+		_, _ = w.Write([]byte("should never reach here"))
+	})
+	foreign.Config.Handler = foreignMux
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	var msgJSON []byte
+	mux.HandleFunc("/handler/page/message-edit", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(msgJSON)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	msgJSON = buildMessageEditJSON(t, 1, []messageEditAttachment{
+		{ID: "1@x", Name: "doc.pdf", Link: foreignURL + "/handler/download/file-evil"},
+	})
+	cli := buildClient(t, srv)
+	destDir := t.TempDir()
+
+	res, err := DownloadAttachments(context.Background(), cli, "m-1", DownloadOptions{DestDir: destDir})
+	if err != nil {
+		t.Fatalf("DownloadAttachments: %v", err)
+	}
+	if res.Files[0].Error == "" {
+		t.Fatal("expected per-file error for off-origin URL")
+	}
+	if !strings.Contains(strings.ToLower(res.Files[0].Error), "off-origin") {
+		t.Errorf("error %q should mention off-origin", res.Files[0].Error)
+	}
+	if foreignHits != 0 {
+		t.Errorf("foreign server was hit %d time(s); want 0 (the pre-flight check should prevent the request)", foreignHits)
+	}
+}
+
+// V4: case-insensitive filesystems (macOS APFS default, Windows NTFS)
+// alias "Report.pdf" and "report.pdf" to the same on-disk file. Even on
+// case-sensitive Linux, we want the dedup logic to be defensive so a
+// downloaded result moved to a case-insensitive disk (USB stick / cloud
+// sync) doesn't lose one of the two files. Normalization is via
+// strings.ToLower on the dedup key only — display Name keeps the
+// original case.
+func TestDownloadAttachments_DedupIsCaseInsensitive(t *testing.T) {
+	t.Parallel()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	mux.HandleFunc("/handler/download/file-A", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("first"))
+	})
+	mux.HandleFunc("/handler/download/file-B", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("second"))
+	})
+	var msgJSON []byte
+	mux.HandleFunc("/handler/page/message-edit", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(msgJSON)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	msgJSON = buildMessageEditJSON(t, 1, []messageEditAttachment{
+		{ID: "1@a", Name: "Report.PDF", Link: srv.URL + "/handler/download/file-A"},
+		{ID: "1@b", Name: "report.pdf", Link: srv.URL + "/handler/download/file-B"},
+	})
+	cli := buildClient(t, srv)
+	destDir := t.TempDir()
+
+	res, err := DownloadAttachments(context.Background(), cli, "m-1", DownloadOptions{DestDir: destDir})
+	if err != nil {
+		t.Fatalf("DownloadAttachments: %v", err)
+	}
+	if len(res.Files) != 2 {
+		t.Fatalf("Files = %d, want 2", len(res.Files))
+	}
+	// Display Name preserves the original Edookit-supplied casing.
+	if res.Files[0].Name != "Report.PDF" || res.Files[1].Name != "report.pdf" {
+		t.Errorf("Names = %q / %q, want original casing preserved", res.Files[0].Name, res.Files[1].Name)
+	}
+	// But the on-disk paths must differ even after case-folding so
+	// case-insensitive filesystems don't alias them to the same file.
+	base0 := strings.ToLower(filepath.Base(res.Files[0].Path))
+	base1 := strings.ToLower(filepath.Base(res.Files[1].Path))
+	if base0 == base1 {
+		t.Errorf("on-disk filenames %q and %q would alias on a case-insensitive filesystem", res.Files[0].Path, res.Files[1].Path)
+	}
+}
