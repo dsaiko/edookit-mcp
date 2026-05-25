@@ -252,7 +252,7 @@ func TestParseSince(t *testing.T) {
 		{name: "1w", input: "1w", wantOK: true, within: 7*24*time.Hour + time.Minute},
 		{name: "2m", input: "2m", wantOK: true, within: 65 * 24 * time.Hour}, // ~2 months, loose
 		{name: "1y", input: "1y", wantOK: true, within: 366 * 24 * time.Hour},
-		{name: "iso date", input: "2026-05-01", wantOK: true, exactT: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)},
+		{name: "iso date (local TZ)", input: "2026-05-01", wantOK: true, exactT: time.Date(2026, 5, 1, 0, 0, 0, 0, time.Local)},
 		{name: "garbage", input: "not-a-date", wantOK: false},
 		{name: "zero count", input: "0d", wantOK: false},
 		{name: "negative", input: "-5d", wantOK: false},

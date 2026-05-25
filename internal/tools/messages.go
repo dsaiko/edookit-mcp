@@ -302,7 +302,11 @@ func parseSince(s string) (time.Time, error) {
 			}
 		}
 	}
-	if t, err := time.Parse("2006-01-02", s); err == nil {
+	// ISO date (no TZ) must be interpreted in the local TZ so it matches the
+	// message timestamps we generate via time.Date(..., time.Local). Otherwise
+	// the boundary shifts by the local offset and messages around midnight get
+	// the wrong side of the cutoff.
+	if t, err := time.ParseInLocation("2006-01-02", s, time.Local); err == nil {
 		return t, nil
 	}
 	if t, err := time.Parse(time.RFC3339, s); err == nil {

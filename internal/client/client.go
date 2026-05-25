@@ -201,12 +201,14 @@ func (c *Client) ensureLoggedIn(ctx context.Context) error {
 	}
 
 	cookies, err := loginViaBrowser(ctx, browserLoginConfig{
-		BaseURL:   c.cfg.BaseURL,
-		Username:  c.cfg.Username,
-		Password:  c.cfg.Password,
-		Headless:  c.cfg.HeadlessLogin,
-		Timeout:   c.cfg.LoginTimeout,
-		UserAgent: defaultUserAgent,
+		BaseURL:  c.cfg.BaseURL,
+		Username: c.cfg.Username,
+		Password: c.cfg.Password,
+		Headless: c.cfg.HeadlessLogin,
+		Timeout:  c.cfg.LoginTimeout,
+		// Deliberately no UserAgent — chromium uses its native Chrome UA, so
+		// Plus4U / reCAPTCHA bot heuristics see a real-looking browser.
+		// defaultUserAgent stays on the net/http client for non-browser requests.
 	})
 	if err != nil {
 		return fmt.Errorf("oidc login: %w", err)
@@ -234,11 +236,19 @@ func (c *Client) ensureLoggedIn(ctx context.Context) error {
 	return nil
 }
 
-// invalidateSession marks the session as logged out so the next call re-authenticates.
+// invalidateSession marks the session as logged out AND clears the cookie jar
+// so the next ensureLoggedIn skips the cached-cookies fast path and runs the
+// full chromedp login. Just flipping loggedIn=false isn't enough — warmup can
+// still succeed (server hands out a new PHPSESSID) with auth tokens that the
+// backend has already invalidated, which would yield an infinite no-op retry
+// loop on authenticated=false responses.
 func (c *Client) invalidateSession() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.loggedIn = false
-	c.mu.Unlock()
+	if jar, err := cookiejar.New(nil); err == nil {
+		c.http.Jar = jar
+	}
 }
 
 // GetDoc fetches a path as a parsed HTML document, re-authenticating once if
@@ -255,6 +265,15 @@ func (c *Client) GetDoc(ctx context.Context, path string) (*goquery.Document, er
 // Re-authenticates once on session expiry, same as GetDoc.
 func (c *Client) GetJSON(ctx context.Context, path string, out any) error {
 	return c.getJSON(ctx, path, out, true)
+}
+
+// authEnvelope is the subset of every /handler/page/* and /handler/grid/*
+// response we read to detect a server-side session expiry that did NOT cause
+// an off-host bounce — when this happens the server returns HTTP 200 with a
+// default page shape and authenticated:false, and callers would otherwise get
+// silently empty results.
+type authEnvelope struct {
+	Authenticated *bool `json:"authenticated"`
 }
 
 func (c *Client) getJSON(ctx context.Context, path string, out any, retry bool) error {
@@ -289,7 +308,23 @@ func (c *Client) getJSON(ctx context.Context, path string, out any, retry bool) 
 		return fmt.Errorf("GET %s: HTTP %d", path, resp.StatusCode)
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read body from %s: %w", path, err)
+	}
+
+	// Server may return HTTP 200 with authenticated:false instead of bouncing.
+	// Detect that and treat it the same as session expiry.
+	var env authEnvelope
+	if jerr := json.Unmarshal(body, &env); jerr == nil && env.Authenticated != nil && !*env.Authenticated {
+		if !retry {
+			return errors.New("session reported authenticated=false and re-login failed")
+		}
+		c.invalidateSession()
+		return c.getJSON(ctx, path, out, false)
+	}
+
+	if err := json.Unmarshal(body, out); err != nil {
 		return fmt.Errorf("decode JSON from %s: %w", path, err)
 	}
 	return nil

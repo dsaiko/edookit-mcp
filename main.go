@@ -65,7 +65,7 @@ func main() {
 
 	s := server.NewMCPServer(
 		"edookit-mcp",
-		"0.1.0",
+		version,
 		server.WithToolCapabilities(true),
 	)
 
@@ -179,11 +179,14 @@ func runLoginTest(cli *client.Client) {
 	if err := cli.GetJSON(ctx, "/handler/page/dashboard", &probe); err != nil {
 		log.Fatalf("dashboard probe failed: %v", err)
 	}
-	if auth, _ := probe["authenticated"].(bool); auth {
-		log.Printf("authenticated session verified via /handler/page/dashboard")
-	} else {
-		log.Printf("WARNING: /handler/page/dashboard returned authenticated=false despite successful login")
+	auth, _ := probe["authenticated"].(bool)
+	if !auth {
+		// GetJSON should have already re-authed on authenticated=false, so
+		// getting here means warmup is genuinely broken. Fail loudly so CI
+		// and humans can't miss it.
+		log.Fatalf("/handler/page/dashboard returned authenticated=false despite successful login — warmup is broken")
 	}
+	log.Printf("authenticated session verified via /handler/page/dashboard")
 }
 
 func runTestMessages(cli *client.Client) {

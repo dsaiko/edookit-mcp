@@ -84,8 +84,8 @@ release:
 
 # Homebrew formula auto-publish into dsaiko/homebrew-tap.
 # Requires repo secret HOMEBREW_TAP_GITHUB_TOKEN — a PAT with write access to
-# the tap repo. If the secret is not set, the workflow passes --skip=brew and
-# this section is silently ignored.
+# the tap repo. If the secret is not set, the workflow passes --skip=homebrew
+# and this section is silently ignored.
 brews:
   - name: edookit-mcp
     repository:

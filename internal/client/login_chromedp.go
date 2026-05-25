@@ -80,12 +80,11 @@ func captureLocation(ctx context.Context) string {
 
 // browserLoginConfig controls how the headless browser performs OIDC login.
 type browserLoginConfig struct {
-	BaseURL   string        // your school's Edookit URL, e.g. https://your-school-login.edookit.net
-	Username  string        // Plus4U identity (email or login name)
-	Password  string        // Plus4U password
-	Headless  bool          // false = visible browser (debugging); true = production
-	Timeout   time.Duration // overall login timeout (default 90s)
-	UserAgent string        // override the browser UA (optional)
+	BaseURL  string        // your school's Edookit URL, e.g. https://your-school-login.edookit.net
+	Username string        // Plus4U identity (email or login name)
+	Password string        // Plus4U password
+	Headless bool          // false = visible browser (debugging); true = production
+	Timeout  time.Duration // overall login timeout (default 90s)
 }
 
 // loginViaBrowser drives the full OIDC code flow in a real chromium instance
@@ -102,17 +101,16 @@ func loginViaBrowser(ctx context.Context, cfg browserLoginConfig) ([]*http.Cooki
 		return nil, fmt.Errorf("parse base url: %w", err)
 	}
 
+	// Keep chromium's default sandbox enabled — disabling it would weaken
+	// browser isolation on end-user machines. Container/CI environments that
+	// need --no-sandbox can drop it via a wrapper script if/when necessary.
 	opts := append([]chromedp.ExecAllocatorOption{},
 		chromedp.DefaultExecAllocatorOptions[:]...)
 	opts = append(opts,
 		chromedp.Flag("headless", cfg.Headless),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
 	)
-	if cfg.UserAgent != "" {
-		opts = append(opts, chromedp.UserAgent(cfg.UserAgent))
-	}
 
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, opts...)
 	defer cancelAlloc()

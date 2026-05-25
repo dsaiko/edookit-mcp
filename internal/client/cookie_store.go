@@ -71,9 +71,20 @@ func saveCookies(path, baseURL string, cookies []*http.Cookie) error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return fmt.Errorf("write %s: %w", tmp, err)
 	}
+	// os.Rename atomically replaces the destination on Unix and (since Go 1.5)
+	// on Windows via MoveFileEx(MOVEFILE_REPLACE_EXISTING). On older Windows
+	// or with certain ACLs the rename can still fail with EEXIST; if it does,
+	// fall back to a remove-then-rename which loses atomicity but at least
+	// keeps the cache updating across runs.
 	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("rename %s -> %s: %w", tmp, path, err)
+		if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("rename %s -> %s (fallback remove failed: %w): %w", tmp, path, removeErr, err)
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("rename %s -> %s: %w", tmp, path, err)
+		}
 	}
 	return nil
 }
