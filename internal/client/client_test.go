@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -721,6 +722,54 @@ func TestConcurrentRequests_NoRaceUnderInvalidation(t *testing.T) {
 	close(stop)
 	wg.Wait()
 	// Reaching here without `go test -race` complaining is the assertion.
+}
+
+// ---------- off-origin preflight ----------
+
+// An absolute off-origin URL must be refused before any request leaves the
+// process, for every request type (JSON / HTML doc / binary download), not
+// just GetTo. Uses a server that would record a hit if one slipped through.
+// Kept serial (no t.Parallel): the subtests share the evil-hit counter that's
+// asserted after they all run, so they must execute before this function
+// returns.
+func TestRequests_RefuseOffOriginURLBeforeDispatch(t *testing.T) {
+	var evil int32
+	evilSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&evil, 1)
+		_, _ = w.Write([]byte("should never be reached"))
+	}))
+	defer evilSrv.Close()
+
+	srv := fakeServer(t, http.NewServeMux())
+	defer srv.Close()
+	cli := newClientForTest(t, srv)
+
+	// Absolute URL pointing at a different origin than baseURL.
+	offOrigin := evilSrv.URL + "/handler/grid/objects-for-me-data"
+
+	t.Run("getJSON", func(t *testing.T) {
+		var out map[string]any
+		err := cli.GetJSON(context.Background(), offOrigin, &out)
+		if err == nil || !strings.Contains(err.Error(), "off-origin") {
+			t.Errorf("GetJSON err = %v, want an off-origin refusal", err)
+		}
+	})
+	t.Run("getDoc", func(t *testing.T) {
+		_, err := cli.GetDoc(context.Background(), offOrigin)
+		if err == nil || !strings.Contains(err.Error(), "off-origin") {
+			t.Errorf("GetDoc err = %v, want an off-origin refusal", err)
+		}
+	})
+	t.Run("getTo", func(t *testing.T) {
+		_, err := cli.GetTo(context.Background(), offOrigin, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "off-origin") {
+			t.Errorf("GetTo err = %v, want an off-origin refusal", err)
+		}
+	})
+
+	if n := atomic.LoadInt32(&evil); n != 0 {
+		t.Errorf("off-origin server was hit %d time(s); preflight should block all dispatch", n)
+	}
 }
 
 // ---------- sameOrigin ----------

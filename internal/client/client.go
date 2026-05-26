@@ -320,6 +320,29 @@ func (c *Client) resolve(path string) (string, error) {
 	return c.baseURL.ResolveReference(ref).String(), nil
 }
 
+// preflightSameOrigin resolves path against baseURL and rejects it before
+// dispatch if it points off-origin. Paths come from internal callers today,
+// but newRequest accepts absolute URLs too (attachment `link` values arrive
+// fully qualified), so a drifted or hostile value could otherwise be sent
+// outbound — an SSRF-style footgun. Sharing one check across GetTo / getJSON
+// / getDoc closes it for every request type, not just binary downloads. The
+// post-response sameOrigin check still catches redirects that happen
+// mid-flight.
+func (c *Client) preflightSameOrigin(path string) error {
+	resolved, err := c.resolve(path)
+	if err != nil {
+		return err
+	}
+	resolvedURL, err := url.Parse(resolved)
+	if err != nil {
+		return fmt.Errorf("parse resolved URL %q: %w", resolved, err)
+	}
+	if !sameOrigin(resolvedURL, c.baseURL) {
+		return fmt.Errorf("refusing off-origin URL %s (must be same origin as %s)", resolvedURL.Host, c.baseURL.Host)
+	}
+	return nil
+}
+
 // newRequest builds an authenticated GET against path (relative or
 // absolute). Every Edookit endpoint this client touches is a GET with no
 // body, so neither method nor body is parameterized; if a future flow
@@ -684,24 +707,10 @@ func (c *Client) getTo(ctx context.Context, path string, dst io.Writer, retry bo
 		return 0, err
 	}
 
-	// Pre-flight origin check: GetTo accepts absolute URLs (attachment
-	// `link` values come back fully qualified from Edookit), so a drifted
-	// or malicious link pointing off-origin would otherwise be dispatched
-	// once, caught by the post-response sameOrigin check, retried after
-	// invalidate, and dispatched a second time before failing. Verify the
-	// resolved URL is same-origin BEFORE c.do so the bogus link never
-	// leaves the process. The post-response check below still catches
-	// redirects that happen mid-flight.
-	resolved, err := c.resolve(path)
-	if err != nil {
-		return 0, err
-	}
-	resolvedURL, err := url.Parse(resolved)
-	if err != nil {
-		return 0, fmt.Errorf("parse resolved URL %q: %w", resolved, err)
-	}
-	if !sameOrigin(resolvedURL, c.baseURL) {
-		return 0, fmt.Errorf("GET %s: refusing off-origin URL %s (must be same origin as %s)", path, resolvedURL.Host, c.baseURL.Host)
+	// Pre-flight origin check before c.do so a bogus off-origin link never
+	// leaves the process. See preflightSameOrigin for the SSRF rationale.
+	if err := c.preflightSameOrigin(path); err != nil {
+		return 0, fmt.Errorf("GET %s: %w", path, err)
 	}
 
 	req, err := c.newRequest(ctx, path)
@@ -768,6 +777,9 @@ func (c *Client) getJSON(ctx context.Context, path string, out any, retry bool) 
 	if err := c.ensureLoggedIn(ctx); err != nil {
 		return err
 	}
+	if err := c.preflightSameOrigin(path); err != nil {
+		return fmt.Errorf("GET %s: %w", path, err)
+	}
 
 	req, err := c.newRequest(ctx, path)
 	if err != nil {
@@ -824,6 +836,9 @@ func (c *Client) getJSON(ctx context.Context, path string, out any, retry bool) 
 func (c *Client) getDoc(ctx context.Context, path string, retry bool) (*goquery.Document, error) {
 	if err := c.ensureLoggedIn(ctx); err != nil {
 		return nil, err
+	}
+	if err := c.preflightSameOrigin(path); err != nil {
+		return nil, fmt.Errorf("GET %s: %w", path, err)
 	}
 
 	req, err := c.newRequest(ctx, path)
