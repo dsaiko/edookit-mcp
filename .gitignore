@@ -50,6 +50,7 @@ Icon?
 # --- Editors / IDEs ---
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 *~
