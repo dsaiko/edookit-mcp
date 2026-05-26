@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -206,11 +207,11 @@ func TestParseFullMessage_MissingFormComponentErrs(t *testing.T) {
 	}
 }
 
-func TestParseFullMessage_ErrorsWhenSubjectAndBodyBothMissing(t *testing.T) {
+func TestParseFullMessage_ErrorsWhenStatusSubjectBodyAllMissing(t *testing.T) {
 	t.Parallel()
-	// Form panel present but the item names that carry subject and body
-	// have vanished (Edookit renamed them). parseFullMessage must fail
-	// loudly so schema drift doesn't masquerade as "the message is empty".
+	// Form panel present but EVERY human-readable item is gone
+	// (object_status, name, description__editor all missing). That's
+	// real schema drift, not a normal state — must fail loudly.
 	resp := messageEditResponse{
 		Authenticated: boolPtr(true),
 		Components: messageEditComponents{
@@ -218,11 +219,8 @@ func TestParseFullMessage_ErrorsWhenSubjectAndBodyBothMissing(t *testing.T) {
 				DOMTarget: domTargetFormMessage,
 				Data: messageEditWorkspaceData{
 					FormPanelMain: []messageEditPanel{
-						// only object_status survives — name and description__editor are gone
-						{Label: "Stav:", Items: []messageEditPanelItem{{
-							Name: "object_status", Type: "html",
-							Val: `<span style="color:#77bb00">Publikováno</span>`,
-						}}},
+						// only hidden-form internals survive
+						{Hidden: true, Items: []messageEditPanelItem{{Name: "__index", Type: "hidden", Val: "1"}}},
 					},
 				},
 			}},
@@ -230,10 +228,53 @@ func TestParseFullMessage_ErrorsWhenSubjectAndBodyBothMissing(t *testing.T) {
 	}
 	_, err := parseFullMessage(1, &resp, testTZ)
 	if err == nil {
-		t.Fatal("expected error when both subject and body are missing, got nil")
+		t.Fatal("expected error when status/subject/body are all missing, got nil")
 	}
 	if !strings.Contains(err.Error(), "schema") && !strings.Contains(err.Error(), "drifted") {
 		t.Errorf("error %q should hint at schema drift", err.Error())
+	}
+}
+
+// Real-world case discovered by the 294-message smoke loop: messages
+// the author deleted in Edookit's UI keep their metadata (status,
+// sender, date) but strip subject + body server-side. The status label
+// changes to "Smazané autorem DD.MM.YYYY HH:MM". This should parse
+// successfully with Deleted=true so callers can distinguish it from
+// real schema drift.
+func TestParseFullMessage_AuthorDeletedMessageParsesAsDeleted(t *testing.T) {
+	t.Parallel()
+	resp := messageEditResponse{
+		Authenticated: boolPtr(true),
+		Components: messageEditComponents{
+			Workspace: []messageEditWorkspaceComponent{{
+				DOMTarget: domTargetFormMessage,
+				Data: messageEditWorkspaceData{
+					FormPanelMain: []messageEditPanel{
+						{Label: "Stav:", Items: []messageEditPanelItem{{
+							Name: "object_status", Type: "html",
+							Val: `<span style="color:#989898">Smazané autorem 13.10.2025 7:43</span><span>, </span><span><b>Braun Zdeněk</b>, Po 13.10.25 7:42</span>`,
+						}}},
+						// No "Předmět:" / "Obsah:" panels — server stripped them.
+					},
+				},
+			}},
+		},
+	}
+	msg, err := parseFullMessage(1, &resp, testTZ)
+	if err != nil {
+		t.Fatalf("expected successful parse for author-deleted message, got error: %v", err)
+	}
+	if !msg.Deleted {
+		t.Errorf("Deleted = false, want true (status begins with 'Smazané')")
+	}
+	if !strings.HasPrefix(msg.Status, "Smazané autorem") {
+		t.Errorf("Status = %q, want it to start with 'Smazané autorem'", msg.Status)
+	}
+	if msg.Author != "Braun Zdeněk" {
+		t.Errorf("Author = %q, want 'Braun Zdeněk' (even on deleted, the author span survives)", msg.Author)
+	}
+	if msg.Subject != "" || msg.BodyText != "" || msg.BodyHTML != "" {
+		t.Errorf("expected subject/body to be empty on deletion, got Subject=%q Body=%q", msg.Subject, msg.BodyText)
 	}
 }
 
@@ -480,6 +521,214 @@ func TestAsString(t *testing.T) {
 		got := asString(tc.in)
 		if got != tc.want {
 			t.Errorf("asString(%v) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// ---------- workspace shape tolerance + Acceptance grid ----------
+
+// Real-world regression: at least one Edookit message returns the
+// __lc_Grid_Acceptance workspace component with `data` as a JSON array
+// (rows of the read-receipt table) instead of an object. The custom
+// UnmarshalJSON on messageEditWorkspaceData must dispatch on the first
+// non-whitespace byte, decoding objects into the typed fields and
+// arrays into the Acceptance grid. Anything else is a tolerated no-op
+// so a future unknown component shape doesn't break the whole parse.
+func TestWorkspaceData_UnmarshalDispatchesOnShape(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name           string
+		raw            string
+		wantFormPanels int
+		wantAttachLen  int
+		wantAcceptRows int
+	}{
+		{
+			name:           "object with form panels",
+			raw:            `{"__form_panel_main":[{"label":"Předmět:","items":[{"name":"name","type":"text","val":"x"}]}]}`,
+			wantFormPanels: 1,
+		},
+		{
+			name:          "object with attachments",
+			raw:           `{"data":[{"id":"1@1","name":"a.pdf","link":"https://x/a","date":0}]}`,
+			wantAttachLen: 1,
+		},
+		{
+			name:           "array of acceptance rows",
+			raw:            `[["1","Alice","21.05.2026","",""],["2","Bob","","Bob Sr",""]]`,
+			wantAcceptRows: 2,
+		},
+		{"null is a no-op", `null`, 0, 0, 0},
+		{"true is a no-op", `true`, 0, 0, 0},
+		{"number is a no-op", `42`, 0, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var d messageEditWorkspaceData
+			if err := json.Unmarshal([]byte(tc.raw), &d); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if len(d.FormPanelMain) != tc.wantFormPanels {
+				t.Errorf("FormPanelMain len = %d, want %d", len(d.FormPanelMain), tc.wantFormPanels)
+			}
+			if len(d.Data) != tc.wantAttachLen {
+				t.Errorf("Data len = %d, want %d", len(d.Data), tc.wantAttachLen)
+			}
+			if len(d.Acceptance) != tc.wantAcceptRows {
+				t.Errorf("Acceptance len = %d, want %d", len(d.Acceptance), tc.wantAcceptRows)
+			}
+		})
+	}
+}
+
+// End-to-end: a mixed workspace (form + fileviewer + acceptance) decodes
+// cleanly through json.Unmarshal — this is the production wire shape
+// that triggered the original bug on m-290491.
+func TestParseFullMessage_MixedWorkspaceWithAcceptanceGrid(t *testing.T) {
+	t.Parallel()
+	rawJSON := `{
+		"authenticated": true,
+		"components": {
+			"workspace": [
+				{
+					"DOMTarget": "__lc_Form_Message",
+					"data": {
+						"__form_panel_main": [
+							{"label":"Stav:","items":[{"name":"object_status","type":"html","val":"<span>Publikováno</span><span><b>Test</b>, Čt 21.05.</span>"}]},
+							{"label":"Předmět:","items":[{"name":"name","type":"text","val":"Subject"}]},
+							{"label":"Obsah:","items":[{"name":"description__editor","type":"simple_editor","readValue":"<p>body</p>"}]}
+						]
+					}
+				},
+				{
+					"DOMTarget": "__lc_Fileviewer_Slave_datatemplate_message",
+					"data": {"data": []}
+				},
+				{
+					"DOMTarget": "__lc_Grid_Acceptance",
+					"data": [
+						["1001","Fajkus Eliáš","21.05.2026","Fajkus Martin<br>Fajkusová Soňa","Ne<br>22.05.2026"],
+						["1002","Holub Tadeáš","","",""]
+					]
+				}
+			]
+		}
+	}`
+	var raw messageEditResponse
+	if err := json.Unmarshal([]byte(rawJSON), &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msg, err := parseFullMessage(290491, &raw, testTZ)
+	if err != nil {
+		t.Fatalf("parseFullMessage: %v", err)
+	}
+	if msg.Subject != "Subject" {
+		t.Errorf("subject = %q", msg.Subject)
+	}
+	if len(msg.Recipients) != 2 {
+		t.Fatalf("Recipients = %d, want 2", len(msg.Recipients))
+	}
+
+	// Fajkus Eliáš: read 21.05.2026, two parents — one unread ("Ne") + one read 22.05.2026.
+	r0 := msg.Recipients[0]
+	if r0.Name != "Fajkus Eliáš" {
+		t.Errorf("r0.Name = %q", r0.Name)
+	}
+	if r0.ReadAt != "2026-05-21" {
+		t.Errorf("r0.ReadAt = %q, want 2026-05-21", r0.ReadAt)
+	}
+	if len(r0.Parents) != 2 || r0.Parents[0] != "Fajkus Martin" || r0.Parents[1] != "Fajkusová Soňa" {
+		t.Errorf("r0.Parents = %v", r0.Parents)
+	}
+	if len(r0.ParentsReadAt) != 2 || r0.ParentsReadAt[0] != "" || r0.ParentsReadAt[1] != "2026-05-22" {
+		t.Errorf("r0.ParentsReadAt = %v, want [\"\", \"2026-05-22\"]", r0.ParentsReadAt)
+	}
+
+	// Holub Tadeáš: not yet read, no parents listed (staff or empty fields).
+	r1 := msg.Recipients[1]
+	if r1.Name != "Holub Tadeáš" || r1.ReadAt != "" {
+		t.Errorf("r1 = %+v", r1)
+	}
+	if len(r1.Parents) != 0 {
+		t.Errorf("r1.Parents = %v, want empty", r1.Parents)
+	}
+}
+
+func TestCollectRecipients(t *testing.T) {
+	t.Parallel()
+	// Defensive against short rows (Edookit could one day add or drop a
+	// column; short rows are silently skipped rather than panicking).
+	rows := [][]string{
+		{"1", "Alice", "21.05.2026", "", ""},
+		{"2", "Bob"}, // too short, must be skipped
+		{"3", "Carol", "Ne", "Carol Sr<br>Carol Jr", "Ne<br>22.05.2026"},
+	}
+	got := collectRecipients(rows)
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2 (the 2-cell row must be skipped)", len(got))
+	}
+	if got[0].Name != "Alice" || got[0].ReadAt != "2026-05-21" {
+		t.Errorf("Alice: %+v", got[0])
+	}
+	if got[1].Name != "Carol" || got[1].ReadAt != "" {
+		t.Errorf("Carol: %+v", got[1])
+	}
+	if len(got[1].Parents) != 2 || len(got[1].ParentsReadAt) != 2 {
+		t.Errorf("Carol parents: %+v / %+v", got[1].Parents, got[1].ParentsReadAt)
+	}
+	if got[1].ParentsReadAt[1] != "2026-05-22" {
+		t.Errorf("Carol second parent read = %q", got[1].ParentsReadAt[1])
+	}
+}
+
+// Edookit collapses parents_first_seen to a single value when all
+// parents share the same status (one "Ne" for two unread parents).
+// The parser normalizes that so ParentsReadAt is always aligned with
+// Parents — Claude/users can index them in pairs without surprises.
+func TestCollectRecipients_AlignsParentsReadStatusWithParentsList(t *testing.T) {
+	t.Parallel()
+	rows := [][]string{
+		// Both parents unread — Edookit sends single "Ne", normalize to ["", ""].
+		{"1", "Both unread", "21.05.2026", "Parent A<br>Parent B", "Ne"},
+		// One unread + one read — Edookit sends both, no normalization needed.
+		{"2", "Split read", "21.05.2026", "Parent C<br>Parent D", "Ne<br>22.05.2026"},
+		// Three parents but only one status — replicate.
+		{"3", "Three same", "21.05.2026", "P E<br>P F<br>P G", "Ne"},
+	}
+	got := collectRecipients(rows)
+	if len(got) != 3 {
+		t.Fatalf("len = %d, want 3", len(got))
+	}
+	if len(got[0].Parents) != 2 || len(got[0].ParentsReadAt) != 2 {
+		t.Errorf("row 0: Parents=%d, ParentsReadAt=%d, want both 2", len(got[0].Parents), len(got[0].ParentsReadAt))
+	}
+	if got[0].ParentsReadAt[0] != "" || got[0].ParentsReadAt[1] != "" {
+		t.Errorf("row 0: ParentsReadAt = %v, want [\"\", \"\"] (single Ne → both unread)", got[0].ParentsReadAt)
+	}
+	if got[1].ParentsReadAt[0] != "" || got[1].ParentsReadAt[1] != "2026-05-22" {
+		t.Errorf("row 1: ParentsReadAt = %v, want [\"\", \"2026-05-22\"]", got[1].ParentsReadAt)
+	}
+	if len(got[2].Parents) != 3 || len(got[2].ParentsReadAt) != 3 {
+		t.Errorf("row 2: Parents=%d, ParentsReadAt=%d, want both 3", len(got[2].Parents), len(got[2].ParentsReadAt))
+	}
+}
+
+func TestCzechDateToISO(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ in, want string }{
+		{"21.05.2026", "2026-05-21"},
+		{"1.1.2026", "2026-01-01"},
+		{" 21.05.2026 ", "2026-05-21"},
+		{"Ne", ""}, // Edookit's "not read"
+		{"", ""},
+		{"not-a-date", ""},
+		{"21.05", ""}, // not 3 components
+		{"00.05.2026", ""},
+	}
+	for _, tc := range cases {
+		if got := czechDateToISO(tc.in); got != tc.want {
+			t.Errorf("czechDateToISO(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }

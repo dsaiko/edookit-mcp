@@ -299,7 +299,14 @@ Vedle `messages` může přijít i `parse_warnings` — to jsou řádky, které 
 - **`date`** — RFC 3339, pokud je v hlavičce zprávy parseable; jinak chybí
 - **`body_text`** — plain text těla (entity dekódované, tagy odstraněné, paragraf/`<br>` převedené na konce řádků)
 - **`body_html`** — originální HTML, jak ho Edookit posílá (užitečné, když chcete zachovat odkazy a formátování)
+- **`deleted`** — `true` pokud autor zprávu v Edookitu smazal. V takovém případě je `subject` / `body_text` / `body_html` prázdné (Edookit je server-side stripne), ale `status`, `author` a `date` zůstávají. Volitelné pole — `false` / chybí pro normální zprávy
 - **`attachments`** — pole `{id, name, url, date}` — `url` je plně kvalifikovaná, ale download přes browser by vyžadoval přihlášenou session; pro spolehlivé stažení použijte `edookit_download_attachments`
+- **`recipients`** — doručenky (sekce „Doručenky" v Edookitu). Pole `{name, read_at, parents, parents_read_at}`:
+  - `name` — jméno příjemce (např. „Fajkus Eliáš")
+  - `read_at` — ISO datum „2026-05-21" kdy si příjemce zprávu poprvé otevřel; prázdný řetězec = ještě nečetl
+  - `parents` — seznam rodičů příjemce (např. `["Fajkus Martin", "Fajkusová Soňa"]`); prázdné pro učitele/zaměstnance
+  - `parents_read_at` — kdy si rodiče zprávu přečetli, **vždy zarovnáno s `parents`** (Edookit někdy posílá jednu hodnotu pro všechny stejné, parser ji rozkopíruje). ISO datum nebo prázdný řetězec
+  - Pro **odeslané** zprávy je tohle nejužitečnější — vidíte, kdo si zprávu přečetl a kdo ne. Pro **přijaté** zprávy je tam typicky jen jeden záznam (vy sami).
 
 **Z `edookit_download_attachments`** — jeden objekt:
 
@@ -316,6 +323,60 @@ Vedle `messages` může přijít i `parse_warnings` — to jsou řádky, které 
 #### Proč nejsou cookies šifrované?
 
 XOR nebo podobné „obfuskace" by vám neposkytly žádnou skutečnou ochranu — útočník s přístupem k souborům má i přístup k binárce a tedy ke klíči. Skutečným bezpečnostním pásmem je FileVault (šifrování celého disku) a oprávnění souborů. Pokud chcete jít dál, dlouhodobé řešení je uložení hesla do macOS Keychain — to může být budoucí vylepšení.
+
+#### Co posíláte do cloudu AI poskytovatele (a co s tím dál)
+
+> ⚠ **Tohle není právní rada.** Jsem inženýr, ne právník. Níže popisuji, **co se s daty technicky děje**, a **jaké možnosti** máte, pokud chcete riziko snížit. Pro konkrétní rozhodnutí (zvlášť ve školním nebo firemním kontextu) se zeptejte vašeho DPO / IT / právního.
+
+`edookit-mcp` sám o sobě posílá data jen mezi vaším počítačem, Edookitem a Plus4U — žádný cloud, žádná telemetrie. Ale **AI asistent**, kterému tooly zpřístupníte, vidí výstup těchto toolů jako součást konverzace a **odesílá ho na servery svého poskytovatele**. To znamená:
+
+- **`edookit_list_inbox` / `edookit_list_sent`** — Anthropic / OpenAI / GitHub (Copilot) atd. dostanou předměty, jména odesílatelů, prvních ~200 znaků těla a metadata zpráv.
+- **`edookit_get_message`** — celé tělo zprávy + jména rodičů + jména recipientů + indikátory přečtení.
+- **`edookit_download_attachments`** — samotné soubory se ukládají **lokálně na váš disk**, ale jejich **jména** (z JSON odpovědi) cloud vidí. Obsah souborů sám o sobě cloud nevidí (binárky neprojdou skrze MCP odpovědi — jen cesty), pokud je do konverzace explicitně neuploadnete.
+
+V Edookit zprávách jsou **osobní údaje třetích stran** — jména jiných dětí, jejich rodičů, učitelů, někdy zdravotní nebo studijní detaily. Z pohledu GDPR jste vy v roli příjemce/zpracovatele těchto údajů (na základě svého vztahu ke škole) a předáváte je AI poskytovateli. Většina veřejných AI tarifů (free / Plus / Pro) má v podmínkách klauzule typu „inputs may be used to improve our models" pokud explicitně neopt-outujete. Pro citlivá data je to obvykle **nedostatečné**.
+
+**Dva schůdné způsoby, jak to udělat slušně:**
+
+##### 1. AI tarif s garancí soukromí (no-train, business / enterprise)
+
+Většina poskytovatelů nabízí placené tarify, kde:
+- inputs ani outputs nejsou použity pro trénování modelu (explicitně v ToS),
+- existuje **Data Processing Agreement (DPA)** podle GDPR,
+- často retence dat ≤ 30 dnů, s možností opt-out na nulu.
+
+Konkrétní příklady (stav k roku 2026, **vždy si ověřte aktuální podmínky u poskytovatele**):
+- **Anthropic** — Claude **Team** / **Enterprise** / **API přes Console** (pay-as-you-go) — no-train default, DPA na vyžádání, [Trust Center](https://trust.anthropic.com/).
+- **OpenAI** — ChatGPT **Team** / **Enterprise** / **API** — no-train default pro Team+ a API, [Enterprise privacy](https://openai.com/enterprise-privacy/).
+- **Google** — Gemini přes **Vertex AI** (placené, ne free Gemini app) — no-train, GDPR DPA.
+- **Microsoft** — Copilot **for Business** / **Enterprise** — no-train, EU Data Boundary.
+
+S takovým tarifem je riziko **srovnatelné** s tím, jak když posíláte e-mail přes Gmail Workspace nebo dokumenty přes Microsoft 365 — formálně podloženo DPA, technicky no-train, byť stále jde o cloud.
+
+##### 2. Lokální LLM (data nikdy neopustí váš počítač)
+
+Pokud chcete plnou kontrolu, MCP klienty lze provozovat s **lokálně běžícím modelem**. `edookit-mcp` mluví standardní MCP přes stdio, takže funguje s libovolným klientem, který tu kombinaci umí:
+
+- **[Continue.dev](https://continue.dev/)** + **[Ollama](https://ollama.com/)** / **[LM Studio](https://lmstudio.ai/)** — VS Code / JetBrains extension, MCP support, žádný cloud LLM.
+- **[Goose](https://block.github.io/goose/)** (od Block) — desktop agent s MCP, podpora lokálních modelů přes Ollama.
+- **[Cursor](https://cursor.com/)** s lokálním Ollama endpointem (přes OpenAI-kompatibilní API).
+
+Modely typu **Llama 3.3 70B**, **Qwen 2.5 32B** nebo **Gemma 2 27B** jsou na M-series Macu / herním PC s 32+ GB RAM/VRAM použitelné a zvládnou typické dotazy nad Edookit zprávami (česky včetně). Kvalita je o stupeň níž než Claude Opus / GPT-4 ale pro „kolik mám nepřečtených, od koho, o čem" plně stačí.
+
+##### Free tarify — co se s nimi reálně děje
+
+Pokud používáte **free Claude / ChatGPT / Gemini**:
+- Vaše konverzace **mohou být** použity k trénování modelu (opt-out často skryté v Settings).
+- Konverzace jsou ukládány na neurčito (možno smazat).
+- GDPR DPA typicky není dostupné na free tier.
+
+Pro **nízce citlivá data** (vaše vlastní rozvrhy, vaše nepřečtené zprávy bez detailů třetích stran) je to obvykle akceptovatelné riziko. Pro **citlivá data** (zprávy obsahující jména a info o dětech v třídě, zdravotní info, hodnocení) by **měl být na free tarifu opt-out** z trénování zapnutý, a i pak je rozumnější přesunout se na placený no-train tarif nebo lokální model.
+
+##### Praktická doporučení
+
+- **Pokud používáte projekt jako rodič** pro své vlastní účely (čtete si zprávy ze školy svého dítěte) → buď no-train placený tarif, nebo lokální model, nebo opt-out + smazání citlivých konverzací.
+- **Pokud používáte projekt jako učitel** s přístupem k osobním datům studentů a jejich rodičů → **jen no-train tarif s DPA, nebo jen lokální model.** Free tarify bez opt-outu nejsou vhodné.
+- **Pokud má škola GDPR / IT policy** — zeptejte se, jestli AI tooly s přístupem ke školní agendě má povolené. Některé školy mají Microsoft 365 / Google Workspace s explicitními DPAs; další zatím nemají rozhodnuto. Není v žádném případě bezpečné předpokládat „jistě to je v pohodě".
 
 ### Časté problémy
 
