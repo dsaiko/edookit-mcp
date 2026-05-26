@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -126,6 +127,167 @@ func TestResolveDestDir_RelativePathRejected(t *testing.T) {
 		if err != nil && !strings.Contains(err.Error(), "absolute") {
 			t.Errorf("resolveDestDir(%q) error %q should mention absolute requirement", raw, err.Error())
 		}
+	}
+}
+
+// ---------- streamToDest no-overwrite commit ----------
+
+// Concurrent downloads to the same destination in no-overwrite mode must end
+// with exactly one writer and a fully-written file — never a clobbered or
+// partial result. Each call downloads to its own temp and then os.Links it
+// into place; dst only appears as a complete file and a losing racer's Link
+// fails with ErrExist, so it skips.
+func TestStreamToDest_NoOverwriteConcurrentRaceFree(t *testing.T) {
+	t.Parallel()
+	const payload = "DOWNLOADED CONTENT BODY"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("warmup ok")) })
+	mux.HandleFunc("/handler/download/file", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte(payload))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	cli := buildClient(t, srv)
+
+	destDir := t.TempDir()
+	dst := filepath.Join(destDir, "report.pdf")
+
+	const n = 8
+	var wg sync.WaitGroup
+	results := make([]DownloadedFile, n)
+	wg.Add(n)
+	for i := range n {
+		go func(i int) {
+			defer wg.Done()
+			results[i] = streamToDest(context.Background(), cli,
+				"/handler/download/file", destDir, dst, false,
+				DownloadedFile{Name: "report.pdf", Path: dst})
+		}(i)
+	}
+	wg.Wait()
+
+	written, skipped := 0, 0
+	for _, r := range results {
+		if r.Error != "" {
+			t.Fatalf("unexpected error: %s", r.Error)
+		}
+		if r.Skipped {
+			skipped++
+		} else {
+			written++
+		}
+	}
+	if written != 1 || skipped != n-1 {
+		t.Fatalf("written=%d skipped=%d, want 1 and %d", written, skipped, n-1)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read dst: %v", err)
+	}
+	if string(got) != payload {
+		t.Errorf("dst content = %q, want full payload %q (clobbered or partial)", got, payload)
+	}
+	entries, _ := os.ReadDir(destDir)
+	if len(entries) != 1 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Errorf("destDir has %d entries %v, want 1 (no leftover temp file)", len(entries), names)
+	}
+}
+
+// A failed download in no-overwrite mode must not leave a 0-byte placeholder
+// at the destination — the temp is only linked into place after a complete
+// download, so a failure leaves nothing at dst.
+func TestStreamToDest_NoOverwriteFailureLeavesNoPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("warmup ok")) })
+	mux.HandleFunc("/handler/download/file", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	cli := buildClient(t, srv)
+
+	destDir := t.TempDir()
+	dst := filepath.Join(destDir, "report.pdf")
+
+	r := streamToDest(context.Background(), cli, "/handler/download/file",
+		destDir, dst, false, DownloadedFile{Name: "report.pdf", Path: dst})
+	if r.Error == "" {
+		t.Fatal("expected a download error, got none")
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Errorf("dst should not exist after failed download, stat err = %v", err)
+	}
+	entries, _ := os.ReadDir(destDir)
+	if len(entries) != 0 {
+		t.Errorf("destDir should be empty after failure, has %d entries", len(entries))
+	}
+}
+
+// A failing download must not affect a concurrent successful one targeting the
+// same destination: with no shared placeholder, the failure leaves dst alone,
+// so the successful caller still commits complete content and the failing one
+// just reports an error (never a false skip, never a clobbered/empty file).
+func TestStreamToDest_NoOverwriteFailureDoesNotBlockConcurrentSuccess(t *testing.T) {
+	t.Parallel()
+	const payload = "GOOD COMPLETE PAYLOAD"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("warmup ok")) })
+	mux.HandleFunc("/handler/download/good", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte(payload))
+	})
+	mux.HandleFunc("/handler/download/bad", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	cli := buildClient(t, srv)
+
+	destDir := t.TempDir()
+	dst := filepath.Join(destDir, "report.pdf")
+
+	var wg sync.WaitGroup
+	var good, bad DownloadedFile
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		good = streamToDest(context.Background(), cli, "/handler/download/good",
+			destDir, dst, false, DownloadedFile{Name: "report.pdf", Path: dst})
+	}()
+	go func() {
+		defer wg.Done()
+		bad = streamToDest(context.Background(), cli, "/handler/download/bad",
+			destDir, dst, false, DownloadedFile{Name: "report.pdf", Path: dst})
+	}()
+	wg.Wait()
+
+	if bad.Error == "" {
+		t.Errorf("failing download should report an error, got none")
+	}
+	if good.Error != "" {
+		t.Errorf("good download should not error, got %q", good.Error)
+	}
+	// Regardless of scheduling, dst must end up as the complete good payload —
+	// the failing call never created it and so can't have removed it.
+	gotBytes, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read dst: %v", err)
+	}
+	if string(gotBytes) != payload {
+		t.Errorf("dst content = %q, want %q", gotBytes, payload)
+	}
+	entries, _ := os.ReadDir(destDir)
+	if len(entries) != 1 {
+		t.Errorf("destDir has %d entries, want 1 (just the final file)", len(entries))
 	}
 }
 

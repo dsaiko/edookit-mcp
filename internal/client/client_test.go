@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -92,11 +93,18 @@ func TestNew_NormalizesDefaultPortInBaseURL(t *testing.T) {
 		{name: "https without port unchanged", in: "https://school.test", want: "school.test"},
 		{name: "custom port preserved", in: "https://school.test:8443", want: "school.test:8443"},
 		{name: "http with :443 preserved (not default)", in: "http://school.test:443", want: "school.test:443"},
+		// IPv6 literals: stripping the default port must keep the brackets so
+		// the Host stays a valid URL authority.
+		{name: "https IPv6 with :443 stripped keeps brackets", in: "https://[::1]:443", want: "[::1]"},
+		{name: "http IPv6 with :80 stripped keeps brackets", in: "http://[::1]:80", want: "[::1]"},
+		{name: "IPv6 custom port preserved", in: "https://[::1]:8443", want: "[::1]:8443"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			cli, err := New(Config{BaseURL: tc.in, Username: "u", Password: "p"})
+			// AllowInsecureHTTP so the http:// port cases exercise port
+			// normalization rather than tripping the insecure-scheme guard.
+			cli, err := New(Config{BaseURL: tc.in, Username: "u", Password: "p", AllowInsecureHTTP: true})
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -164,6 +172,41 @@ func TestNew_RejectsBadBaseURL(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.wantMsg) {
 				t.Errorf("error %q should mention %q", err.Error(), tc.wantMsg)
+			}
+		})
+	}
+}
+
+func TestNew_InsecureHTTPPolicy(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		baseURL   string
+		allow     bool
+		wantError bool
+	}{
+		{name: "https non-loopback ok", baseURL: "https://school.edookit.net", wantError: false},
+		{name: "http non-loopback rejected", baseURL: "http://school.edookit.net", wantError: true},
+		{name: "http non-loopback allowed by flag", baseURL: "http://school.edookit.net", allow: true, wantError: false},
+		{name: "http localhost ok", baseURL: "http://localhost:8080", wantError: false},
+		{name: "http 127.0.0.1 ok", baseURL: "http://127.0.0.1:8080", wantError: false},
+		{name: "http ::1 ok", baseURL: "http://[::1]:8080", wantError: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := New(Config{BaseURL: tc.baseURL, Username: "u", Password: "p", AllowInsecureHTTP: tc.allow})
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("expected error for %q (allow=%v), got nil", tc.baseURL, tc.allow)
+				}
+				if !strings.Contains(err.Error(), "insecure http") {
+					t.Errorf("error %q should mention insecure http", err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for %q (allow=%v): %v", tc.baseURL, tc.allow, err)
 			}
 		})
 	}
@@ -679,6 +722,54 @@ func TestConcurrentRequests_NoRaceUnderInvalidation(t *testing.T) {
 	close(stop)
 	wg.Wait()
 	// Reaching here without `go test -race` complaining is the assertion.
+}
+
+// ---------- off-origin preflight ----------
+
+// An absolute off-origin URL must be refused before any request leaves the
+// process, for every request type (JSON / HTML doc / binary download), not
+// just GetTo. Uses a server that would record a hit if one slipped through.
+// Kept serial (no t.Parallel): the subtests share the evil-hit counter that's
+// asserted after they all run, so they must execute before this function
+// returns.
+func TestRequests_RefuseOffOriginURLBeforeDispatch(t *testing.T) {
+	var evil int32
+	evilSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&evil, 1)
+		_, _ = w.Write([]byte("should never be reached"))
+	}))
+	defer evilSrv.Close()
+
+	srv := fakeServer(t, http.NewServeMux())
+	defer srv.Close()
+	cli := newClientForTest(t, srv)
+
+	// Absolute URL pointing at a different origin than baseURL.
+	offOrigin := evilSrv.URL + "/handler/grid/objects-for-me-data"
+
+	t.Run("getJSON", func(t *testing.T) {
+		var out map[string]any
+		err := cli.GetJSON(context.Background(), offOrigin, &out)
+		if err == nil || !strings.Contains(err.Error(), "off-origin") {
+			t.Errorf("GetJSON err = %v, want an off-origin refusal", err)
+		}
+	})
+	t.Run("getDoc", func(t *testing.T) {
+		_, err := cli.GetDoc(context.Background(), offOrigin)
+		if err == nil || !strings.Contains(err.Error(), "off-origin") {
+			t.Errorf("GetDoc err = %v, want an off-origin refusal", err)
+		}
+	})
+	t.Run("getTo", func(t *testing.T) {
+		_, err := cli.GetTo(context.Background(), offOrigin, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "off-origin") {
+			t.Errorf("GetTo err = %v, want an off-origin refusal", err)
+		}
+	})
+
+	if n := atomic.LoadInt32(&evil); n != 0 {
+		t.Errorf("off-origin server was hit %d time(s); preflight should block all dispatch", n)
+	}
 }
 
 // ---------- sameOrigin ----------

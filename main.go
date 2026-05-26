@@ -52,12 +52,13 @@ func main() {
 	}
 
 	cli, err := client.New(client.Config{
-		BaseURL:         getenvRequired("EDOOKIT_URL"),
-		Username:        getenvRequired("EDOOKIT_USER"),
-		Password:        getenvRequired("EDOOKIT_PASS"),
-		HeadlessLogin:   getenvBool("EDOOKIT_HEADLESS_LOGIN", true),
-		CookieCachePath: cookieCachePath(),
-		Timezone:        loadTimezone(),
+		BaseURL:           getenvRequired("EDOOKIT_URL"),
+		Username:          getenvRequired("EDOOKIT_USER"),
+		Password:          getenvRequired("EDOOKIT_PASS"),
+		HeadlessLogin:     getenvBool("EDOOKIT_HEADLESS_LOGIN", true),
+		AllowInsecureHTTP: getenvBool("EDOOKIT_ALLOW_INSECURE_HTTP", false),
+		CookieCachePath:   cookieCachePath(),
+		Timezone:          loadTimezone(),
 	})
 	if err != nil {
 		log.Fatalf("init client: %v", err)

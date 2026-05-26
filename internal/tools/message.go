@@ -389,17 +389,14 @@ func czechDateToISO(s string) string {
 	if s == "" || s == "Ne" {
 		return ""
 	}
-	parts := strings.Split(s, ".")
-	if len(parts) != 3 {
+	// Tolerate stray internal spaces ("21. 5. 2026") the way the previous
+	// per-part trimming did, then parse strictly so impossible dates
+	// ("00.05.2026", "32.13.2026") are rejected rather than normalized.
+	t, err := time.Parse("2.1.2006", strings.ReplaceAll(s, " ", ""))
+	if err != nil {
 		return ""
 	}
-	d, errD := strconv.Atoi(strings.TrimSpace(parts[0]))
-	mo, errM := strconv.Atoi(strings.TrimSpace(parts[1]))
-	y, errY := strconv.Atoi(strings.TrimSpace(parts[2]))
-	if errD != nil || errM != nil || errY != nil || d == 0 || mo == 0 || y == 0 {
-		return ""
-	}
-	return fmt.Sprintf("%04d-%02d-%02d", y, mo, d)
+	return t.Format("2006-01-02")
 }
 
 // splitBR splits a "<br>"-joined cell into its components. Empty input
@@ -505,12 +502,9 @@ func parseStatusHTML(s string, loc *time.Location) (status, author, dateRFC stri
 	}
 	// Inline "Od DD.MM.YYYY HH:MM" — present for received messages.
 	if m := statusDateRe.FindStringSubmatch(root.Text()); len(m) == 6 {
-		d, _ := strconv.Atoi(m[1])
-		mo, _ := strconv.Atoi(m[2])
-		y, _ := strconv.Atoi(m[3])
-		h, _ := strconv.Atoi(m[4])
-		mi, _ := strconv.Atoi(m[5])
-		dateRFC = time.Date(y, time.Month(mo), d, h, mi, 0, 0, loc).Format(time.RFC3339)
+		if iso, ok := czechDateTimeToRFC3339(m[1], m[2], m[3], m[4], m[5], loc); ok {
+			dateRFC = iso
+		}
 	}
 	return status, author, dateRFC
 }

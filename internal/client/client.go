@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -17,7 +18,16 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"golang.org/x/net/publicsuffix"
 )
+
+// jarOptions configures every cookie jar this client creates. Using the
+// public suffix list is what net/http/cookiejar docs recommend: without it
+// the jar treats any host as eligible for broad ("supercookie") domain
+// attributes, so a malicious or compromised upstream could set a cookie
+// scoped to a registry suffix (e.g. ".net") and have it replayed across
+// unrelated hosts during redirects.
+var jarOptions = &cookiejar.Options{PublicSuffixList: publicsuffix.List}
 
 const defaultUserAgent = "edookit-mcp/0.1 (+https://github.com/dsaiko/edookit-mcp)"
 
@@ -37,6 +47,14 @@ type Config struct {
 	BaseURL  string // your school's Edookit URL, e.g. https://your-school-login.edookit.net
 	Username string // Plus4U identity (email or login name)
 	Password string
+
+	// AllowInsecureHTTP permits a plain http:// BaseURL pointing at a
+	// non-loopback host. Off by default: a real Edookit tenant is always
+	// https, and a misconfigured http:// URL would send the session cookie
+	// (and login traffic) in the clear. Loopback hosts (localhost / 127.0.0.1
+	// / ::1) are always allowed regardless of this flag so local test servers
+	// keep working.
+	AllowInsecureHTTP bool
 
 	// HeadlessLogin controls whether the chromium instance used during login
 	// is invisible. Default is true; set to false to watch the flow during
@@ -124,7 +142,7 @@ type swappableJar struct {
 }
 
 func newSwappableJar() (*swappableJar, error) {
-	j, err := cookiejar.New(nil)
+	j, err := cookiejar.New(jarOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +163,7 @@ func (s *swappableJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
 // holding a reference to the previous inner via Load() continues to work
 // against the old jar (which becomes garbage once those calls return).
 func (s *swappableJar) reset() error {
-	j, err := cookiejar.New(nil)
+	j, err := cookiejar.New(jarOptions)
 	if err != nil {
 		return err
 	}
@@ -178,7 +196,7 @@ func New(cfg Config) (*Client, error) {
 		cfg.Timezone = defaultTimezone()
 	}
 
-	u, err := parseBaseURL(cfg.BaseURL)
+	u, err := parseBaseURL(cfg.BaseURL, cfg.AllowInsecureHTTP)
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +219,7 @@ func New(cfg Config) (*Client, error) {
 // inputs like "school.edookit.net" by stashing them in Path; the failure would
 // surface much later in an HTTP/chromedp call with a less useful message.
 // Reject those (and missing/invalid hosts) here while we still have context.
-func parseBaseURL(raw string) (*url.URL, error) {
+func parseBaseURL(raw string, allowInsecureHTTP bool) (*url.URL, error) {
 	if raw == "" {
 		return nil, errors.New("BaseURL is required")
 	}
@@ -218,14 +236,42 @@ func parseBaseURL(raw string) (*url.URL, error) {
 	if u.Hostname() == "" {
 		return nil, fmt.Errorf("BaseURL %q has no host", raw)
 	}
+	// Plain http:// to a non-loopback host would put the session cookie and
+	// login traffic on the wire in the clear. Reject unless explicitly opted
+	// in via AllowInsecureHTTP. Loopback (localhost / 127.0.0.1 / ::1) is
+	// always allowed so local test servers don't need the flag.
+	if u.Scheme == schemeHTTP && !allowInsecureHTTP && !isLoopbackHost(u.Hostname()) {
+		return nil, fmt.Errorf("BaseURL %q uses insecure http:// to a non-loopback host; use https:// or set AllowInsecureHTTP", raw)
+	}
 	// Strip the default port for the scheme so off-host comparisons
 	// downstream don't trip on a "https://school.test:443" baseURL vs a
 	// "https://school.test" redirect (both denote the same origin). Custom
 	// ports (:8443 etc.) are preserved verbatim.
 	if (u.Scheme == schemeHTTP && u.Port() == "80") || (u.Scheme == schemeHTTPS && u.Port() == "443") {
-		u.Host = u.Hostname()
+		host := u.Hostname()
+		// Hostname() strips IPv6 brackets; re-add them so the resulting Host
+		// stays a valid URL authority ("[::1]", not "::1" which stringifies to
+		// the malformed "https://::1/...").
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+		u.Host = host
 	}
 	return u, nil
+}
+
+// isLoopbackHost reports whether host (a URL hostname, no port) refers to the
+// local machine: the literal "localhost", or any loopback IP (127.0.0.0/8,
+// ::1). Used to keep plain-http local test servers working without the
+// AllowInsecureHTTP opt-in.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // defaultTimezone returns Europe/Prague (the TZ for the schools this MCP
@@ -272,6 +318,29 @@ func (c *Client) resolve(path string) (string, error) {
 		return "", fmt.Errorf("parse request path %q: %w", path, err)
 	}
 	return c.baseURL.ResolveReference(ref).String(), nil
+}
+
+// preflightSameOrigin resolves path against baseURL and rejects it before
+// dispatch if it points off-origin. Paths come from internal callers today,
+// but newRequest accepts absolute URLs too (attachment `link` values arrive
+// fully qualified), so a drifted or hostile value could otherwise be sent
+// outbound — an SSRF-style footgun. Sharing one check across GetTo / getJSON
+// / getDoc closes it for every request type, not just binary downloads. The
+// post-response sameOrigin check still catches redirects that happen
+// mid-flight.
+func (c *Client) preflightSameOrigin(path string) error {
+	resolved, err := c.resolve(path)
+	if err != nil {
+		return err
+	}
+	resolvedURL, err := url.Parse(resolved)
+	if err != nil {
+		return fmt.Errorf("parse resolved URL %q: %w", resolved, err)
+	}
+	if !sameOrigin(resolvedURL, c.baseURL) {
+		return fmt.Errorf("refusing off-origin URL %s (must be same origin as %s)", resolvedURL.Host, c.baseURL.Host)
+	}
+	return nil
 }
 
 // newRequest builds an authenticated GET against path (relative or
@@ -638,24 +707,10 @@ func (c *Client) getTo(ctx context.Context, path string, dst io.Writer, retry bo
 		return 0, err
 	}
 
-	// Pre-flight origin check: GetTo accepts absolute URLs (attachment
-	// `link` values come back fully qualified from Edookit), so a drifted
-	// or malicious link pointing off-origin would otherwise be dispatched
-	// once, caught by the post-response sameOrigin check, retried after
-	// invalidate, and dispatched a second time before failing. Verify the
-	// resolved URL is same-origin BEFORE c.do so the bogus link never
-	// leaves the process. The post-response check below still catches
-	// redirects that happen mid-flight.
-	resolved, err := c.resolve(path)
-	if err != nil {
-		return 0, err
-	}
-	resolvedURL, err := url.Parse(resolved)
-	if err != nil {
-		return 0, fmt.Errorf("parse resolved URL %q: %w", resolved, err)
-	}
-	if !sameOrigin(resolvedURL, c.baseURL) {
-		return 0, fmt.Errorf("GET %s: refusing off-origin URL %s (must be same origin as %s)", path, resolvedURL.Host, c.baseURL.Host)
+	// Pre-flight origin check before c.do so a bogus off-origin link never
+	// leaves the process. See preflightSameOrigin for the SSRF rationale.
+	if err := c.preflightSameOrigin(path); err != nil {
+		return 0, fmt.Errorf("GET %s: %w", path, err)
 	}
 
 	req, err := c.newRequest(ctx, path)
@@ -722,6 +777,9 @@ func (c *Client) getJSON(ctx context.Context, path string, out any, retry bool) 
 	if err := c.ensureLoggedIn(ctx); err != nil {
 		return err
 	}
+	if err := c.preflightSameOrigin(path); err != nil {
+		return fmt.Errorf("GET %s: %w", path, err)
+	}
 
 	req, err := c.newRequest(ctx, path)
 	if err != nil {
@@ -778,6 +836,9 @@ func (c *Client) getJSON(ctx context.Context, path string, out any, retry bool) 
 func (c *Client) getDoc(ctx context.Context, path string, retry bool) (*goquery.Document, error) {
 	if err := c.ensureLoggedIn(ctx); err != nil {
 		return nil, err
+	}
+	if err := c.preflightSameOrigin(path); err != nil {
+		return nil, fmt.Errorf("GET %s: %w", path, err)
 	}
 
 	req, err := c.newRequest(ctx, path)

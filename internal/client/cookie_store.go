@@ -5,11 +5,20 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 )
+
+// maxCookieClockSkew bounds how far a cached file's captured_at may sit in the
+// future before we distrust it. A future timestamp (clock skew or tampering)
+// would make the computed age negative and keep the cache "fresh" forever,
+// silently defeating CookieMaxAge. A few minutes of tolerance absorbs ordinary
+// skew without opening that window.
+const maxCookieClockSkew = 5 * time.Minute
 
 // cookieFile is the on-disk format for cached session cookies. CapturedAt is
 // used to expire the cache after CookieMaxAge regardless of the cookies' own
@@ -36,6 +45,21 @@ func DefaultCookieCachePath() (string, error) {
 // or unreadable payload is treated as a cache miss and reported as an error so
 // the caller can decide to re-login.
 func loadCookies(path, baseURL string) ([]*http.Cookie, time.Duration, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	// These cookies grant live session access; saveCookies writes them 0600.
+	// A group/world-readable cache means another local user may be able to
+	// read the session — warn loudly (we don't reject, to avoid breaking
+	// caches created under a looser historical umask). POSIX perm bits are
+	// only meaningful off Windows, where os reports a synthetic 0666.
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			log.Printf("[client] warning: cookie cache %s is mode %04o (group/world-accessible); tighten with: chmod 600 %s", path, perm, path)
+		}
+	}
+
 	data, err := os.ReadFile(path) //nolint:gosec // G304: path comes from our own config (env var or UserCacheDir), not external input
 	if err != nil {
 		return nil, 0, err
@@ -49,6 +73,10 @@ func loadCookies(path, baseURL string) ([]*http.Cookie, time.Duration, error) {
 	}
 	if len(cf.Cookies) == 0 {
 		return nil, 0, errors.New("cookie file is empty")
+	}
+	// Distrust a captured_at far in the future — see maxCookieClockSkew.
+	if skew := time.Until(cf.CapturedAt); skew > maxCookieClockSkew {
+		return nil, 0, fmt.Errorf("cookie file %s captured_at is %s in the future; treating as a cache miss", path, skew.Round(time.Second))
 	}
 	return cf.Cookies, time.Since(cf.CapturedAt), nil
 }
