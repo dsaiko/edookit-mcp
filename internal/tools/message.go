@@ -1,7 +1,9 @@
 package tools
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -30,7 +32,21 @@ type FullMessage struct {
 	Date        string       `json:"date,omitempty"`      // RFC3339, school timezone
 	BodyHTML    string       `json:"body_html,omitempty"` // original message body HTML (sanitized by Edookit's editor)
 	BodyText    string       `json:"body_text,omitempty"` // plain-text rendering of BodyHTML (entities decoded, whitespace collapsed, line breaks preserved)
+	Deleted     bool         `json:"deleted,omitempty"`   // true when Edookit reports the message as author-deleted (Status starts with "Smazané"); Subject + BodyHTML/Text are stripped server-side in that case, only Status / Author / Date carry info
 	Attachments []Attachment `json:"attachments"`
+	Recipients  []Recipient  `json:"recipients,omitempty"` // delivery / read-receipt table (Komunikace → Doručenky) — present on sent messages; for received messages typically lists only the current user
+}
+
+// Recipient is one row of the message's delivery / read-receipt table
+// (Edookit calls it "Doručenky"). For sent messages this tells the
+// author who received the message and whether they (and their parents)
+// have opened it yet. For received messages the row usually just
+// represents the current user.
+type Recipient struct {
+	Name          string   `json:"name"`                      // "Fajkus Eliáš"
+	ReadAt        string   `json:"read_at,omitempty"`         // ISO date "2026-05-21" when the recipient first read the message; "" if not yet read
+	Parents       []string `json:"parents,omitempty"`         // ["Fajkus Martin", "Fajkusová Soňa"]; empty for staff recipients (no parents listed)
+	ParentsReadAt []string `json:"parents_read_at,omitempty"` // aligned with Parents; per parent either ISO date "2026-05-21" or "" if not read
 }
 
 // Attachment is one file linked from a message. URL is fully qualified and
@@ -80,6 +96,7 @@ func normalizeMessageID(s string) (int, error) {
 const (
 	domTargetFormMessage = "__lc_Form_Message"
 	domTargetFileviewer  = "__lc_Fileviewer_Slave_datatemplate_message"
+	domTargetAcceptance  = "__lc_Grid_Acceptance"
 )
 
 // messageEditResponse is the subset of /handler/page/message-edit?__index=N
@@ -109,16 +126,48 @@ type messageEditWorkspaceComponent struct {
 	Data      messageEditWorkspaceData `json:"data"`
 }
 
-// messageEditWorkspaceData has two shapes depending on which DOMTarget
-// owns the component. The form-message panel carries __form_panel_main;
-// the fileviewer panel carries data (a nested array of attachments).
-// Either field can legitimately be absent (one for each DOMTarget) and
-// JSON-unmarshal leaves the missing one nil — only the parseFullMessage
-// dispatch reads the field appropriate to its component, so the other
-// staying nil is fine.
+// messageEditWorkspaceData carries the `data` field of a workspace
+// component. The field has three observed shapes in the wild:
+//
+//   - form-message component: object with __form_panel_main + other
+//     sub-panels we ignore. Populates FormPanelMain.
+//   - fileviewer component: object with `data` (attachments array) +
+//     other metadata we ignore. Populates Data.
+//   - acceptance-grid component: bare JSON array of rows where each
+//     row is itself an array of strings — Edookit's tabular shape for
+//     the read-receipts table. Populates Acceptance.
+//
+// Custom UnmarshalJSON dispatches on the first byte: '{' decodes into
+// the typed struct fields; '[' decodes into Acceptance directly; any
+// other shape (null, scalar) is silently no-op'd so a future component
+// we don't model can't break the whole parse.
+//
+// parseFullMessage looks up components by DOMTarget and only reads the
+// field appropriate to that component, so the unused fields staying
+// zero-valued is harmless.
 type messageEditWorkspaceData struct {
 	FormPanelMain []messageEditPanel      `json:"__form_panel_main,omitempty"`
 	Data          []messageEditAttachment `json:"data,omitempty"`
+	Acceptance    [][]string              `json:"-"`
+}
+
+func (d *messageEditWorkspaceData) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 {
+		return nil
+	}
+	switch b[0] {
+	case '{':
+		// Alias type breaks the recursion into our own UnmarshalJSON.
+		type alias messageEditWorkspaceData
+		return json.Unmarshal(b, (*alias)(d))
+	case '[':
+		return json.Unmarshal(b, &d.Acceptance)
+	default:
+		// null / scalar / unexpected shape — workspace component we
+		// don't model. Leave d zero-valued.
+		return nil
+	}
 }
 
 type messageEditPanel struct {
@@ -152,7 +201,7 @@ func parseFullMessage(num int, raw *messageEditResponse, loc *time.Location) (*F
 		return nil, errors.New("server reported authenticated=false")
 	}
 
-	form, fileviewer := pickFormAndFileviewer(raw.Components.Workspace)
+	form, fileviewer, acceptance := pickComponents(raw.Components.Workspace)
 	if form == nil {
 		return nil, fmt.Errorf("message-edit response has no __lc_Form_Message workspace component (got %d components)", len(raw.Components.Workspace))
 	}
@@ -164,30 +213,44 @@ func parseFullMessage(num int, raw *messageEditResponse, loc *time.Location) (*F
 	}
 	populateMessageFields(msg, form.Data.FormPanelMain, loc)
 
-	// Schema-drift guard: if Edookit renames or removes both "name" and
-	// "description__editor" items, parseFullMessage would otherwise return
-	// a successful FullMessage with empty subject AND empty body — which
-	// downstream presents as "this message has nothing in it". Loud
-	// failure here matches the row-parser's policy (see fetchAndParse:
-	// rows-fetched-but-none-parsed becomes an error) so schema drift
-	// gets flagged as drift, not as "the message is empty".
-	if msg.Subject == "" && msg.BodyText == "" && msg.BodyHTML == "" {
-		return nil, fmt.Errorf("message %d: parsed message has empty subject AND empty body — Edookit form schema may have drifted (expected items 'name' and 'description__editor' in __form_panel_main)", num)
+	// Detect author-deleted messages: Edookit keeps the metadata (status,
+	// author, date) but strips subject + body server-side, and the status
+	// label changes to "Smazané autorem DD.MM.YYYY HH:MM". The schema-
+	// drift guard below would otherwise misreport this as "form schema
+	// drifted" — but it's a legitimate state we should surface.
+	if strings.HasPrefix(msg.Status, "Smazané") {
+		msg.Deleted = true
+	}
+
+	// Schema-drift guard: if Edookit renames or removes BOTH the
+	// "name" / "description__editor" items AND object_status (i.e. the
+	// whole form is empty of human-readable content), parseFullMessage
+	// would otherwise return a successful FullMessage with nothing in
+	// it. Loud failure here matches the row-parser's policy (see
+	// fetchAndParse: rows-fetched-but-none-parsed becomes an error) so
+	// genuine drift gets flagged as drift. Note: author-deletion leaves
+	// status non-empty, so this won't false-positive on those.
+	if msg.Status == "" && msg.Subject == "" && msg.BodyText == "" && msg.BodyHTML == "" {
+		return nil, fmt.Errorf("message %d: parsed message has empty status AND subject AND body — Edookit form schema may have drifted (expected items 'object_status' / 'name' / 'description__editor' in __form_panel_main)", num)
 	}
 
 	if fileviewer != nil {
 		msg.Attachments = collectAttachments(fileviewer.Data.Data, loc)
 	}
+	if acceptance != nil {
+		msg.Recipients = collectRecipients(acceptance.Data.Acceptance)
+	}
 
 	return msg, nil
 }
 
-// pickFormAndFileviewer scans the workspace array once and returns the
-// two components parseFullMessage needs (form + attachments). Either may
-// be nil — only form is required; missing fileviewer just means "no
-// attachments". Both can also be present but in unexpected order, which
-// is why we scan rather than indexing.
-func pickFormAndFileviewer(workspace []messageEditWorkspaceComponent) (form, fileviewer *messageEditWorkspaceComponent) {
+// pickComponents scans the workspace array once and returns the three
+// components parseFullMessage knows how to extract. form is required;
+// the others may legitimately be absent (a no-attachments message
+// won't have fileviewer; a stripped-down API response may lack the
+// acceptance grid). Order in the response is not guaranteed, hence
+// the scan-and-classify.
+func pickComponents(workspace []messageEditWorkspaceComponent) (form, fileviewer, acceptance *messageEditWorkspaceComponent) {
 	for i := range workspace {
 		w := &workspace[i]
 		switch w.DOMTarget {
@@ -195,9 +258,11 @@ func pickFormAndFileviewer(workspace []messageEditWorkspaceComponent) (form, fil
 			form = w
 		case domTargetFileviewer:
 			fileviewer = w
+		case domTargetAcceptance:
+			acceptance = w
 		}
 	}
-	return form, fileviewer
+	return form, fileviewer, acceptance
 }
 
 // populateMessageFields extracts subject / status / author / date / body
@@ -237,6 +302,125 @@ func collectAttachments(raw []messageEditAttachment, loc *time.Location) []Attac
 			URL:  a.Link,
 			Date: unixToRFC3339(a.Date, loc),
 		})
+	}
+	return out
+}
+
+// collectRecipients converts the raw Acceptance grid rows into the
+// public Recipient shape. Edookit's row layout (observed from
+// /handler/page/message-edit) is a 5-tuple:
+//
+//	[ id, person_name, first_seen, parents (br-joined), parents_first_seen (br-joined) ]
+//
+// Where first_seen / parents_first_seen are either "DD.MM.YYYY", an
+// empty string, or "Ne" (Czech "no" — recipient/parent hasn't read).
+// Parents and parents_first_seen are joined with "<br>" because
+// Edookit's UI renders them as multi-line cells.
+//
+// Edookit collapses parents_first_seen to a single value when all
+// parents share the status (a single "Ne" badge for two unread
+// parents, vs. "Ne<br>21.05.2026" for one unread and one read). We
+// normalize that by repeating the last value to match len(Parents) so
+// consumers always get aligned arrays.
+//
+// Rows that don't have at least 5 cells are skipped (defensive — same
+// approach as the row-list parser does for short rows).
+func collectRecipients(rows [][]string) []Recipient {
+	out := make([]Recipient, 0, len(rows))
+	for _, row := range rows {
+		if len(row) < 5 {
+			continue
+		}
+		parents := splitBR(row[3])
+		parentsRead := mapSlice(splitBR(row[4]), czechDateToISO)
+		out = append(out, Recipient{
+			Name:          strings.TrimSpace(row[1]),
+			ReadAt:        czechDateToISO(row[2]),
+			Parents:       parents,
+			ParentsReadAt: alignParentsRead(parentsRead, len(parents)),
+		})
+	}
+	return out
+}
+
+// alignParentsRead normalizes the parents-read indicator to match the
+// number of parents. Edookit's wire format collapses a uniform "Ne /
+// Ne" to a single "Ne", which would otherwise leave len(ParentsReadAt)
+// < len(Parents) and confuse downstream consumers. When the indicator
+// is empty (staff recipient with no parents listed) it stays empty.
+// When it's longer than Parents (shouldn't happen, but be defensive)
+// it's truncated.
+func alignParentsRead(read []string, nParents int) []string {
+	if nParents == 0 {
+		return nil
+	}
+	switch {
+	case len(read) == 0:
+		// Edookit sent neither "Ne" nor a date for any parent — fill
+		// with empties so the array length still matches Parents.
+		out := make([]string, nParents)
+		return out
+	case len(read) < nParents:
+		// Single (or fewer) status applies to all parents — replicate
+		// the last value to fill in.
+		out := make([]string, nParents)
+		for i := range out {
+			if i < len(read) {
+				out[i] = read[i]
+			} else {
+				out[i] = read[len(read)-1]
+			}
+		}
+		return out
+	case len(read) > nParents:
+		return read[:nParents]
+	default:
+		return read
+	}
+}
+
+// czechDateToISO converts a Czech "DD.MM.YYYY" string to ISO "YYYY-MM-DD".
+// Returns "" for an empty input, for "Ne" (Czech for "no", which Edookit
+// uses to mean "not read"), or for anything that doesn't parse. The
+// output is date-only because the Acceptance grid carries day-precision
+// only — promoting it to RFC3339 by faking 00:00 would be misleading.
+func czechDateToISO(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "Ne" {
+		return ""
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	d, errD := strconv.Atoi(strings.TrimSpace(parts[0]))
+	mo, errM := strconv.Atoi(strings.TrimSpace(parts[1]))
+	y, errY := strconv.Atoi(strings.TrimSpace(parts[2]))
+	if errD != nil || errM != nil || errY != nil || d == 0 || mo == 0 || y == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%04d-%02d-%02d", y, mo, d)
+}
+
+// splitBR splits a "<br>"-joined cell into its components. Empty input
+// returns an empty slice (nil) rather than [""] so JSON omitempty drops
+// the field entirely for staff recipients with no parents listed.
+func splitBR(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "<br>")
+}
+
+// mapSlice applies fn to every element of in. Used to transform parents'
+// per-parent read indicators from Czech dates / "Ne" into ISO dates / "".
+func mapSlice[T any](in []T, fn func(T) T) []T {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]T, len(in))
+	for i, v := range in {
+		out[i] = fn(v)
 	}
 	return out
 }

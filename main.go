@@ -34,6 +34,7 @@ func main() {
 	clearCookies := flag.Bool("clear-cookies", false, "delete the cached session cookies and exit")
 	testMessages := flag.Bool("test-messages", false, "list a few inbox + sent messages and exit (smoke test for the tools)")
 	dumpMessage := flag.String("dump-message", "", "(dev) fetch the full body of the given message ID (e.g. m-290491 or 290491) and dump the raw JSON response across all plausible endpoints — used to reverse-engineer the full-message + attachments API shape")
+	getMessage := flag.String("get-message", "", "(dev) call tools.GetMessage for the given ID and print the resulting FullMessage JSON (smoke test for the parser)")
 	showVersion := flag.Bool("version", false, "print version and commit, then exit")
 	flag.Parse()
 
@@ -68,6 +69,10 @@ func main() {
 	}
 	if *testMessages {
 		runTestMessages(cli)
+		return
+	}
+	if *getMessage != "" {
+		runGetMessage(cli, *getMessage)
 		return
 	}
 	if *dumpMessage != "" {
@@ -192,18 +197,27 @@ func registerSentTool(s *server.MCPServer, cli *client.Client) {
 func registerGetMessageTool(s *server.MCPServer, cli *client.Client) {
 	s.AddTool(
 		mcp.NewTool("edookit_get_message",
-			mcp.WithDescription("Fetch the full body and attachment list of a single message "+
-				"from the **Edookit school information system** (works for both received "+
-				"and sent messages — Edookit serves them via the same endpoint). Use this "+
-				"after edookit_list_inbox or edookit_list_sent has surfaced a message ID "+
-				"the user is interested in: the list tools return only a ~200-character "+
-				"body preview, while this tool returns the full message body in both "+
-				"plain text and HTML form, plus the metadata needed to download attachments. "+
-				"Returns a JSON object with id, number, subject, status (e.g. 'Publikováno'), "+
-				"author (sender for received messages, publisher for sent), date (RFC3339), "+
-				"body_text (plain text), body_html (original HTML), and attachments — an "+
-				"array of {id, name, url, date}. To actually save attachment files to disk, "+
-				"use edookit_download_attachments instead (this tool only lists them)."),
+			mcp.WithDescription("Fetch the full body, attachment list, and read-receipt "+
+				"table of a single message from the **Edookit school information system** "+
+				"(works for both received and sent messages — Edookit serves them via the "+
+				"same endpoint). Use this after edookit_list_inbox or edookit_list_sent "+
+				"has surfaced a message ID the user is interested in: the list tools "+
+				"return only a ~200-character body preview, while this tool returns the "+
+				"full message body in both plain text and HTML form, plus the metadata "+
+				"needed to download attachments AND a delivery / read-receipt table "+
+				"(Edookit calls it 'Doručenky'). Returns a JSON object with id, number, "+
+				"subject, status (e.g. 'Publikováno'), author (sender for received, "+
+				"publisher for sent — typically the user themselves), date (RFC3339), "+
+				"body_text (plain text), body_html (original HTML), deleted (true if "+
+				"the message was deleted by its author — Edookit then strips subject "+
+				"and body, only status/author/date survive), attachments — array of "+
+				"{id, name, url, date}, and recipients — array of {name, read_at (ISO "+
+				"date or empty if not yet read), parents (list), parents_read_at "+
+				"(aligned with parents)}. For sent messages the recipients array tells "+
+				"the author who read the message and when; for received messages it "+
+				"typically lists only the current user. To actually save attachment "+
+				"files to disk, use edookit_download_attachments instead (this tool only "+
+				"lists them)."),
 			mcp.WithString("id",
 				mcp.Required(),
 				mcp.Description("Message identifier as returned by edookit_list_inbox / edookit_list_sent. "+
@@ -379,6 +393,23 @@ func runTestMessages(cli *client.Client) {
 // printing whichever ones return JSON. Output goes to stdout (the JSON
 // body) and stderr (probe progress) so the caller can redirect them
 // independently. No retention — pure investigation aid.
+// runGetMessage is a dev smoke target — calls tools.GetMessage with the
+// given ID and prints the parsed FullMessage as indented JSON on stdout.
+// Used to verify the parser end-to-end against live Edookit (the
+// edookit_get_message MCP tool exposes the same call to clients).
+func runGetMessage(cli *client.Client, id string) {
+	ctx := context.Background()
+	msg, err := tools.GetMessage(ctx, cli, id)
+	if err != nil {
+		log.Fatalf("get-message %s: %v", id, err)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(msg); err != nil {
+		log.Fatalf("encode: %v", err)
+	}
+}
+
 func runDumpMessage(cli *client.Client, idArg string) {
 	ctx := context.Background()
 	id := strings.TrimPrefix(idArg, "m-")
