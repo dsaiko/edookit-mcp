@@ -17,7 +17,16 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"golang.org/x/net/publicsuffix"
 )
+
+// jarOptions configures every cookie jar this client creates. Using the
+// public suffix list is what net/http/cookiejar docs recommend: without it
+// the jar treats any host as eligible for broad ("supercookie") domain
+// attributes, so a malicious or compromised upstream could set a cookie
+// scoped to a registry suffix (e.g. ".net") and have it replayed across
+// unrelated hosts during redirects.
+var jarOptions = &cookiejar.Options{PublicSuffixList: publicsuffix.List}
 
 const defaultUserAgent = "edookit-mcp/0.1 (+https://github.com/dsaiko/edookit-mcp)"
 
@@ -124,7 +133,7 @@ type swappableJar struct {
 }
 
 func newSwappableJar() (*swappableJar, error) {
-	j, err := cookiejar.New(nil)
+	j, err := cookiejar.New(jarOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +154,7 @@ func (s *swappableJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
 // holding a reference to the previous inner via Load() continues to work
 // against the old jar (which becomes garbage once those calls return).
 func (s *swappableJar) reset() error {
-	j, err := cookiejar.New(nil)
+	j, err := cookiejar.New(jarOptions)
 	if err != nil {
 		return err
 	}
