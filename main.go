@@ -91,6 +91,7 @@ func main() {
 	registerSentTool(s, cli)
 	registerGetMessageTool(s, cli)
 	registerDownloadAttachmentsTool(s, cli)
+	registerViewAttachmentTool(s, cli)
 
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("serve stdio: %v", err)
@@ -299,6 +300,58 @@ func registerDownloadAttachmentsTool(s *server.MCPServer, cli *client.Client) {
 				return mcp.NewToolResultError(fmt.Sprintf("marshal: %v", err)), nil
 			}
 			return mcp.NewToolResultText(string(b)), nil
+		},
+	)
+}
+
+func registerViewAttachmentTool(s *server.MCPServer, cli *client.Client) {
+	s.AddTool(
+		mcp.NewTool("edookit_view_attachment",
+			mcp.WithDescription("View a single attachment of an **Edookit** message *inline* in "+
+				"the conversation — no file is written to disk. Use this (instead of "+
+				"edookit_download_attachments) when the user wants to SEE or READ an "+
+				"attachment's content directly: a photo/scan, a PDF's text, or a text/CSV "+
+				"file. Returns MCP content blocks the client renders directly: images come "+
+				"back as image content (downscaled if very large), PDFs as their extracted "+
+				"text, and text-like files as their decoded content. Image-only/scanned PDFs, "+
+				"Office documents (doc/xls/ppt), and other binary types can't be shown inline "+
+				"— for those (or to keep a local copy) use edookit_download_attachments. Find "+
+				"attachment ids via edookit_get_message (each attachment has an `id` like "+
+				"`1@191207`)."),
+			mcp.WithString("id",
+				mcp.Required(),
+				mcp.Description("Message identifier (m-NNNNNN or NNNNNN), as returned by the list/get tools."),
+			),
+			mcp.WithString("attachment_id",
+				mcp.Required(),
+				mcp.Description("Attachment id from edookit_get_message's attachments array, e.g. \"1@191207\"."),
+			),
+			mcp.WithNumber("max_size_mb",
+				mcp.Description("Inline size cap in MB. Default 8, hard max 25. Larger attachments "+
+					"return a note pointing at edookit_download_attachments instead."),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id := req.GetString("id", "")
+			attID := req.GetString("attachment_id", "")
+			if id == "" || attID == "" {
+				return mcp.NewToolResultError("missing required parameter: both id and attachment_id are required"), nil
+			}
+			res, err := tools.ViewAttachment(ctx, cli, id, attID, tools.ViewOptions{
+				MaxSizeMB: int(req.GetFloat("max_size_mb", 0)),
+			})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			content := make([]mcp.Content, 0, len(res.Blocks))
+			for _, b := range res.Blocks {
+				if b.ImageB64 != "" {
+					content = append(content, mcp.NewImageContent(b.ImageB64, b.ImageMime))
+				} else {
+					content = append(content, mcp.NewTextContent(b.Text))
+				}
+			}
+			return &mcp.CallToolResult{Content: content}, nil
 		},
 	)
 }

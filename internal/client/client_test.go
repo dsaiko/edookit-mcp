@@ -724,6 +724,79 @@ func TestConcurrentRequests_NoRaceUnderInvalidation(t *testing.T) {
 	// Reaching here without `go test -race` complaining is the assertion.
 }
 
+// ---------- GetBytes ----------
+
+// Serial (no t.Parallel): subtests share srv, which the deferred Close would
+// shut down before parallel subtests ran.
+func TestGetBytes(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/handler/download/file", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("PNGDATA"))
+	})
+	// A real JSON attachment served as application/json — must come back, not
+	// be mistaken for a session-expiry envelope.
+	mux.HandleFunc("/handler/download/data.json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"grades":[1,2,3]}`))
+	})
+	// A real HTML attachment served as text/html — must come back after the
+	// stale-session retry, not error as a login page.
+	mux.HandleFunc("/handler/download/page.html", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte("<html><body>hi</body></html>"))
+	})
+	srv := fakeServer(t, mux)
+	defer srv.Close()
+	cli := newClientForTest(t, srv)
+
+	t.Run("returns body and content-type", func(t *testing.T) {
+		body, ct, err := cli.GetBytes(context.Background(), "/handler/download/file", 1024)
+		if err != nil {
+			t.Fatalf("GetBytes: %v", err)
+		}
+		if string(body) != "PNGDATA" {
+			t.Errorf("body = %q, want PNGDATA", body)
+		}
+		if !strings.HasPrefix(ct, "image/png") {
+			t.Errorf("content-type = %q, want image/png", ct)
+		}
+	})
+
+	t.Run("rejects body over the limit", func(t *testing.T) {
+		_, _, err := cli.GetBytes(context.Background(), "/handler/download/file", 3) // body is 7 bytes
+		if !errors.Is(err, ErrAttachmentTooLarge) {
+			t.Errorf("err = %v, want ErrAttachmentTooLarge", err)
+		}
+	})
+
+	t.Run("real JSON attachment is returned, not treated as an envelope", func(t *testing.T) {
+		body, ct, err := cli.GetBytes(context.Background(), "/handler/download/data.json", 1024)
+		if err != nil {
+			t.Fatalf("GetBytes(json): %v", err)
+		}
+		if !strings.Contains(string(body), `"grades"`) {
+			t.Errorf("body = %q, want the JSON attachment content", body)
+		}
+		if !strings.HasPrefix(ct, "application/json") {
+			t.Errorf("content-type = %q, want application/json", ct)
+		}
+	})
+
+	t.Run("real HTML attachment is returned after retry, not rejected as login page", func(t *testing.T) {
+		body, ct, err := cli.GetBytes(context.Background(), "/handler/download/page.html", 1024)
+		if err != nil {
+			t.Fatalf("GetBytes(html): %v", err)
+		}
+		if !strings.Contains(string(body), "<body>hi</body>") {
+			t.Errorf("body = %q, want the HTML attachment content", body)
+		}
+		if !strings.HasPrefix(ct, "text/html") {
+			t.Errorf("content-type = %q, want text/html", ct)
+		}
+	})
+}
+
 // ---------- off-origin preflight ----------
 
 // An absolute off-origin URL must be refused before any request leaves the
