@@ -108,19 +108,7 @@ func downloadOne(ctx context.Context, cli *client.Client, a Attachment, destDir 
 	}
 	out.Path = dst
 
-	// Skip-if-already-present: if the file already exists at dst and the
-	// caller didn't request overwrite, leave it alone. No size check —
-	// we have no Content-Length up-front; if the user wants a re-fetch
-	// they pass overwrite=true.
-	if !overwrite {
-		if info, err := os.Stat(dst); err == nil {
-			out.Bytes = info.Size()
-			out.Skipped = true
-			return out
-		}
-	}
-
-	return streamToDest(ctx, cli, a.URL, destDir, dst, out)
+	return streamToDest(ctx, cli, a.URL, destDir, dst, overwrite, out)
 }
 
 // validateAttachment performs the cheap up-front checks that don't depend
@@ -174,18 +162,39 @@ func planDestination(name, destDir string, usedNames map[string]int) (dst, errMs
 	return dst, ""
 }
 
-// streamToDest writes the body of url to a unique temp file in destDir
-// and atomically renames to dst on success. The temp-then-rename pattern
-// has two motivations:
-//   - If the download (or its close) fails partway, dst stays intact —
-//     important under overwrite=true, where directly truncating dst would
-//     lose the user's previous version on any failure.
-//   - The skip-if-exists check in the caller only ever sees finished
-//     files, never a half-written one from a previous crash.
+// streamToDest writes the body of url to a unique temp file in destDir and
+// then commits it to dst. The download always lands in a hidden .part temp
+// first, so:
+//   - a reader never sees a half-written or 0-byte file at dst, and
+//   - a failed/aborted download leaves at most an orphan temp, never a
+//     partial final file.
+//
+// The commit step differs by mode:
+//   - overwrite=true: atomicRename replaces any existing dst.
+//   - no-overwrite: os.Link the completed temp to dst. The link only appears
+//     once it points at the fully-downloaded file (no placeholder window),
+//     and it fails with fs.ErrExist if dst already exists → keep it (Skipped).
+//     This makes the "keep existing files" guarantee race-free without ever
+//     exposing dst before it holds complete content: a concurrent caller
+//     either wins the link or sees a finished file, never an empty reservation.
+//     (os.Link needs dst and temp on the same filesystem, which holds since
+//     both live in destDir; it is unsupported on a few filesystems like FAT.)
 //
 // `out` is the already-populated result entry — we layer Bytes / Error
 // onto it and return.
-func streamToDest(ctx context.Context, cli *client.Client, url, destDir, dst string, out DownloadedFile) DownloadedFile {
+func streamToDest(ctx context.Context, cli *client.Client, url, destDir, dst string, overwrite bool, out DownloadedFile) DownloadedFile {
+	// Fast path: skip an already-present file without downloading it. This is
+	// purely an optimization — correctness for the race where dst appears
+	// mid-download is still enforced by the os.Link commit below, which fails
+	// with ErrExist rather than clobbering.
+	if !overwrite {
+		if info, err := os.Stat(dst); err == nil {
+			out.Skipped = true
+			out.Bytes = info.Size()
+			return out
+		}
+	}
+
 	tmpf, err := os.CreateTemp(destDir, ".edookit-download-*.part")
 	if err != nil {
 		out.Error = fmt.Sprintf("create temp in %s: %v", destDir, err)
@@ -213,11 +222,33 @@ func streamToDest(ctx context.Context, cli *client.Client, url, destDir, dst str
 		out.Error = fmt.Sprintf("close: %v", closeErr)
 		return out
 	}
+
+	if !overwrite {
+		// Hard-link the finished temp into place. dst becomes visible only as
+		// a complete file; an existing dst makes Link fail with ErrExist so we
+		// keep it. The temp name is dropped by the deferred cleanup either way.
+		if err := os.Link(tmpPath, dst); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				out.Skipped = true
+				if info, statErr := os.Stat(dst); statErr == nil {
+					out.Bytes = info.Size()
+				}
+				return out
+			}
+			out.Error = fmt.Sprintf("link %s -> %s: %v", tmpPath, dst, err)
+			return out
+		}
+		out.Bytes = n
+		log.Printf("[tools] downloaded %d bytes -> %s", n, dst)
+		return out
+	}
+
+	// overwrite=true: replace any existing dst atomically.
 	if err := atomicRename(tmpPath, dst); err != nil {
 		out.Error = fmt.Sprintf("rename %s -> %s: %v", tmpPath, dst, err)
 		return out
 	}
-	tmpPath = "" // rename succeeded; deferred cleanup must not remove dst
+	tmpPath = "" // rename consumed the temp; deferred cleanup must not remove dst
 	out.Bytes = n
 	log.Printf("[tools] downloaded %d bytes -> %s", n, dst)
 	return out
