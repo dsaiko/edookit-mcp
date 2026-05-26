@@ -145,6 +145,35 @@ func TestParseRow_Sent(t *testing.T) {
 	}
 }
 
+func TestCzechDateTimeToRFC3339(t *testing.T) {
+	t.Parallel()
+	loc := time.UTC
+	cases := []struct {
+		d, mo, y, h, mi string
+		want            string // "" means ok=false expected
+	}{
+		{"21", "05", "2026", "12", "31", "2026-05-21T12:31:00Z"},
+		{"19", "5", "2026", "6", "24", "2026-05-19T06:24:00Z"}, // single-digit month/hour
+		{"32", "13", "2026", "25", "99", ""},                   // every field out of range
+		{"31", "02", "2026", "10", "00", ""},                   // 31 Feb — invalid day for month
+		{"0", "5", "2026", "10", "00", ""},                     // day zero
+	}
+	for _, tc := range cases {
+		got, ok := czechDateTimeToRFC3339(tc.d, tc.mo, tc.y, tc.h, tc.mi, loc)
+		if tc.want == "" {
+			if ok {
+				t.Errorf("czechDateTimeToRFC3339(%s.%s.%s %s:%s) = %q, ok=true; want ok=false",
+					tc.d, tc.mo, tc.y, tc.h, tc.mi, got)
+			}
+			continue
+		}
+		if !ok || got != tc.want {
+			t.Errorf("czechDateTimeToRFC3339(%s.%s.%s %s:%s) = %q, ok=%v; want %q",
+				tc.d, tc.mo, tc.y, tc.h, tc.mi, got, ok, tc.want)
+		}
+	}
+}
+
 func TestParseRow_RelativeDateToday(t *testing.T) {
 	t.Parallel()
 

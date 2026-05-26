@@ -224,6 +224,40 @@ var czechDateRe = regexp.MustCompile(`(\d{1,2})\.(\d{1,2})\.(\d{4}) (\d{1,2}):(\
 // `<b><span style="color:#77bb00">Dnes</span> 23:55</b>`.
 var relativeDateRe = regexp.MustCompile(`(?i)(dnes|včera)\s+(\d{1,2}):(\d{1,2})`)
 
+// czechDateTimeToRFC3339 assembles an RFC3339 timestamp from the day/month/
+// year/hour/minute substrings of a Czech "D.M.YYYY H:MM" date, anchored to
+// loc. It parses via time.ParseInLocation rather than time.Date so impossible
+// inputs ("32.13.2026 25:99", "31.02.2026 ...") are rejected (ok=false)
+// instead of being silently normalized into a confidently-wrong instant.
+func czechDateTimeToRFC3339(day, month, year, hour, minute string, loc *time.Location) (string, bool) {
+	t, err := time.ParseInLocation("2.1.2006 15:4", day+"."+month+"."+year+" "+hour+":"+minute, loc)
+	if err != nil {
+		return "", false
+	}
+	return t.Format(time.RFC3339), true
+}
+
+// parseSmallDate extracts the message date from a row's <small> text. Edookit
+// usually renders an absolute "DD.MM.YYYY HH:MM", but for messages from the
+// last day or two it uses a relative label ("Dnes HH:MM" / "Včera HH:MM")
+// which we resolve against the school's wall-clock today. Returns ok=false if
+// no parseable date is present so the caller can record it as missing.
+func parseSmallDate(smallText string, loc *time.Location) (string, bool) {
+	if m := czechDateRe.FindStringSubmatch(smallText); len(m) == 6 {
+		return czechDateTimeToRFC3339(m[1], m[2], m[3], m[4], m[5], loc)
+	}
+	if rm := relativeDateRe.FindStringSubmatch(smallText); len(rm) == 4 {
+		day := time.Now().In(loc)
+		if strings.EqualFold(rm[1], "včera") {
+			day = day.AddDate(0, 0, -1)
+		}
+		return czechDateTimeToRFC3339(
+			strconv.Itoa(day.Day()), strconv.Itoa(int(day.Month())), strconv.Itoa(day.Year()),
+			rm[2], rm[3], loc)
+	}
+	return "", false
+}
+
 // parseRow extracts structured fields from one row of the grid response. The
 // row's third cell is an HTML blob; the first cell is the UID. Required
 // fields (date, subject, and sender-or-status depending on isSent) must all
@@ -253,26 +287,8 @@ func parseRow(uid, rowHTML string, isSent bool, loc *time.Location) (Message, er
 
 	var missing []string
 
-	// Date: usually "DD.MM.YYYY HH:MM" somewhere in the <small> text, but for
-	// messages from the last day or two Edookit renders a relative label
-	// ("Dnes HH:MM" / "Včera HH:MM") instead — resolve those against the
-	// school's wall-clock today.
-	smallText := small.Text()
-	if m := czechDateRe.FindStringSubmatch(smallText); len(m) == 6 {
-		d, _ := strconv.Atoi(m[1])
-		mo, _ := strconv.Atoi(m[2])
-		y, _ := strconv.Atoi(m[3])
-		h, _ := strconv.Atoi(m[4])
-		mi, _ := strconv.Atoi(m[5])
-		msg.Date = time.Date(y, time.Month(mo), d, h, mi, 0, 0, loc).Format(time.RFC3339)
-	} else if rm := relativeDateRe.FindStringSubmatch(smallText); len(rm) == 4 {
-		h, _ := strconv.Atoi(rm[2])
-		mi, _ := strconv.Atoi(rm[3])
-		day := time.Now().In(loc)
-		if strings.EqualFold(rm[1], "včera") {
-			day = day.AddDate(0, 0, -1)
-		}
-		msg.Date = time.Date(day.Year(), day.Month(), day.Day(), h, mi, 0, 0, loc).Format(time.RFC3339)
+	if iso, ok := parseSmallDate(small.Text(), loc); ok {
+		msg.Date = iso
 	} else {
 		missing = append(missing, "date")
 	}
