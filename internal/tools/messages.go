@@ -217,6 +217,13 @@ func cloneValues(v url.Values) url.Values {
 
 var czechDateRe = regexp.MustCompile(`(\d{1,2})\.(\d{1,2})\.(\d{4}) (\d{1,2}):(\d{1,2})`)
 
+// relativeDateRe matches Edookit's relative day labels for recent rows: it
+// renders "Dnes HH:MM" (today) / "Včera HH:MM" (yesterday) instead of an
+// absolute DD.MM.YYYY date for messages from the last day or two. The day word
+// sits in its own colored <span> inside the date <b>, e.g.
+// `<b><span style="color:#77bb00">Dnes</span> 23:55</b>`.
+var relativeDateRe = regexp.MustCompile(`(?i)(dnes|včera)\s+(\d{1,2}):(\d{1,2})`)
+
 // parseRow extracts structured fields from one row of the grid response. The
 // row's third cell is an HTML blob; the first cell is the UID. Required
 // fields (date, subject, and sender-or-status depending on isSent) must all
@@ -246,20 +253,35 @@ func parseRow(uid, rowHTML string, isSent bool, loc *time.Location) (Message, er
 
 	var missing []string
 
-	// Date: DD.MM.YYYY HH:MM somewhere in the <small> text.
-	if m := czechDateRe.FindStringSubmatch(small.Text()); len(m) == 6 {
+	// Date: usually "DD.MM.YYYY HH:MM" somewhere in the <small> text, but for
+	// messages from the last day or two Edookit renders a relative label
+	// ("Dnes HH:MM" / "Včera HH:MM") instead — resolve those against the
+	// school's wall-clock today.
+	smallText := small.Text()
+	if m := czechDateRe.FindStringSubmatch(smallText); len(m) == 6 {
 		d, _ := strconv.Atoi(m[1])
 		mo, _ := strconv.Atoi(m[2])
 		y, _ := strconv.Atoi(m[3])
 		h, _ := strconv.Atoi(m[4])
 		mi, _ := strconv.Atoi(m[5])
 		msg.Date = time.Date(y, time.Month(mo), d, h, mi, 0, 0, loc).Format(time.RFC3339)
+	} else if rm := relativeDateRe.FindStringSubmatch(smallText); len(rm) == 4 {
+		h, _ := strconv.Atoi(rm[2])
+		mi, _ := strconv.Atoi(rm[3])
+		day := time.Now().In(loc)
+		if strings.EqualFold(rm[1], "včera") {
+			day = day.AddDate(0, 0, -1)
+		}
+		msg.Date = time.Date(day.Year(), day.Month(), day.Day(), h, mi, 0, 0, loc).Format(time.RFC3339)
 	} else {
 		missing = append(missing, "date")
 	}
 
-	// First span in <small> is either the sender (inbox) or the status (sent).
-	if first := strings.TrimSpace(small.Find("span").First().Text()); first != "" {
+	// First direct-child span of <small> is either the sender (inbox) or the
+	// status (sent). We use Children, not Find, because relative-date rows nest
+	// a "Dnes"/"Včera" <span> inside the date <b> — a descendant span that
+	// Find would grab first, clobbering the real sender/status.
+	if first := strings.TrimSpace(small.Children().Filter("span").First().Text()); first != "" {
 		// Sender lines have collapsed whitespace ("Eva (KAL)  (učitel 4SC)") —
 		// normalize to single spaces for nicer downstream output.
 		first = strings.Join(strings.Fields(first), " ")
