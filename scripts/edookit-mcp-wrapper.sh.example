@@ -1,0 +1,35 @@
+#!/bin/bash
+#
+# edookit-mcp wrapper (template)
+# ------------------------------
+# Fetches EDOOKIT_PASS from your OS secret store at launch, so the password
+# never appears in any MCP config JSON or in the process listing (argv).
+#
+# Setup:
+#   1. Copy this file somewhere on your PATH and make it executable:
+#        cp scripts/edookit-mcp-wrapper.sh.example ~/.local/bin/edookit-mcp-wrapper.sh
+#        chmod +x ~/.local/bin/edookit-mcp-wrapper.sh
+#   2. Edit the three values below (URL, USER, and the path to the binary).
+#   3. Store the password in your secret store (see the platform blocks below).
+#   4. Point your MCP client's "command" at this script, with NO "env" block:
+#        { "mcpServers": { "edookit": { "command": "/Users/you/.local/bin/edookit-mcp-wrapper.sh" } } }
+#
+set -e
+
+export EDOOKIT_URL=https://your-school-login.edookit.net
+export EDOOKIT_USER=your.name@example.com
+
+# --- macOS (Keychain) -------------------------------------------------------
+# Store once:   security add-generic-password -a "$USER" -s edookit-mcp -w 'YOUR_PASS'
+# Rotate later: security add-generic-password -a "$USER" -s edookit-mcp -w 'NEW_PASS' -U
+export EDOOKIT_PASS=$(security find-generic-password -a "$USER" -s edookit-mcp -w)
+
+# --- Linux (libsecret / GNOME Keyring) --------------------------------------
+# Requires `secret-tool` (package: libsecret-tools). Comment out the macOS line
+# above and use this instead:
+# Store once:   secret-tool store --label="edookit-mcp" service edookit-mcp account "$USER"
+# export EDOOKIT_PASS=$(secret-tool lookup service edookit-mcp account "$USER")
+
+# Path to the edookit-mcp binary (e.g. the one built by `make build`, or the
+# install location from `make install`).
+exec /absolute/path/to/edookit-mcp/bin/edookit-mcp "$@"
