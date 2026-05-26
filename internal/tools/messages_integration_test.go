@@ -327,6 +327,34 @@ func TestListInbox_SinceSkipsOldButKeepsLaterNewRows(t *testing.T) {
 	}
 }
 
+// A row whose date matches the digit pattern but is not a real calendar
+// instant ("32.13.2026 25:99") must be rejected end-to-end: the good row is
+// returned, the impossible one lands in ParseWarnings (not silently
+// normalized into a wrong timestamp).
+func TestListInbox_InvalidDateRowWarned(t *testing.T) {
+	t.Parallel()
+
+	srv := fakeServer(t, func(_ *testing.T, _ *http.Request) [][]string {
+		return [][]string{
+			buildRow("m-2", "20.05.2026 10:00", "Alice", "Good", "Body", 0),
+			buildRow("m-1", "32.13.2026 25:99", "Bob", "Impossible date", "Body", 0),
+		}
+	})
+	defer srv.Close()
+
+	cli := newTestClient(t, srv)
+	msgs, err := ListInbox(context.Background(), cli, InboxOptions{})
+	if err != nil {
+		t.Fatalf("ListInbox: %v", err)
+	}
+	if len(msgs.Messages) != 1 || msgs.Messages[0].Subject != "Good" {
+		t.Fatalf("got %d messages (%v), want just the good one", len(msgs.Messages), msgs.Messages)
+	}
+	if len(msgs.ParseWarnings) != 1 || !strings.Contains(msgs.ParseWarnings[0], "date") {
+		t.Fatalf("ParseWarnings = %v, want one mentioning the missing date", msgs.ParseWarnings)
+	}
+}
+
 func TestListInbox_EmptyResponse(t *testing.T) {
 	t.Parallel()
 
