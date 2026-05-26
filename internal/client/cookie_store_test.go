@@ -1,13 +1,29 @@
 package client
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
+
+// writeCookieFile marshals cf to path with 0600 perms — for tests that need a
+// file saveCookies wouldn't produce (future timestamps, custom perms).
+func writeCookieFile(t *testing.T, path string, cf cookieFile) {
+	t.Helper()
+	data, err := json.MarshalIndent(cf, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
 
 func TestSaveLoadCookies_RoundTrip(t *testing.T) {
 	t.Parallel()
@@ -82,6 +98,59 @@ func TestLoadCookies_RejectsEmptyCookieList(t *testing.T) {
 	_, _, err := loadCookies(path, "https://example.test")
 	if err == nil {
 		t.Fatal("expected error for empty cookie list, got nil")
+	}
+}
+
+func TestLoadCookies_RejectsFutureCapturedAt(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "cookies.json")
+	writeCookieFile(t, path, cookieFile{
+		CapturedAt: time.Now().Add(2 * time.Hour), // well beyond maxCookieClockSkew
+		BaseURL:    "https://example.test",
+		Cookies:    []*http.Cookie{{Name: "PHPSESSID", Value: "x", Path: "/"}},
+	})
+
+	_, _, err := loadCookies(path, "https://example.test")
+	if err == nil || !strings.Contains(err.Error(), "future") {
+		t.Fatalf("loadCookies err = %v, want a future-timestamp rejection", err)
+	}
+}
+
+func TestLoadCookies_AllowsSmallFutureSkew(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "cookies.json")
+	writeCookieFile(t, path, cookieFile{
+		CapturedAt: time.Now().Add(1 * time.Minute), // within maxCookieClockSkew
+		BaseURL:    "https://example.test",
+		Cookies:    []*http.Cookie{{Name: "PHPSESSID", Value: "x", Path: "/"}},
+	})
+
+	if _, _, err := loadCookies(path, "https://example.test"); err != nil {
+		t.Fatalf("loadCookies rejected a small clock skew: %v", err)
+	}
+}
+
+func TestLoadCookies_GroupReadableStillLoads(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX perm bits not meaningful on Windows")
+	}
+
+	path := filepath.Join(t.TempDir(), "cookies.json")
+	writeCookieFile(t, path, cookieFile{
+		CapturedAt: time.Now(),
+		BaseURL:    "https://example.test",
+		Cookies:    []*http.Cookie{{Name: "PHPSESSID", Value: "x", Path: "/"}},
+	})
+	if err := os.Chmod(path, 0o644); err != nil { // group/world-readable
+		t.Fatalf("chmod: %v", err)
+	}
+
+	// We warn (to the log) but must NOT reject — the cache stays usable.
+	if _, _, err := loadCookies(path, "https://example.test"); err != nil {
+		t.Fatalf("loadCookies should warn-not-fail on loose perms, got: %v", err)
 	}
 }
 
