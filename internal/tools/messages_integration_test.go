@@ -271,7 +271,7 @@ func TestListInbox_SinceStopsAtBoundary(t *testing.T) {
 		return [][]string{
 			buildRow("m-3", "21.05.2026 10:00", "S", "Recent", "B", 0),
 			buildRow("m-2", "15.05.2026 10:00", "S", "Recent", "B", 0),
-			// This one is older than the floor and should stop iteration.
+			// Older than the floor — must be excluded from the result.
 			buildRow("m-1", "01.01.2020 00:00", "S", "Old", "B", 0),
 			buildRow("m-0", "01.01.2019 00:00", "S", "Even older", "B", 0),
 		}
@@ -290,6 +290,40 @@ func TestListInbox_SinceStopsAtBoundary(t *testing.T) {
 		if m.Subject == "Old" || m.Subject == "Even older" {
 			t.Errorf("unexpected old message included: %q", m.Subject)
 		}
+	}
+}
+
+// since must skip rows older than the floor without stopping the scan: if the
+// server interleaves a newer row after an older one (full-text results aren't
+// guaranteed newest-first), the newer match must still be returned.
+func TestListInbox_SinceSkipsOldButKeepsLaterNewRows(t *testing.T) {
+	t.Parallel()
+
+	srv := fakeServer(t, func(_ *testing.T, _ *http.Request) [][]string {
+		return [][]string{
+			buildRow("m-3", "21.05.2026 10:00", "S", "Recent A", "B", 0),
+			// Older than the floor, positioned BEFORE a newer row.
+			buildRow("m-1", "01.01.2020 00:00", "S", "Old", "B", 0),
+			buildRow("m-2", "18.05.2026 10:00", "S", "Recent B", "B", 0),
+		}
+	})
+	defer srv.Close()
+
+	cli := newTestClient(t, srv)
+	msgs, err := ListInbox(context.Background(), cli, InboxOptions{Since: "2026-05-10"})
+	if err != nil {
+		t.Fatalf("ListInbox: %v", err)
+	}
+	if len(msgs.Messages) != 2 {
+		t.Fatalf("got %d messages, want 2 (both recent rows, old one skipped)", len(msgs.Messages))
+	}
+	for _, m := range msgs.Messages {
+		if m.Subject == "Old" {
+			t.Errorf("old row should have been skipped, but was included")
+		}
+	}
+	if msgs.Messages[1].Subject != "Recent B" {
+		t.Errorf("the newer row after the old one was dropped: got %q", msgs.Messages[1].Subject)
 	}
 }
 

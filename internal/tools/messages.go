@@ -179,7 +179,11 @@ func fetchAndParse(ctx context.Context, cli *client.Client, path string, baseQue
 			}
 			if !sinceTime.IsZero() {
 				if t, terr := time.Parse(time.RFC3339, msg.Date); terr == nil && t.Before(sinceTime) {
-					return finalizeResult(result, rowsFetched)
+					// Skip this older row but keep scanning: don't assume the
+					// server returns rows strictly newest-first (full-text and
+					// future sort changes can interleave a newer match after an
+					// older one). The limit + maxPages still bound the work.
+					continue
 				}
 			}
 			result.Messages = append(result.Messages, msg)
