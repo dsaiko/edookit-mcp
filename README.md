@@ -135,6 +135,8 @@ Společné pro většinu klientů je tahle JSON konfigurace (Anthropic / Claude 
 
 Liší se hlavně **kam ji vložit**. Po každé změně klienta restartujte.
 
+> **Tip: heslo mimo config JSON (Keychain).** Pokud nechcete mít `EDOOKIT_PASS` v plaintextu v config souboru ani v `.env`, použijte **wrapper skript**, který heslo načte z OS secret store až při spuštění — viz [Varianta: heslo v Keychainu](#varianta-heslo-v-keychainu). V `command` pak ukážete na ten skript a `env` blok úplně vynecháte.
+
 #### Claude Code
 
 Konfigurační soubor: `~/.claude.json`. Vložte výše uvedený `mcpServers` blok (pokud sekce neexistuje, vytvořte ji; pokud existuje, přidejte do ní jen klíč `"edookit"`).
@@ -316,13 +318,47 @@ Vedle `messages` může přijít i `parse_warnings` — to jsou řádky, které 
 
 ### Bezpečnost a soukromí
 
-- **Heslo** je uloženo v souboru `.env`. Na **macOS / Linuxu** doporučená oprávnění jsou `0600` — to nastaví krok `chmod 600 .env` v sekci Konfigurace výše (běžné umask `022` by jinak vyrobilo `0644`, tj. soubor čitelný pro ostatní uživatele systému). Pokud používáte FileVault (zapnutý standardně na novějších Macích), je to dostačující ochrana proti odcizenému disku. Na **Windows** POSIX bity nefungují stejně — soubor je chráněn primárně přes ACL vašeho uživatelského profilu (`%USERPROFILE%`); pro citlivý disk používejte BitLocker.
+- **Heslo** je uloženo v souboru `.env` (nebo bezpečněji v OS secret store — viz [Varianta: heslo v Keychainu](#varianta-heslo-v-keychainu)). Na **macOS / Linuxu** doporučená oprávnění jsou `0600` — to nastaví krok `chmod 600 .env` v sekci Konfigurace výše (běžné umask `022` by jinak vyrobilo `0644`, tj. soubor čitelný pro ostatní uživatele systému). Pokud používáte FileVault (zapnutý standardně na novějších Macích), je to dostačující ochrana proti odcizenému disku. Na **Windows** POSIX bity nefungují stejně — soubor je chráněn primárně přes ACL vašeho uživatelského profilu (`%USERPROFILE%`); pro citlivý disk používejte BitLocker.
 - **Cookies** jsou v uživatelské cache (cesta výše). Na **macOS / Linuxu** se ukládají s oprávněními `0600` a na macOS jsou vyloučeny ze zálohy Time Machine / iCloud (patří do systémové cache). Na **Windows** Go neumí POSIX bity vynutit (`os.Chmod` je tam v podstatě no-op kromě read-only flagu) — ochranou je standardní ACL na `%LocalAppData%\edookit-mcp\`, který je čitelný jen pro vlastníka profilu. Více v sekci [otázek o šifrování](#proč-nejsou-cookies-šifrované) níže.
 - **Žádné externí servery** ze strany konektoru — `edookit-mcp` komunikuje pouze mezi vaším počítačem, Edookitem a Plus4U. Žádný telemetrický kanál, žádné cloudové úložiště. Tělo zpráv (a vaše prompty) ovšem prochází přes poskytovatele vašeho AI asistenta — [Anthropic](https://www.anthropic.com/privacy) pro Claude, [OpenAI](https://openai.com/policies/privacy-policy/) pro ChatGPT, atd. — zpracovává je podle jejich vlastních pravidel. Pokud vám to nevyhovuje, použijte lokálně běžící model přes klienta typu Continue.dev / Goose s lokálním LLM.
 
 #### Proč nejsou cookies šifrované?
 
-XOR nebo podobné „obfuskace" by vám neposkytly žádnou skutečnou ochranu — útočník s přístupem k souborům má i přístup k binárce a tedy ke klíči. Skutečným bezpečnostním pásmem je FileVault (šifrování celého disku) a oprávnění souborů. Pokud chcete jít dál, dlouhodobé řešení je uložení hesla do macOS Keychain — to může být budoucí vylepšení.
+XOR nebo podobné „obfuskace" by vám neposkytly žádnou skutečnou ochranu — útočník s přístupem k souborům má i přístup k binárce a tedy ke klíči. Skutečným bezpečnostním pásmem je FileVault (šifrování celého disku) a oprávnění souborů. Pokud chcete jít dál, heslo lze místo `.env` načítat z OS secret store (macOS Keychain / Linux libsecret) přes wrapper skript — viz následující sekce.
+
+#### Varianta: heslo v Keychainu
+
+Pokud nechcete mít heslo v plaintextu (ani v `.env`, ani v `env` bloku config JSON), použijte **wrapper skript**, který ho načte z OS secret store až při startu serveru — heslo se tak neobjeví v žádném souboru ani v process listingu (argv). Šablona je v repu: [`scripts/edookit-mcp-wrapper.sh.example`](scripts/edookit-mcp-wrapper.sh.example).
+
+```bash
+cp scripts/edookit-mcp-wrapper.sh.example ~/.local/bin/edookit-mcp-wrapper.sh
+chmod +x ~/.local/bin/edookit-mcp-wrapper.sh
+$EDITOR ~/.local/bin/edookit-mcp-wrapper.sh   # vyplňte URL, USER a cestu k binárce
+```
+
+Heslo uložte do secret store:
+
+```bash
+# macOS (Keychain)
+security add-generic-password -a "$USER" -s edookit-mcp -w 'VAŠE_HESLO'
+
+# Linux (libsecret / GNOME Keyring — balíček libsecret-tools)
+secret-tool store --label="edookit-mcp" service edookit-mcp account "$USER"
+```
+
+Skript podporuje obě platformy — v šabloně odkomentujte příslušný řádek (`security` pro macOS, `secret-tool` pro Linux). Ve Windows tahle varianta nefunguje (skript je bash + `security`/`secret-tool`); tam zůstaňte u `.env` chráněného přes ACL profilu.
+
+V MCP klientovi pak nastavte `command` na ten skript a **`env` blok úplně vynechte** (heslo i ostatní proměnné dodá wrapper):
+
+```json
+{
+  "mcpServers": {
+    "edookit": {
+      "command": "/Users/vase-jmeno/.local/bin/edookit-mcp-wrapper.sh"
+    }
+  }
+}
+```
 
 #### Co posíláte do cloudu AI poskytovatele (a co s tím dál)
 

@@ -36,6 +36,19 @@ const sentRowDigiHTML = `<small><span style="color:#77bb00">Publikováno</span>,
 	` <span style="vertical-align:50%"><span style="color:#0c9ce1"><b>(1)</b></span></span></div>` +
 	`Dobrý den, posílám informace.<br>`
 
+// Inbox row for a message from today: Edookit renders a relative "Dnes HH:MM"
+// label (the day word in its own colored span nested inside the date <b>)
+// instead of an absolute date. Captured live from the unread view.
+const inboxRowDnesHTML = `<small style="color:#888;float:right;text-align:right">zpráva č. 291011, <b><span style="color:#77bb00">Dnes</span> 23:55</b>, <span style="color:#212121;font-weight:bold">Saiko Dušan (SAI)</span></small>` +
+	`<div><a href="https://test.example/#handler/window/message-edit?__index=291011" class="ajax"><span class="ico50 menu_icon"></span></a>` +
+	`<a href="https://test.example/#handler/window/message-edit?__index=291011" class="ajax"><span style="color:#e78e08"><b>test</b></span></a>` +
+	`<span style="font-size:12px;vertical-align:50%"></span></div>` +
+	`<div class="cleaner">&nbsp;</div>`
+
+// Same shape but with the "Včera" (yesterday) label.
+const inboxRowVceraHTML = `<small style="color:#888;float:right;text-align:right">zpráva č. 291000, <b><span style="color:#77bb00">Včera</span> 8:05</b>, <span style="color:#212121;font-weight:bold">Saiko Dušan (SAI)</span></small>` +
+	`<div><a href="https://test.example/#handler/window/message-edit?__index=291000" class="ajax"><span style="color:#e78e08"><b>test2</b></span></a></div>`
+
 // testLoc is the timezone the unit tests pass to parseRow/parseSince. Using
 // UTC keeps assertions stable regardless of where the test host happens to be.
 var testLoc = time.UTC
@@ -129,6 +142,52 @@ func TestParseRow_Sent(t *testing.T) {
 	}
 	if msg.Attachments != 1 {
 		t.Errorf("Attachments = %d, want 1", msg.Attachments)
+	}
+}
+
+func TestParseRow_RelativeDateToday(t *testing.T) {
+	t.Parallel()
+
+	msg, err := parseRow("m-291011", inboxRowDnesHTML, false, testLoc)
+	if err != nil {
+		t.Fatalf("parseRow: %v", err)
+	}
+	// Sender must be the real sender, not the "Dnes" label.
+	if msg.Sender != "Saiko Dušan (SAI)" {
+		t.Errorf("Sender = %q, want 'Saiko Dušan (SAI)'", msg.Sender)
+	}
+	if msg.Subject != "test" {
+		t.Errorf("Subject = %q, want 'test'", msg.Subject)
+	}
+	gotTime, err := time.Parse(time.RFC3339, msg.Date)
+	if err != nil {
+		t.Fatalf("parse Date %q: %v", msg.Date, err)
+	}
+	now := time.Now().In(testLoc)
+	want := time.Date(now.Year(), now.Month(), now.Day(), 23, 55, 0, 0, testLoc)
+	if !gotTime.Equal(want) {
+		t.Errorf("Date parsed to %v, want today at 23:55 (%v)", gotTime, want)
+	}
+}
+
+func TestParseRow_RelativeDateYesterday(t *testing.T) {
+	t.Parallel()
+
+	msg, err := parseRow("m-291000", inboxRowVceraHTML, false, testLoc)
+	if err != nil {
+		t.Fatalf("parseRow: %v", err)
+	}
+	if msg.Sender != "Saiko Dušan (SAI)" {
+		t.Errorf("Sender = %q, want 'Saiko Dušan (SAI)'", msg.Sender)
+	}
+	gotTime, err := time.Parse(time.RFC3339, msg.Date)
+	if err != nil {
+		t.Fatalf("parse Date %q: %v", msg.Date, err)
+	}
+	y := time.Now().In(testLoc).AddDate(0, 0, -1)
+	want := time.Date(y.Year(), y.Month(), y.Day(), 8, 5, 0, 0, testLoc)
+	if !gotTime.Equal(want) {
+		t.Errorf("Date parsed to %v, want yesterday at 8:05 (%v)", gotTime, want)
 	}
 }
 
