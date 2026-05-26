@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -46,6 +47,14 @@ type Config struct {
 	BaseURL  string // your school's Edookit URL, e.g. https://your-school-login.edookit.net
 	Username string // Plus4U identity (email or login name)
 	Password string
+
+	// AllowInsecureHTTP permits a plain http:// BaseURL pointing at a
+	// non-loopback host. Off by default: a real Edookit tenant is always
+	// https, and a misconfigured http:// URL would send the session cookie
+	// (and login traffic) in the clear. Loopback hosts (localhost / 127.0.0.1
+	// / ::1) are always allowed regardless of this flag so local test servers
+	// keep working.
+	AllowInsecureHTTP bool
 
 	// HeadlessLogin controls whether the chromium instance used during login
 	// is invisible. Default is true; set to false to watch the flow during
@@ -187,7 +196,7 @@ func New(cfg Config) (*Client, error) {
 		cfg.Timezone = defaultTimezone()
 	}
 
-	u, err := parseBaseURL(cfg.BaseURL)
+	u, err := parseBaseURL(cfg.BaseURL, cfg.AllowInsecureHTTP)
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +219,7 @@ func New(cfg Config) (*Client, error) {
 // inputs like "school.edookit.net" by stashing them in Path; the failure would
 // surface much later in an HTTP/chromedp call with a less useful message.
 // Reject those (and missing/invalid hosts) here while we still have context.
-func parseBaseURL(raw string) (*url.URL, error) {
+func parseBaseURL(raw string, allowInsecureHTTP bool) (*url.URL, error) {
 	if raw == "" {
 		return nil, errors.New("BaseURL is required")
 	}
@@ -227,14 +236,42 @@ func parseBaseURL(raw string) (*url.URL, error) {
 	if u.Hostname() == "" {
 		return nil, fmt.Errorf("BaseURL %q has no host", raw)
 	}
+	// Plain http:// to a non-loopback host would put the session cookie and
+	// login traffic on the wire in the clear. Reject unless explicitly opted
+	// in via AllowInsecureHTTP. Loopback (localhost / 127.0.0.1 / ::1) is
+	// always allowed so local test servers don't need the flag.
+	if u.Scheme == schemeHTTP && !allowInsecureHTTP && !isLoopbackHost(u.Hostname()) {
+		return nil, fmt.Errorf("BaseURL %q uses insecure http:// to a non-loopback host; use https:// or set AllowInsecureHTTP", raw)
+	}
 	// Strip the default port for the scheme so off-host comparisons
 	// downstream don't trip on a "https://school.test:443" baseURL vs a
 	// "https://school.test" redirect (both denote the same origin). Custom
 	// ports (:8443 etc.) are preserved verbatim.
 	if (u.Scheme == schemeHTTP && u.Port() == "80") || (u.Scheme == schemeHTTPS && u.Port() == "443") {
-		u.Host = u.Hostname()
+		host := u.Hostname()
+		// Hostname() strips IPv6 brackets; re-add them so the resulting Host
+		// stays a valid URL authority ("[::1]", not "::1" which stringifies to
+		// the malformed "https://::1/...").
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+		u.Host = host
 	}
 	return u, nil
+}
+
+// isLoopbackHost reports whether host (a URL hostname, no port) refers to the
+// local machine: the literal "localhost", or any loopback IP (127.0.0.0/8,
+// ::1). Used to keep plain-http local test servers working without the
+// AllowInsecureHTTP opt-in.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // defaultTimezone returns Europe/Prague (the TZ for the schools this MCP
