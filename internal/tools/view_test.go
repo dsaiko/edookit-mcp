@@ -24,6 +24,20 @@ var minimalPDF = []byte("%PDF-1.4\n" +
 	"trailer<</Root 1 0 R/Size 5>>\n" +
 	"%%EOF")
 
+// multiPagePDF is a valid 3-page PDF (all pages share one content stream).
+// Used to verify multi-page rendering and the max_pages cap.
+var multiPagePDF = []byte("%PDF-1.4\n" +
+	"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n" +
+	"2 0 obj<</Type/Pages/Count 3/Kids[3 0 R 4 0 R 5 0 R]>>endobj\n" +
+	"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 144 144]/Resources<<>>/Contents 6 0 R>>endobj\n" +
+	"4 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 144 144]/Resources<<>>/Contents 6 0 R>>endobj\n" +
+	"5 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 144 144]/Resources<<>>/Contents 6 0 R>>endobj\n" +
+	"6 0 obj<</Length 30>>stream\n" +
+	"1 0 0 RG 10 10 m 134 134 l S\n" +
+	"endstream endobj\n" +
+	"trailer<</Root 1 0 R/Size 7>>\n" +
+	"%%EOF")
+
 // ---------- pure helpers ----------
 
 func TestResolveMime(t *testing.T) {
@@ -311,6 +325,49 @@ func TestViewAttachment_PDFRendersToImages(t *testing.T) {
 	}
 	if images < 1 {
 		t.Fatalf("expected at least one rendered page image, got blocks %+v", res.Blocks)
+	}
+}
+
+func TestViewAttachment_PDFMultiPageRespectsMaxPages(t *testing.T) {
+	t.Parallel()
+
+	srv := viewAttachmentServer(t, "list.pdf", "1@pdf", "application/pdf", multiPagePDF)
+	defer srv.Close()
+
+	cli := buildClient(t, srv)
+	res, err := ViewAttachment(context.Background(), cli, "m-555", "1@pdf", ViewOptions{MaxPages: 2})
+	if err != nil {
+		t.Fatalf("ViewAttachment: %v", err)
+	}
+
+	var images int
+	var sawPage1, sawPage2, sawCapNote bool
+	for _, b := range res.Blocks {
+		if b.ImageB64 != "" {
+			images++
+			if b.ImageMime != "image/png" {
+				t.Errorf("page mime = %q, want image/png", b.ImageMime)
+			}
+			continue
+		}
+		switch {
+		case strings.Contains(b.Text, "strana 1/3"):
+			sawPage1 = true
+		case strings.Contains(b.Text, "strana 2/3"):
+			sawPage2 = true
+		case strings.Contains(b.Text, "2 z 3"):
+			sawCapNote = true
+		}
+	}
+
+	if images != 2 {
+		t.Errorf("got %d image blocks, want 2 (capped by max_pages)", images)
+	}
+	if !sawPage1 || !sawPage2 {
+		t.Errorf("expected per-page labels 'strana 1/3' and 'strana 2/3'; blocks=%+v", res.Blocks)
+	}
+	if !sawCapNote {
+		t.Errorf("expected a cap note mentioning '2 z 3' pages; blocks=%+v", res.Blocks)
 	}
 }
 
