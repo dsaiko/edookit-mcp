@@ -12,6 +12,18 @@ import (
 	"testing"
 )
 
+// minimalPDF is a tiny but valid one-page PDF (blank 144x144 page). pdfium
+// opens and rasterizes it, so it exercises the real render path.
+var minimalPDF = []byte("%PDF-1.4\n" +
+	"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n" +
+	"2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n" +
+	"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 144 144]/Resources<<>>/Contents 4 0 R>>endobj\n" +
+	"4 0 obj<</Length 44>>stream\n" +
+	"1 0 0 RG 10 10 m 134 134 l S\n" +
+	"endstream endobj\n" +
+	"trailer<</Root 1 0 R/Size 5>>\n" +
+	"%%EOF")
+
 // ---------- pure helpers ----------
 
 func TestResolveMime(t *testing.T) {
@@ -236,24 +248,21 @@ func TestViewAttachment_UnknownBinary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ViewAttachment: %v", err)
 	}
-	// header + note + raw resource blob
-	if len(res.Blocks) != 3 {
-		t.Fatalf("got %d blocks, want 3 (header + note + resource)", len(res.Blocks))
+	// header + download note (no inline content for unknown binary)
+	if len(res.Blocks) != 2 {
+		t.Fatalf("got %d blocks, want 2 (header + note)", len(res.Blocks))
 	}
 	if !strings.Contains(res.Blocks[1].Text, "edookit_download_attachments") {
 		t.Errorf("note block = %q, want a 'use download' fallback", res.Blocks[1].Text)
 	}
-	if res.Blocks[2].ResourceB64 == "" || res.Blocks[2].ResourceMime != "application/zip" || res.Blocks[2].ResourceName != "bundle.zip" {
-		t.Errorf("resource block = %+v, want the raw file blob", res.Blocks[2])
-	}
 }
 
-func TestViewAttachment_PDFAttachesRawBlob(t *testing.T) {
+func TestViewAttachment_PDFInvalidFallsBack(t *testing.T) {
 	t.Parallel()
 
-	// Not a real text-layer PDF, so extraction yields nothing → note + the raw
-	// PDF must still be attached as a resource so a capable client can show it.
-	srv := viewAttachmentServer(t, "schedule.pdf", "1@pdf", "application/pdf", []byte("%PDF-1.4 binary-ish"))
+	// Not a real PDF: no text layer and rendering fails → a download note, no
+	// image blocks.
+	srv := viewAttachmentServer(t, "schedule.pdf", "1@pdf", "application/pdf", []byte("%PDF-1.4 not really a pdf"))
 	defer srv.Close()
 
 	cli := buildClient(t, srv)
@@ -261,15 +270,47 @@ func TestViewAttachment_PDFAttachesRawBlob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ViewAttachment: %v", err)
 	}
-	if len(res.Blocks) != 3 {
-		t.Fatalf("got %d blocks, want 3 (header + no-text note + resource)", len(res.Blocks))
+	for _, b := range res.Blocks {
+		if b.ImageB64 != "" {
+			t.Fatalf("invalid PDF should not produce image blocks, got %+v", res.Blocks)
+		}
 	}
-	last := res.Blocks[2]
-	if last.ResourceB64 == "" || last.ResourceMime != "application/pdf" || last.ResourceName != "schedule.pdf" {
-		t.Errorf("resource block = %+v, want the raw PDF blob", last)
+	if !strings.Contains(res.Blocks[len(res.Blocks)-1].Text, "edookit_download_attachments") {
+		t.Errorf("last block = %q, want a download fallback note", res.Blocks[len(res.Blocks)-1].Text)
 	}
-	if dec, derr := base64.StdEncoding.DecodeString(last.ResourceB64); derr != nil || !strings.HasPrefix(string(dec), "%PDF") {
-		t.Errorf("resource blob did not round-trip to the original PDF bytes (err=%v)", derr)
+}
+
+func TestViewAttachment_PDFRendersToImages(t *testing.T) {
+	t.Parallel()
+
+	srv := viewAttachmentServer(t, "schedule.pdf", "1@pdf", "application/pdf", minimalPDF)
+	defer srv.Close()
+
+	cli := buildClient(t, srv)
+	res, err := ViewAttachment(context.Background(), cli, "m-555", "1@pdf", ViewOptions{})
+	if err != nil {
+		t.Fatalf("ViewAttachment: %v", err)
+	}
+	var images int
+	for _, b := range res.Blocks {
+		if b.ImageB64 == "" {
+			continue
+		}
+		images++
+		if b.ImageMime != "image/png" {
+			t.Errorf("rendered page mime = %q, want image/png", b.ImageMime)
+		}
+		dec, derr := base64.StdEncoding.DecodeString(b.ImageB64)
+		if derr != nil {
+			t.Errorf("page image is not valid base64: %v", derr)
+			continue
+		}
+		if _, _, ierr := image.Decode(bytes.NewReader(dec)); ierr != nil {
+			t.Errorf("page image does not decode: %v", ierr)
+		}
+	}
+	if images < 1 {
+		t.Fatalf("expected at least one rendered page image, got blocks %+v", res.Blocks)
 	}
 }
 
