@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"image"
 	"image/png"
 	"net/http"
@@ -12,31 +13,43 @@ import (
 	"testing"
 )
 
-// minimalPDF is a tiny but valid one-page PDF (blank 144x144 page). pdfium
-// opens and rasterizes it, so it exercises the real render path.
-var minimalPDF = []byte("%PDF-1.4\n" +
-	"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n" +
-	"2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n" +
-	"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 144 144]/Resources<<>>/Contents 4 0 R>>endobj\n" +
-	"4 0 obj<</Length 44>>stream\n" +
-	"1 0 0 RG 10 10 m 134 134 l S\n" +
-	"endstream endobj\n" +
-	"trailer<</Root 1 0 R/Size 5>>\n" +
-	"%%EOF")
+// buildTestPDF assembles a well-formed PDF with `pages` blank 144x144 pages
+// (all sharing one content stream), including a correct xref table and
+// startxref offset. Building it with computed offsets — rather than a
+// hand-written literal — means the render tests exercise PDFium's normal
+// parse path, not its lenient repair fallback.
+func buildTestPDF(t *testing.T, pages int) []byte {
+	t.Helper()
+	const content = "1 0 0 RG 10 10 m 134 134 l S\n"
+	contentObj := 3 + pages // catalog=1, pages=2, page objs=3..2+pages, content=last
 
-// multiPagePDF is a valid 3-page PDF (all pages share one content stream).
-// Used to verify multi-page rendering and the max_pages cap.
-var multiPagePDF = []byte("%PDF-1.4\n" +
-	"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n" +
-	"2 0 obj<</Type/Pages/Count 3/Kids[3 0 R 4 0 R 5 0 R]>>endobj\n" +
-	"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 144 144]/Resources<<>>/Contents 6 0 R>>endobj\n" +
-	"4 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 144 144]/Resources<<>>/Contents 6 0 R>>endobj\n" +
-	"5 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 144 144]/Resources<<>>/Contents 6 0 R>>endobj\n" +
-	"6 0 obj<</Length 30>>stream\n" +
-	"1 0 0 RG 10 10 m 134 134 l S\n" +
-	"endstream endobj\n" +
-	"trailer<</Root 1 0 R/Size 7>>\n" +
-	"%%EOF")
+	bodies := make([]string, 0, pages+3) // catalog + pages + N page objs + content
+	bodies = append(bodies, "<</Type/Catalog/Pages 2 0 R>>")
+	kids := ""
+	for i := range pages {
+		kids += fmt.Sprintf("%d 0 R ", 3+i)
+	}
+	bodies = append(bodies, fmt.Sprintf("<</Type/Pages/Count %d/Kids[%s]>>", pages, strings.TrimSpace(kids)))
+	for range pages {
+		bodies = append(bodies, fmt.Sprintf("<</Type/Page/Parent 2 0 R/MediaBox[0 0 144 144]/Resources<<>>/Contents %d 0 R>>", contentObj))
+	}
+	bodies = append(bodies, fmt.Sprintf("<</Length %d>>stream\n%sendstream", len(content), content))
+
+	var buf bytes.Buffer
+	buf.WriteString("%PDF-1.4\n")
+	offsets := make([]int, len(bodies)+1)
+	for i, body := range bodies {
+		offsets[i+1] = buf.Len()
+		fmt.Fprintf(&buf, "%d 0 obj%s\nendobj\n", i+1, body)
+	}
+	xrefOff := buf.Len()
+	fmt.Fprintf(&buf, "xref\n0 %d\n0000000000 65535 f \n", len(bodies)+1)
+	for i := 1; i <= len(bodies); i++ {
+		fmt.Fprintf(&buf, "%010d 00000 n \n", offsets[i])
+	}
+	fmt.Fprintf(&buf, "trailer<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF", len(bodies)+1, xrefOff)
+	return buf.Bytes()
+}
 
 // ---------- pure helpers ----------
 
@@ -297,7 +310,7 @@ func TestViewAttachment_PDFInvalidFallsBack(t *testing.T) {
 func TestViewAttachment_PDFRendersToImages(t *testing.T) {
 	t.Parallel()
 
-	srv := viewAttachmentServer(t, "schedule.pdf", "1@pdf", "application/pdf", minimalPDF)
+	srv := viewAttachmentServer(t, "schedule.pdf", "1@pdf", "application/pdf", buildTestPDF(t, 1))
 	defer srv.Close()
 
 	cli := buildClient(t, srv)
@@ -331,7 +344,7 @@ func TestViewAttachment_PDFRendersToImages(t *testing.T) {
 func TestViewAttachment_PDFMultiPageRespectsMaxPages(t *testing.T) {
 	t.Parallel()
 
-	srv := viewAttachmentServer(t, "list.pdf", "1@pdf", "application/pdf", multiPagePDF)
+	srv := viewAttachmentServer(t, "list.pdf", "1@pdf", "application/pdf", buildTestPDF(t, 3))
 	defer srv.Close()
 
 	cli := buildClient(t, srv)

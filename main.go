@@ -310,12 +310,14 @@ func registerViewAttachmentTool(s *server.MCPServer, cli *client.Client) {
 			mcp.WithDescription("View a single attachment of an **Edookit** message *inline* in "+
 				"the conversation — no file is written to disk. Use this (instead of "+
 				"edookit_download_attachments) when the user wants to SEE or READ an "+
-				"attachment's content directly: a photo/scan, a PDF's text, or a text/CSV "+
-				"file. Returns MCP content blocks the client renders directly: images come "+
-				"back as image content (downscaled if very large), PDFs as their extracted "+
-				"text, and text-like files as their decoded content. Image-only/scanned PDFs, "+
-				"Office documents (doc/xls/ppt), and other binary types can't be shown inline "+
-				"— for those (or to keep a local copy) use edookit_download_attachments. Find "+
+				"attachment's content directly: a photo/scan, a PDF (including scanned/"+
+				"image-only ones), or a text/CSV file. Returns MCP content blocks the client "+
+				"renders directly: images come back as image content (downscaled if very "+
+				"large); PDFs are rendered to PNG page images (the first `max_pages` pages) "+
+				"plus the whole document's extracted text, so even scanned/image-only PDFs "+
+				"are shown; text-like files come back as their decoded content. Office "+
+				"documents (doc/xls/ppt) and other binary types can't be shown inline — for "+
+				"those (or to keep a local copy) use edookit_download_attachments. Find "+
 				"attachment ids via edookit_get_message (each attachment has an `id` like "+
 				"`1@191207`)."),
 			mcp.WithString("id",
