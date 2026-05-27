@@ -14,10 +14,11 @@ import (
 	"github.com/klippa-app/go-pdfium/webassembly"
 )
 
-// pdfRenderDPI is the rasterization resolution. 150 DPI is enough to read a
-// scanned/printed page; oversized renders are downscaled to maxImageDim before
-// being sent, so this mainly affects sharpness, not the final pixel budget.
-const pdfRenderDPI = 150
+// Pages are rendered bounded to maxImageDim on each edge (see renderOnePage)
+// rather than at a fixed DPI. Rendering by max-pixels caps the bitmap PDFium
+// allocates regardless of the page's declared MediaBox — a tiny PDF can declare
+// an enormous box, and a fixed-DPI render would try to allocate the full thing
+// before any downscale.
 
 // PDFium is shipped as a single WebAssembly module embedded in this binary and
 // run via wazero (pure Go, no cgo, no runtime dependency). Initializing the
@@ -98,9 +99,13 @@ func rasterizePDF(ctx context.Context, body []byte, maxPages int) (pngs [][]byte
 }
 
 func renderOnePage(inst pdfium.Pdfium, doc references.FPDF_DOCUMENT, index int) ([]byte, error) {
-	rp, err := inst.RenderPageInDPI(&requests.RenderPageInDPI{
-		DPI:  pdfRenderDPI,
-		Page: requests.Page{ByIndex: &requests.PageByIndex{Document: doc, Index: index}},
+	// Width/Height are treated as the MAX dimensions: PDFium fits the page
+	// inside maxImageDim×maxImageDim (preserving aspect), so the allocated
+	// bitmap is bounded no matter how large the page's MediaBox claims to be.
+	rp, err := inst.RenderPageInPixels(&requests.RenderPageInPixels{
+		Width:  maxImageDim,
+		Height: maxImageDim,
+		Page:   requests.Page{ByIndex: &requests.PageByIndex{Document: doc, Index: index}},
 	})
 	if err != nil {
 		return nil, err
@@ -113,11 +118,5 @@ func renderOnePage(inst pdfium.Pdfium, doc references.FPDF_DOCUMENT, index int) 
 	if err := png.Encode(&buf, rp.Result.Image); err != nil {
 		return nil, fmt.Errorf("encode png: %w", err)
 	}
-	out := buf.Bytes()
-	// A 150-DPI page can exceed maxImageDim; shrink it like any other image so
-	// we don't waste tokens on pixels the model can't use.
-	if resized, _, ok := downscaleImage(out); ok {
-		out = resized
-	}
-	return out, nil
+	return buf.Bytes(), nil
 }
