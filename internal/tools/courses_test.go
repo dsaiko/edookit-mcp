@@ -130,6 +130,50 @@ func TestListCourses_DrillDownRoster(t *testing.T) {
 	}
 }
 
+func TestListCourses_IncludeStudents_PartialFailure(t *testing.T) {
+	t.Parallel()
+	const pageJSON = `{"authenticated":true,"components":{"panel":[
+		{"name":"class_course","type":"tied_selects","data":{"data":[
+			{"d":["my","-- Moje kurzy --"],"c":[
+				{"d":["myc-1-100","AUT - 4SA"]},
+				{"d":["myc-1-102","AUT 2 - 4SA"]}
+			]}
+		]}}
+	]}}`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("warmup ok")) })
+	mux.HandleFunc("/handler/page/evaluation-grid", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(pageJSON))
+	})
+	mux.HandleFunc("/handler/grid/evaluation-grid-data", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("course_id") == "myc-1-102" {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"components":{"workspace":[{"data":[["19701","19701","<b><span>Baloušek Tomáš<small> (4SA)</small></span></b>"]]}]}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	cli := buildClient(t, srv)
+
+	courses, err := ListCourses(context.Background(), cli, CoursesOptions{IncludeStudents: true})
+	if err != nil {
+		t.Fatalf("ListCourses: %v", err)
+	}
+	byID := map[string]Course{}
+	for _, c := range courses {
+		byID[c.CourseID] = c
+	}
+	if got := byID["myc-1-100"]; len(got.Students) != 1 || got.Error != "" {
+		t.Errorf("good course = %+v, want 1 student and no error", got)
+	}
+	if got := byID["myc-1-102"]; got.Error == "" || len(got.Students) != 0 {
+		t.Errorf("failed course = %+v, want Error set and no students (distinguishable from empty)", got)
+	}
+}
+
 func TestListCourses_UnknownCourseID(t *testing.T) {
 	t.Parallel()
 	srv := coursesServer(t)

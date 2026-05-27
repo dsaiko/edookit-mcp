@@ -44,6 +44,10 @@ type Course struct {
 	Name       string    `json:"name"`
 	SplitGroup bool      `json:"split_group"`
 	Students   []Student `json:"students,omitempty"`
+	// Error is set (only in include_students mode) when this course's roster
+	// fetch failed, so the caller can tell a real empty roster from a failure —
+	// the others still return their students.
+	Error string `json:"error,omitempty"`
 }
 
 // CoursesOptions controls ListCourses.
@@ -59,7 +63,7 @@ type CoursesOptions struct {
 // course list only (one request); with CourseID it returns that course plus its
 // roster; with IncludeStudents it populates every course's roster.
 func ListCourses(ctx context.Context, cli *client.Client, opts CoursesOptions) ([]Course, error) {
-	courses, err := fetchCourseList(ctx, cli)
+	courses, pgroup, err := fetchCourseList(ctx, cli)
 	if err != nil {
 		return nil, err
 	}
@@ -67,7 +71,7 @@ func ListCourses(ctx context.Context, cli *client.Client, opts CoursesOptions) (
 	if opts.CourseID != "" {
 		for i := range courses {
 			if courses[i].CourseID == opts.CourseID {
-				students, serr := courseStudents(ctx, cli, opts.CourseID)
+				students, serr := courseStudents(ctx, cli, pgroup, opts.CourseID)
 				if serr != nil {
 					return nil, serr
 				}
@@ -79,15 +83,21 @@ func ListCourses(ctx context.Context, cli *client.Client, opts CoursesOptions) (
 	}
 
 	if opts.IncludeStudents {
-		fillAllRosters(ctx, cli, courses)
+		fillAllRosters(ctx, cli, pgroup, courses)
+		// A canceled/expired context makes every roster fetch fail; that's a
+		// hard failure, not a silently-partial result.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 	}
 	return courses, nil
 }
 
 // fillAllRosters populates every course's roster with bounded concurrency. A
-// course whose fetch fails is left without students (logged) rather than
-// failing the whole listing.
-func fillAllRosters(ctx context.Context, cli *client.Client, courses []Course) {
+// course whose fetch fails gets its Error set (and is logged) rather than
+// failing the whole listing, so a real empty roster stays distinguishable from
+// a failure.
+func fillAllRosters(ctx context.Context, cli *client.Client, pgroup string, courses []Course) {
 	sem := make(chan struct{}, maxCourseStudentFetch)
 	var wg sync.WaitGroup
 	for i := range courses {
@@ -96,9 +106,10 @@ func fillAllRosters(ctx context.Context, cli *client.Client, courses []Course) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			students, err := courseStudents(ctx, cli, courses[i].CourseID)
+			students, err := courseStudents(ctx, cli, pgroup, courses[i].CourseID)
 			if err != nil {
 				log.Printf("[tools] roster for course %s (%s) failed: %v", courses[i].CourseID, courses[i].Name, err)
+				courses[i].Error = err.Error()
 				return
 			}
 			courses[i].Students = students
@@ -107,16 +118,18 @@ func fillAllRosters(ctx context.Context, cli *client.Client, courses []Course) {
 	wg.Wait()
 }
 
-// fetchCourseList loads the evaluation-grid page and parses the course dropdown
-// (the `class_course` tied-select) into the teacher's courses.
-func fetchCourseList(ctx context.Context, cli *client.Client) ([]Course, error) {
+// fetchCourseList loads the evaluation-grid page, parses the course dropdown
+// (the `class_course` tied-select), and returns the courses plus the pgroup
+// ("Pohled") id they came from — so roster fetches address the same view the
+// list was read from.
+func fetchCourseList(ctx context.Context, cli *client.Client) ([]Course, string, error) {
 	var page map[string]any
 	if err := cli.GetJSON(ctx, evaluationGridPath, &page); err != nil {
-		return nil, fmt.Errorf("load evaluation-grid: %w", err)
+		return nil, "", fmt.Errorf("load evaluation-grid: %w", err)
 	}
 	node := findNamedNode(page, "class_course")
 	if node == nil {
-		return nil, fmt.Errorf("course selector not found on evaluation-grid (Edookit page shape may have changed)")
+		return nil, "", fmt.Errorf("course selector not found on evaluation-grid (Edookit page shape may have changed)")
 	}
 	return parseCourseOptions(node)
 }
@@ -130,12 +143,12 @@ func fetchCourseList(ctx context.Context, cli *client.Client) ([]Course, error) 
 //	    {"d": ["myc-…-20037", "AUT - 4SA"]},
 //	    {"d": ["myc-…-20102", "  AUT 1 - 4SA"]},   // indent = split half-group
 //	    …]}]}}
-func parseCourseOptions(node map[string]any) ([]Course, error) {
+func parseCourseOptions(node map[string]any) ([]Course, string, error) {
 	views, _ := asSlice(dig(node, "data", "data"))
 	if len(views) == 0 {
-		return nil, fmt.Errorf("course selector has no views")
+		return nil, "", fmt.Errorf("course selector has no views")
 	}
-	opts := courseOptionsForView(views, myCoursesPGroup)
+	opts, pgroup := courseOptionsForView(views, myCoursesPGroup)
 
 	courses := make([]Course, 0, len(opts))
 	for _, o := range opts {
@@ -158,36 +171,42 @@ func parseCourseOptions(node map[string]any) ([]Course, error) {
 			SplitGroup: name != strings.TrimLeft(name, "  "), // leading indent marks a half-group
 		})
 	}
-	return courses, nil
+	return courses, pgroup, nil
 }
 
-// courseOptionsForView returns the option list ("c") of the named pgroup view
-// (default "my"), falling back to the first view's options.
-func courseOptionsForView(views []any, pgroup string) []any {
-	first := []any(nil)
+// courseOptionsForView returns the option list ("c") of the preferred pgroup
+// view (default "my") and the id of the view actually used. If the preferred
+// view is absent it falls back to the first view and returns that view's id
+// too, so roster fetches stay consistent with where the list came from.
+func courseOptionsForView(views []any, preferred string) (opts []any, pgroup string) {
+	var firstOpts []any
+	var firstPgroup string
+	haveFirst := false
 	for _, v := range views {
 		vm, ok := asMap(v)
 		if !ok {
 			continue
 		}
 		c, _ := asSlice(vm["c"])
-		if first == nil {
-			first = c
+		id := ""
+		if d, _ := asSlice(vm["d"]); len(d) > 0 {
+			id, _ = asStr(d[0])
 		}
-		d, _ := asSlice(vm["d"])
-		if len(d) > 0 {
-			if id, _ := asStr(d[0]); id == pgroup {
-				return c
-			}
+		if !haveFirst {
+			firstOpts, firstPgroup, haveFirst = c, id, true
+		}
+		if id == preferred {
+			return c, id
 		}
 	}
-	return first
+	return firstOpts, firstPgroup
 }
 
-// courseStudents loads one course's roster from the evaluation grid data.
-func courseStudents(ctx context.Context, cli *client.Client, courseID string) ([]Student, error) {
+// courseStudents loads one course's roster from the evaluation grid data, in
+// the given pgroup ("Pohled") view.
+func courseStudents(ctx context.Context, cli *client.Client, pgroup, courseID string) ([]Student, error) {
 	q := url.Values{}
-	q.Set("pgroup_id", myCoursesPGroup)
+	q.Set("pgroup_id", pgroup)
 	q.Set("course_id", courseID)
 
 	var resp evalGridResponse
