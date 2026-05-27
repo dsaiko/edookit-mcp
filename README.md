@@ -195,7 +195,7 @@ K dispozici je pět nástrojů:
 | `edookit_list_sent` | Vypíše zprávy z **Vytvořené** (odeslané). Stejné filtry kromě "view". |
 | `edookit_get_message` | Stáhne **plný text** jedné konkrétní zprávy podle ID — to, co `list_*` vrací jen jako ~200znakový preview. Funguje pro přijaté i odeslané. Vrací subject, status, autora, datum, body_text (plain text), body_html (originál) a metadata všech příloh. |
 | `edookit_download_attachments` | **Stáhne všechny přílohy** jedné zprávy do lokálního adresáře. Funguje pro přijaté i odeslané. Defaultně ukládá do `<os-temp>/edookit-mcp/<id>/` (přenositelné napříč OS); explicitní cestu lze předat parametrem. |
-| `edookit_view_attachment` | **Zobrazí jednu přílohu inline** přímo v konverzaci (bez ukládání na disk). Obrázky vrací jako obrázkový blok (velké zmenší na 1568 px), PDF jako extrahovaný text, textové/CSV soubory jako jejich obsah. U PDF a ostatních binárních typů (Office apod.) navíc přiloží **surový soubor jako MCP resource** — capable klient ho může zobrazit/nabídnout, ale podpora se liší podle klienta; pro spolehlivou lokální kopii použijte `edookit_download_attachments`. ID přílohy zjistíte přes `edookit_get_message`. |
+| `edookit_view_attachment` | **Zobrazí jednu přílohu inline** přímo v konverzaci (bez ukládání na disk). Obrázky vrací jako obrázkový blok (velké zmenší na 1568 px); **PDF vyrenderuje na obrázky stránek** (PNG, defaultně prvních 5, viz `max_pages`) plus k tomu extrahovaný text celého dokumentu; textové/CSV soubory jako jejich obsah. Office dokumenty a jiné binární typy inline nejdou — pro ně (nebo pro lokální kopii) použijte `edookit_download_attachments`. ID přílohy zjistíte přes `edookit_get_message`. |
 
 Nástroje **nevoláte přímo** — píšete Claudovi normálním jazykem a on sám rozhodne, kdy a s jakými parametry je použít. Níže jsou příklady promptů a co se pod nimi typicky děje.
 
@@ -241,7 +241,7 @@ Nástroje **nevoláte přímo** — píšete Claudovi normálním jazykem a on s
 > *"Co je v tom PDF od třídní?"*
 > *"Přečti mi obsah té přílohy."*
 
-→ Claude zavolá `edookit_view_attachment` a přílohu vrátí **inline** (bez ukládání na disk): obrázek se zobrazí přímo, z PDF přečte text, textový/CSV soubor vypíše. U naskenovaných/obrázkových PDF, Office dokumentů a jiných binárních typů Claude doporučí `edookit_download_attachments`.
+→ Claude zavolá `edookit_view_attachment` a přílohu vrátí **inline** (bez ukládání na disk): obrázek se zobrazí přímo, PDF vyrenderuje na obrázky stránek (+ přečte text), textový/CSV soubor vypíše. U Office dokumentů a jiných binárních typů Claude doporučí `edookit_download_attachments`.
 
 **Zprávy s přílohou (jen seznam, bez stahování):**
 > *"Která nepřečtená zpráva ze školy má přílohu?"*
@@ -531,6 +531,9 @@ The fileviewer panel exposes:
 - [`github.com/mark3labs/mcp-go`](https://github.com/mark3labs/mcp-go) — MCP server runtime
 - [`github.com/chromedp/chromedp`](https://github.com/chromedp/chromedp) — Chrome DevTools Protocol driver for the OIDC login
 - [`github.com/PuerkitoBio/goquery`](https://github.com/PuerkitoBio/goquery) — HTML parsing for row data extraction
+- [`github.com/ledongthuc/pdf`](https://github.com/ledongthuc/pdf) — PDF text extraction (pure Go) for `edookit_view_attachment`
+- [`github.com/klippa-app/go-pdfium`](https://github.com/klippa-app/go-pdfium) — PDF page rasterization via the WebAssembly/wazero backend (no cgo; PDFium is embedded as WASM, so the binary stays a single static cross-platform artifact at the cost of ~10 MB extra size)
+- [`golang.org/x/image`](https://pkg.go.dev/golang.org/x/image) — image downscaling for inline attachment viewing
 
 ### Development
 

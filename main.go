@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -311,12 +310,14 @@ func registerViewAttachmentTool(s *server.MCPServer, cli *client.Client) {
 			mcp.WithDescription("View a single attachment of an **Edookit** message *inline* in "+
 				"the conversation — no file is written to disk. Use this (instead of "+
 				"edookit_download_attachments) when the user wants to SEE or READ an "+
-				"attachment's content directly: a photo/scan, a PDF's text, or a text/CSV "+
-				"file. Returns MCP content blocks the client renders directly: images come "+
-				"back as image content (downscaled if very large), PDFs as their extracted "+
-				"text, and text-like files as their decoded content. Image-only/scanned PDFs, "+
-				"Office documents (doc/xls/ppt), and other binary types can't be shown inline "+
-				"— for those (or to keep a local copy) use edookit_download_attachments. Find "+
+				"attachment's content directly: a photo/scan, a PDF (including scanned/"+
+				"image-only ones), or a text/CSV file. Returns MCP content blocks the client "+
+				"renders directly: images come back as image content (downscaled if very "+
+				"large); PDFs are rendered to PNG page images (the first `max_pages` pages) "+
+				"plus the whole document's extracted text, so even scanned/image-only PDFs "+
+				"are shown; text-like files come back as their decoded content. Office "+
+				"documents (doc/xls/ppt) and other binary types can't be shown inline — for "+
+				"those (or to keep a local copy) use edookit_download_attachments. Find "+
 				"attachment ids via edookit_get_message (each attachment has an `id` like "+
 				"`1@191207`)."),
 			mcp.WithString("id",
@@ -331,6 +332,10 @@ func registerViewAttachmentTool(s *server.MCPServer, cli *client.Client) {
 				mcp.Description("Inline size cap in MB. Default 8, hard max 25. Larger attachments "+
 					"return a note pointing at edookit_download_attachments instead."),
 			),
+			mcp.WithNumber("max_pages",
+				mcp.Description("For PDFs: how many pages to render to images. Default 5, hard max 20. "+
+					"Extracted text always covers the whole document regardless."),
+			),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			id := req.GetString("id", "")
@@ -340,25 +345,16 @@ func registerViewAttachmentTool(s *server.MCPServer, cli *client.Client) {
 			}
 			res, err := tools.ViewAttachment(ctx, cli, id, attID, tools.ViewOptions{
 				MaxSizeMB: int(req.GetFloat("max_size_mb", 0)),
+				MaxPages:  int(req.GetFloat("max_pages", 0)),
 			})
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 			content := make([]mcp.Content, 0, len(res.Blocks))
 			for _, b := range res.Blocks {
-				switch {
-				case b.ResourceB64 != "":
-					content = append(content, mcp.EmbeddedResource{
-						Type: "resource",
-						Resource: mcp.BlobResourceContents{
-							URI:      "edookit://attachment/" + url.PathEscape(b.ResourceName),
-							MIMEType: b.ResourceMime,
-							Blob:     b.ResourceB64,
-						},
-					})
-				case b.ImageB64 != "":
+				if b.ImageB64 != "" {
 					content = append(content, mcp.NewImageContent(b.ImageB64, b.ImageMime))
-				default:
+				} else {
 					content = append(content, mcp.NewTextContent(b.Text))
 				}
 			}

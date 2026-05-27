@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"image"
 	"image/png"
 	"net/http"
@@ -11,6 +12,44 @@ import (
 	"strings"
 	"testing"
 )
+
+// buildTestPDF assembles a well-formed PDF with `pages` blank 144x144 pages
+// (all sharing one content stream), including a correct xref table and
+// startxref offset. Building it with computed offsets — rather than a
+// hand-written literal — means the render tests exercise PDFium's normal
+// parse path, not its lenient repair fallback.
+func buildTestPDF(t *testing.T, pages int) []byte {
+	t.Helper()
+	const content = "1 0 0 RG 10 10 m 134 134 l S\n"
+	contentObj := 3 + pages // catalog=1, pages=2, page objs=3..2+pages, content=last
+
+	bodies := make([]string, 0, pages+3) // catalog + pages + N page objs + content
+	bodies = append(bodies, "<</Type/Catalog/Pages 2 0 R>>")
+	kids := ""
+	for i := range pages {
+		kids += fmt.Sprintf("%d 0 R ", 3+i)
+	}
+	bodies = append(bodies, fmt.Sprintf("<</Type/Pages/Count %d/Kids[%s]>>", pages, strings.TrimSpace(kids)))
+	for range pages {
+		bodies = append(bodies, fmt.Sprintf("<</Type/Page/Parent 2 0 R/MediaBox[0 0 144 144]/Resources<<>>/Contents %d 0 R>>", contentObj))
+	}
+	bodies = append(bodies, fmt.Sprintf("<</Length %d>>stream\n%sendstream", len(content), content))
+
+	var buf bytes.Buffer
+	buf.WriteString("%PDF-1.4\n")
+	offsets := make([]int, len(bodies)+1)
+	for i, body := range bodies {
+		offsets[i+1] = buf.Len()
+		fmt.Fprintf(&buf, "%d 0 obj%s\nendobj\n", i+1, body)
+	}
+	xrefOff := buf.Len()
+	fmt.Fprintf(&buf, "xref\n0 %d\n0000000000 65535 f \n", len(bodies)+1)
+	for i := 1; i <= len(bodies); i++ {
+		fmt.Fprintf(&buf, "%010d 00000 n \n", offsets[i])
+	}
+	fmt.Fprintf(&buf, "trailer<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF", len(bodies)+1, xrefOff)
+	return buf.Bytes()
+}
 
 // ---------- pure helpers ----------
 
@@ -236,24 +275,21 @@ func TestViewAttachment_UnknownBinary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ViewAttachment: %v", err)
 	}
-	// header + note + raw resource blob
-	if len(res.Blocks) != 3 {
-		t.Fatalf("got %d blocks, want 3 (header + note + resource)", len(res.Blocks))
+	// header + download note (no inline content for unknown binary)
+	if len(res.Blocks) != 2 {
+		t.Fatalf("got %d blocks, want 2 (header + note)", len(res.Blocks))
 	}
 	if !strings.Contains(res.Blocks[1].Text, "edookit_download_attachments") {
 		t.Errorf("note block = %q, want a 'use download' fallback", res.Blocks[1].Text)
 	}
-	if res.Blocks[2].ResourceB64 == "" || res.Blocks[2].ResourceMime != "application/zip" || res.Blocks[2].ResourceName != "bundle.zip" {
-		t.Errorf("resource block = %+v, want the raw file blob", res.Blocks[2])
-	}
 }
 
-func TestViewAttachment_PDFAttachesRawBlob(t *testing.T) {
+func TestViewAttachment_PDFInvalidFallsBack(t *testing.T) {
 	t.Parallel()
 
-	// Not a real text-layer PDF, so extraction yields nothing → note + the raw
-	// PDF must still be attached as a resource so a capable client can show it.
-	srv := viewAttachmentServer(t, "schedule.pdf", "1@pdf", "application/pdf", []byte("%PDF-1.4 binary-ish"))
+	// Not a real PDF: no text layer and rendering fails → a download note, no
+	// image blocks.
+	srv := viewAttachmentServer(t, "schedule.pdf", "1@pdf", "application/pdf", []byte("%PDF-1.4 not really a pdf"))
 	defer srv.Close()
 
 	cli := buildClient(t, srv)
@@ -261,15 +297,99 @@ func TestViewAttachment_PDFAttachesRawBlob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ViewAttachment: %v", err)
 	}
-	if len(res.Blocks) != 3 {
-		t.Fatalf("got %d blocks, want 3 (header + no-text note + resource)", len(res.Blocks))
+	for _, b := range res.Blocks {
+		if b.ImageB64 != "" {
+			t.Fatalf("invalid PDF should not produce image blocks, got %+v", res.Blocks)
+		}
 	}
-	last := res.Blocks[2]
-	if last.ResourceB64 == "" || last.ResourceMime != "application/pdf" || last.ResourceName != "schedule.pdf" {
-		t.Errorf("resource block = %+v, want the raw PDF blob", last)
+	if !strings.Contains(res.Blocks[len(res.Blocks)-1].Text, "edookit_download_attachments") {
+		t.Errorf("last block = %q, want a download fallback note", res.Blocks[len(res.Blocks)-1].Text)
 	}
-	if dec, derr := base64.StdEncoding.DecodeString(last.ResourceB64); derr != nil || !strings.HasPrefix(string(dec), "%PDF") {
-		t.Errorf("resource blob did not round-trip to the original PDF bytes (err=%v)", derr)
+}
+
+func TestViewAttachment_PDFRendersToImages(t *testing.T) {
+	t.Parallel()
+
+	srv := viewAttachmentServer(t, "schedule.pdf", "1@pdf", "application/pdf", buildTestPDF(t, 1))
+	defer srv.Close()
+
+	cli := buildClient(t, srv)
+	res, err := ViewAttachment(context.Background(), cli, "m-555", "1@pdf", ViewOptions{})
+	if err != nil {
+		t.Fatalf("ViewAttachment: %v", err)
+	}
+	var images int
+	for _, b := range res.Blocks {
+		if b.ImageB64 == "" {
+			continue
+		}
+		images++
+		if b.ImageMime != "image/png" {
+			t.Errorf("rendered page mime = %q, want image/png", b.ImageMime)
+		}
+		dec, derr := base64.StdEncoding.DecodeString(b.ImageB64)
+		if derr != nil {
+			t.Errorf("page image is not valid base64: %v", derr)
+			continue
+		}
+		if _, _, ierr := image.Decode(bytes.NewReader(dec)); ierr != nil {
+			t.Errorf("page image does not decode: %v", ierr)
+		}
+	}
+	if images < 1 {
+		t.Fatalf("expected at least one rendered page image, got blocks %+v", res.Blocks)
+	}
+}
+
+func TestViewAttachment_PDFMultiPageRespectsMaxPages(t *testing.T) {
+	t.Parallel()
+
+	srv := viewAttachmentServer(t, "list.pdf", "1@pdf", "application/pdf", buildTestPDF(t, 3))
+	defer srv.Close()
+
+	cli := buildClient(t, srv)
+	res, err := ViewAttachment(context.Background(), cli, "m-555", "1@pdf", ViewOptions{MaxPages: 2})
+	if err != nil {
+		t.Fatalf("ViewAttachment: %v", err)
+	}
+
+	var images int
+	var sawPage1, sawPage2, sawCapNote bool
+	for _, b := range res.Blocks {
+		if b.ImageB64 != "" {
+			images++
+			if b.ImageMime != "image/png" {
+				t.Errorf("page mime = %q, want image/png", b.ImageMime)
+			}
+			continue
+		}
+		switch {
+		case strings.Contains(b.Text, "strana 1/3"):
+			sawPage1 = true
+		case strings.Contains(b.Text, "strana 2/3"):
+			sawPage2 = true
+		case strings.Contains(b.Text, "2 z 3"):
+			sawCapNote = true
+		}
+	}
+
+	if images != 2 {
+		t.Errorf("got %d image blocks, want 2 (capped by max_pages)", images)
+	}
+	if !sawPage1 || !sawPage2 {
+		t.Errorf("expected per-page labels 'strana 1/3' and 'strana 2/3'; blocks=%+v", res.Blocks)
+	}
+	if !sawCapNote {
+		t.Errorf("expected a cap note mentioning '2 z 3' pages; blocks=%+v", res.Blocks)
+	}
+}
+
+func TestRasterizePDF_ContextCancelled(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := rasterizePDF(ctx, buildTestPDF(t, 2), 2); err == nil {
+		t.Fatal("expected an error when the context is already canceled")
 	}
 }
 
