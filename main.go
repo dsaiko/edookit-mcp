@@ -388,12 +388,15 @@ func registerListCoursesTool(s *server.MCPServer, cli *client.Client) {
 				"\"AUT 1 - 4SA\" / \"AUT 2 - 4SA\" (split_group=true). Use this for questions "+
 				"like \"which classes/courses do I teach\", \"list my groups\", or as the way "+
 				"to find a course_id before listing its pupils. Returns a JSON array of "+
-				"{course_id, name, split_group, students?}. By default (no arguments) it "+
-				"returns just the course list — one cheap request. Pass `course_id` to get "+
+				"{course_id, name, split_group, students?, error?}. By default (no arguments) "+
+				"it returns just the course list — one cheap request. Pass `course_id` to get "+
 				"one course **with its student roster** (žáci: {study_id, name, class}); a "+
 				"half-group's roster is the subset of the class in that half. Pass "+
 				"`include_students=true` to populate every course's roster at once (heavier — "+
-				"one request per course; pupils of a class repeat under its half-groups)."),
+				"one request per course; pupils of a class repeat under its half-groups). In "+
+				"that mode a course whose roster failed to load carries a non-empty `error` "+
+				"field (and no `students`), so an empty class is distinguishable from a "+
+				"failed fetch — don't treat a missing roster as 'no pupils' when `error` is set."),
 			mcp.WithString("course_id",
 				mcp.Description("Return just this course with its student roster. Value is a "+
 					"course_id from a prior no-argument call, e.g. \"myc-22909-20102\"."),
