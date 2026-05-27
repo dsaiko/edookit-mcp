@@ -103,4 +103,16 @@ func TestRegisterTools_NoPanic(t *testing.T) {
 	registerSentTool(s, cli)
 	registerGetMessageTool(s, cli)
 	registerDownloadAttachmentsTool(s, cli)
+	registerViewAttachmentTool(s, cli)
+	registerServerInfoTool(s)
+}
+
+func TestBuildServerInfo(t *testing.T) {
+	info := buildServerInfo()
+	// In tests the ldflags aren't set, so these hold the dev placeholders —
+	// the point is that the fields are wired to the build vars.
+	if info.Version != version || info.Commit != commit || info.BuildTime != date {
+		t.Errorf("buildServerInfo() = %+v, want it to mirror version/commit/date (%q/%q/%q)",
+			info, version, commit, date)
+	}
 }
