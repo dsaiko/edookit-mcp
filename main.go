@@ -22,11 +22,24 @@ import (
 	"github.com/dsaiko/edookit-mcp/internal/tools"
 )
 
-// Build-time metadata, populated by GoReleaser via -ldflags. Empty in dev builds.
+// Build-time metadata, populated by GoReleaser via -ldflags. Placeholder
+// values in dev builds.
 var (
 	version = "dev"
 	commit  = "none"
+	date    = "unknown"
 )
+
+// serverInfo is the build metadata returned by edookit_server_info.
+type serverInfo struct {
+	Version   string `json:"version"`
+	Commit    string `json:"commit"`
+	BuildTime string `json:"build_time"`
+}
+
+func buildServerInfo() serverInfo {
+	return serverInfo{Version: version, Commit: commit, BuildTime: date}
+}
 
 func main() {
 	loginTest := flag.Bool("login-test", false, "perform OIDC login once and exit (smoke test)")
@@ -39,7 +52,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("edookit-mcp %s (commit %s)\n", version, commit)
+		fmt.Printf("edookit-mcp %s (commit %s, built %s)\n", version, commit, date)
 		return
 	}
 	if *clearCookies {
@@ -92,6 +105,7 @@ func main() {
 	registerGetMessageTool(s, cli)
 	registerDownloadAttachmentsTool(s, cli)
 	registerViewAttachmentTool(s, cli)
+	registerServerInfoTool(s)
 
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("serve stdio: %v", err)
@@ -359,6 +373,26 @@ func registerViewAttachmentTool(s *server.MCPServer, cli *client.Client) {
 				}
 			}
 			return &mcp.CallToolResult{Content: content}, nil
+		},
+	)
+}
+
+func registerServerInfoTool(s *server.MCPServer) {
+	s.AddTool(
+		mcp.NewTool("edookit_server_info",
+			mcp.WithDescription("Return this edookit-mcp server's build metadata as JSON: "+
+				"{version, commit, build_time}. Use ONLY when the user explicitly asks which "+
+				"version is running or whether the server/connector is up to date — it is not "+
+				"part of any normal message or attachment workflow. Takes no arguments. "+
+				"Placeholder values (\"dev\"/\"none\"/\"unknown\") mean a local dev build, not a "+
+				"released binary."),
+		),
+		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			b, err := json.Marshal(buildServerInfo())
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("marshal: %v", err)), nil
+			}
+			return mcp.NewToolResultText(string(b)), nil
 		},
 	)
 }
