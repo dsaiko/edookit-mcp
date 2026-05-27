@@ -236,8 +236,40 @@ func TestViewAttachment_UnknownBinary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ViewAttachment: %v", err)
 	}
-	if len(res.Blocks) != 2 || !strings.Contains(res.Blocks[1].Text, "edookit_download_attachments") {
-		t.Errorf("blocks = %+v, want a 'use download' note for binary type", res.Blocks)
+	// header + note + raw resource blob
+	if len(res.Blocks) != 3 {
+		t.Fatalf("got %d blocks, want 3 (header + note + resource)", len(res.Blocks))
+	}
+	if !strings.Contains(res.Blocks[1].Text, "edookit_download_attachments") {
+		t.Errorf("note block = %q, want a 'use download' fallback", res.Blocks[1].Text)
+	}
+	if res.Blocks[2].ResourceB64 == "" || res.Blocks[2].ResourceMime != "application/zip" || res.Blocks[2].ResourceName != "bundle.zip" {
+		t.Errorf("resource block = %+v, want the raw file blob", res.Blocks[2])
+	}
+}
+
+func TestViewAttachment_PDFAttachesRawBlob(t *testing.T) {
+	t.Parallel()
+
+	// Not a real text-layer PDF, so extraction yields nothing → note + the raw
+	// PDF must still be attached as a resource so a capable client can show it.
+	srv := viewAttachmentServer(t, "schedule.pdf", "1@pdf", "application/pdf", []byte("%PDF-1.4 binary-ish"))
+	defer srv.Close()
+
+	cli := buildClient(t, srv)
+	res, err := ViewAttachment(context.Background(), cli, "m-555", "1@pdf", ViewOptions{})
+	if err != nil {
+		t.Fatalf("ViewAttachment: %v", err)
+	}
+	if len(res.Blocks) != 3 {
+		t.Fatalf("got %d blocks, want 3 (header + no-text note + resource)", len(res.Blocks))
+	}
+	last := res.Blocks[2]
+	if last.ResourceB64 == "" || last.ResourceMime != "application/pdf" || last.ResourceName != "schedule.pdf" {
+		t.Errorf("resource block = %+v, want the raw PDF blob", last)
+	}
+	if dec, derr := base64.StdEncoding.DecodeString(last.ResourceB64); derr != nil || !strings.HasPrefix(string(dec), "%PDF") {
+		t.Errorf("resource blob did not round-trip to the original PDF bytes (err=%v)", derr)
 	}
 }
 

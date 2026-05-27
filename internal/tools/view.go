@@ -44,13 +44,16 @@ const (
 )
 
 // ViewBlock is one transport-neutral content block. The MCP layer (main.go)
-// maps a block with ImageB64 set to image content and otherwise to text
-// content — keeping mcp-go types out of this package preserves the existing
-// transport-agnostic boundary.
+// maps it by precedence: a ResourceB64 block → an embedded resource (raw file
+// blob), an ImageB64 block → image content, otherwise text content. Keeping
+// mcp-go types out of this package preserves the transport-agnostic boundary.
 type ViewBlock struct {
-	Text      string
-	ImageB64  string
-	ImageMime string
+	Text         string
+	ImageB64     string
+	ImageMime    string
+	ResourceB64  string // base64 of the raw file, surfaced as an embedded resource
+	ResourceMime string
+	ResourceName string // original filename, used to build the resource URI
 }
 
 // ViewResult is the ordered list of content blocks for one viewed attachment.
@@ -65,6 +68,18 @@ type ViewOptions struct {
 
 func textBlock(s string) ViewBlock              { return ViewBlock{Text: s} }
 func imageBlock(b64, mimeType string) ViewBlock { return ViewBlock{ImageB64: b64, ImageMime: mimeType} }
+
+// rawResourceBlock carries the original file bytes as an embedded resource so a
+// client that supports it can offer/render the actual file (e.g. the PDF),
+// rather than only the extracted text. Whether a given MCP client surfaces it
+// is client-dependent.
+func rawResourceBlock(body []byte, mimeType, name string) ViewBlock {
+	return ViewBlock{
+		ResourceB64:  base64.StdEncoding.EncodeToString(body),
+		ResourceMime: mimeType,
+		ResourceName: name,
+	}
+}
 
 // ViewAttachment fetches one attachment and returns it as inline content blocks
 // the MCP client can render directly (no file written to disk). Images come
@@ -125,15 +140,21 @@ func ViewAttachment(ctx context.Context, cli *client.Client, messageID, attachme
 		} else {
 			res.Blocks = append(res.Blocks, textBlock(
 				"PDF nemá čitelnou textovou vrstvu (pravděpodobně sken nebo samé obrázky). "+
-					"Pro vizuální obsah použij edookit_download_attachments."))
+					"Surové PDF je přiloženo jako soubor (pokud ho tvůj klient zobrazí); "+
+					"jinak použij edookit_download_attachments."))
 		}
+		// Attach the raw PDF so a capable client can render/offer the file itself.
+		res.Blocks = append(res.Blocks, rawResourceBlock(body, mimeType, att.Name))
 
 	case isTextLike(mimeType, att.Name):
 		res.Blocks = append(res.Blocks, textBlock("--- obsah ---\n"+truncateRunes(string(body), maxViewTextRunes)))
 
 	default:
-		res.Blocks = append(res.Blocks, textBlock(fmt.Sprintf(
-			"Binární typ (%s) — inline nezobrazitelný. Použij edookit_download_attachments.", mimeType)))
+		res.Blocks = append(res.Blocks,
+			textBlock(fmt.Sprintf(
+				"Binární typ (%s) — inline nezobrazitelný. Surový soubor je přiložen jako resource "+
+					"(pokud ho tvůj klient zobrazí); jinak použij edookit_download_attachments.", mimeType)),
+			rawResourceBlock(body, mimeType, att.Name))
 	}
 	return res, nil
 }
