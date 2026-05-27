@@ -764,6 +764,107 @@ func (c *Client) getTo(ctx context.Context, path string, dst io.Writer, retry bo
 	return io.Copy(dst, resp.Body)
 }
 
+// ErrAttachmentTooLarge is returned by GetBytes when the response body exceeds
+// the caller-supplied limit. Callers streaming to disk should use GetTo, which
+// is unbounded; GetBytes is for the inline-view path where memory must be bounded.
+var ErrAttachmentTooLarge = errors.New("attachment exceeds inline size limit")
+
+// GetBytes fetches GET <path> fully into memory (up to limit bytes) and returns
+// the body together with the response Content-Type. Returns ErrAttachmentTooLarge
+// if the body would exceed limit (nothing is buffered past limit+1). Session,
+// preflight, and login-page handling match GetTo. Intended for the inline-view
+// tool; for plain downloads use GetTo.
+func (c *Client) GetBytes(ctx context.Context, path string, limit int64) (body []byte, contentType string, err error) {
+	return c.getBytes(ctx, path, limit, true)
+}
+
+func (c *Client) getBytes(ctx context.Context, path string, limit int64, retry bool) (body []byte, contentType string, err error) {
+	if err := c.ensureLoggedIn(ctx); err != nil {
+		return nil, "", err
+	}
+	if err := c.preflightSameOrigin(path); err != nil {
+		return nil, "", fmt.Errorf("GET %s: %w", path, err)
+	}
+
+	req, err := c.newRequest(ctx, path)
+	if err != nil {
+		return nil, "", err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("GET %s: %w", path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if !sameOrigin(resp.Request.URL, c.baseURL) {
+		if !retry {
+			return nil, "", errors.New("session expired and re-login failed")
+		}
+		c.invalidateSession()
+		return c.getBytes(ctx, path, limit, false)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, "", fmt.Errorf("GET %s: HTTP %d", path, resp.StatusCode)
+	}
+
+	body, err = io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, "", fmt.Errorf("read body from %s: %w", path, err)
+	}
+	if int64(len(body)) > limit {
+		return nil, "", ErrAttachmentTooLarge
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	switch classifyDownloadBody(ct, body, retry) {
+	case dispReauth:
+		c.invalidateSession()
+		return c.getBytes(ctx, path, limit, false)
+	case dispFail:
+		return nil, "", errors.New("session reported authenticated=false and re-login failed")
+	}
+	return body, ct, nil
+}
+
+type downloadDisposition int
+
+const (
+	dispAccept downloadDisposition = iota // a real attachment body — return it
+	dispReauth                            // looks like a stale session — invalidate and retry
+	dispFail                              // confirmed stale session and retry already exhausted
+)
+
+// classifyDownloadBody decides whether a download response is a real attachment
+// or a stale-session artifact. Unlike GetTo (download to disk), the inline
+// viewer legitimately handles JSON and HTML files, so those content types can't
+// be rejected outright:
+//   - application/json: only a session-expiry envelope (authenticated:false)
+//     is a stale session; any other JSON is a real attachment (accept).
+//   - text/html: a stale session serves the login page as HTML, so retry once;
+//     if it is STILL HTML after a successful re-login, treat it as a genuine
+//     HTML attachment (accept) rather than failing.
+//
+// retry reports whether a re-auth attempt is still available.
+func classifyDownloadBody(contentType string, body []byte, retry bool) downloadDisposition {
+	switch lc := strings.ToLower(contentType); {
+	case strings.HasPrefix(lc, "application/json"):
+		var env authEnvelope
+		if json.Unmarshal(body, &env) == nil && env.Authenticated != nil && !*env.Authenticated {
+			if retry {
+				return dispReauth
+			}
+			return dispFail
+		}
+		return dispAccept
+	case strings.HasPrefix(lc, "text/html"):
+		if retry {
+			return dispReauth
+		}
+		return dispAccept
+	}
+	return dispAccept
+}
+
 // authEnvelope is the subset of every /handler/page/* and /handler/grid/*
 // response we read to detect a server-side session expiry that did NOT cause
 // an off-host bounce — when this happens the server returns HTTP 200 with a
