@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image/png"
 	"sync"
@@ -45,7 +46,7 @@ func pdfiumPool() (pdfium.Pool, error) {
 // were capped. An error means rendering was unavailable for this document
 // (encrypted, malformed, pool init failure); the caller should fall back to
 // text / a download note.
-func rasterizePDF(body []byte, maxPages int) (pngs [][]byte, totalPages int, err error) {
+func rasterizePDF(ctx context.Context, body []byte, maxPages int) (pngs [][]byte, totalPages int, err error) {
 	if maxPages < 1 {
 		maxPages = 1
 	}
@@ -53,7 +54,13 @@ func rasterizePDF(body []byte, maxPages int) (pngs [][]byte, totalPages int, err
 	if err != nil {
 		return nil, 0, fmt.Errorf("pdfium init: %w", err)
 	}
-	inst, err := pool.GetInstance(30 * time.Second)
+	// The pool is a single shared worker (one wasm instance is heavy on memory),
+	// so concurrent renders queue here. Acquire with the call's context plus a
+	// deadline so a canceled or stuck caller frees its turn instead of blocking
+	// indefinitely.
+	acqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	inst, err := pool.GetInstanceWithContext(acqCtx)
 	if err != nil {
 		return nil, 0, fmt.Errorf("pdfium instance: %w", err)
 	}
@@ -76,6 +83,9 @@ func rasterizePDF(body []byte, maxPages int) (pngs [][]byte, totalPages int, err
 		n = maxPages
 	}
 	for i := range n {
+		if err := ctx.Err(); err != nil {
+			return pngs, totalPages, err // caller canceled mid-render
+		}
 		pngBytes, rerr := renderOnePage(inst, doc.Document, i)
 		if rerr != nil {
 			// Partial success is still useful — return what we have plus the error

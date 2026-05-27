@@ -127,7 +127,7 @@ func ViewAttachment(ctx context.Context, cli *client.Client, messageID, attachme
 		res.Blocks = append(res.Blocks, imageBlock(b64, outMime))
 
 	case mimeType == mimePDF:
-		res.Blocks = append(res.Blocks, pdfBlocks(body, opts.MaxPages)...)
+		res.Blocks = append(res.Blocks, pdfBlocks(ctx, body, opts.MaxPages)...)
 
 	case isTextLike(mimeType, att.Name):
 		res.Blocks = append(res.Blocks, textBlock("--- obsah ---\n"+truncateRunes(string(body), maxViewTextRunes)))
@@ -195,7 +195,7 @@ func isTextLike(mimeType, filename string) bool {
 // first maxPages pages rasterized to PNG so the page is actually visible. If
 // rendering is unavailable (encrypted/malformed/init failure) it degrades to
 // whatever text was extracted, or a download note.
-func pdfBlocks(body []byte, maxPages int) []ViewBlock {
+func pdfBlocks(ctx context.Context, body []byte, maxPages int) []ViewBlock {
 	if maxPages <= 0 {
 		maxPages = defaultViewMaxPages
 	}
@@ -208,7 +208,7 @@ func pdfBlocks(body []byte, maxPages int) []ViewBlock {
 		blocks = append(blocks, textBlock("--- text PDF ---\n"+truncateRunes(text, maxViewTextRunes)))
 	}
 
-	pngs, totalPages, err := rasterizePDF(body, maxPages)
+	pngs, totalPages, err := rasterizePDF(ctx, body, maxPages)
 	if err != nil {
 		log.Printf("[tools] pdf rasterize failed: %v", err)
 	}
@@ -217,7 +217,15 @@ func pdfBlocks(body []byte, maxPages int) []ViewBlock {
 			textBlock(fmt.Sprintf("--- strana %d/%d ---", i+1, totalPages)),
 			imageBlock(base64.StdEncoding.EncodeToString(p), mimePNG))
 	}
-	if totalPages > len(pngs) && len(pngs) > 0 {
+	// Explain why not all pages are shown — but only attribute it to max_pages
+	// when rendering actually succeeded. A mid-document render failure (err != nil)
+	// gets a different note: bumping max_pages wouldn't help there.
+	switch {
+	case err != nil && len(pngs) > 0:
+		blocks = append(blocks, textBlock(fmt.Sprintf(
+			"(Zobrazeno prvních %d stran; další se nepodařilo vyrenderovat. Zbytek viz text výše nebo edookit_download_attachments.)",
+			len(pngs))))
+	case err == nil && totalPages > len(pngs):
 		blocks = append(blocks, textBlock(fmt.Sprintf(
 			"(Zobrazeno prvních %d z %d stran. Pro zbytek zvyš max_pages nebo použij edookit_download_attachments.)",
 			len(pngs), totalPages)))

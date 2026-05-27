@@ -384,6 +384,15 @@ func TestViewAttachment_PDFMultiPageRespectsMaxPages(t *testing.T) {
 	}
 }
 
+func TestRasterizePDF_ContextCancelled(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := rasterizePDF(ctx, buildTestPDF(t, 2), 2); err == nil {
+		t.Fatal("expected an error when the context is already canceled")
+	}
+}
+
 func TestViewAttachment_NotFound(t *testing.T) {
 	t.Parallel()
 
