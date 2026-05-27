@@ -104,6 +104,7 @@ func TestRegisterTools_NoPanic(t *testing.T) {
 	registerGetMessageTool(s, cli)
 	registerDownloadAttachmentsTool(s, cli)
 	registerViewAttachmentTool(s, cli)
+	registerListCoursesTool(s, cli)
 	registerServerInfoTool(s)
 }
 

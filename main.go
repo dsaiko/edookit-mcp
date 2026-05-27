@@ -105,6 +105,7 @@ func main() {
 	registerGetMessageTool(s, cli)
 	registerDownloadAttachmentsTool(s, cli)
 	registerViewAttachmentTool(s, cli)
+	registerListCoursesTool(s, cli)
 	registerServerInfoTool(s)
 
 	if err := server.ServeStdio(s); err != nil {
@@ -373,6 +374,51 @@ func registerViewAttachmentTool(s *server.MCPServer, cli *client.Client) {
 				}
 			}
 			return &mcp.CallToolResult{Content: content}, nil
+		},
+	)
+}
+
+func registerListCoursesTool(s *server.MCPServer, cli *client.Client) {
+	s.AddTool(
+		mcp.NewTool("edookit_list_courses",
+			mcp.WithDescription("List the signed-in teacher's **Edookit** courses — what the "+
+				"user calls *moje třídy / moje kurzy / moje skupiny* (the courses shown in "+
+				"Hodnocení → Známkování v tabulce). A course is a subject taught to a class "+
+				"or group, e.g. \"AUT - 4SA\" (whole class) with its split half-groups "+
+				"\"AUT 1 - 4SA\" / \"AUT 2 - 4SA\" (split_group=true). Use this for questions "+
+				"like \"which classes/courses do I teach\", \"list my groups\", or as the way "+
+				"to find a course_id before listing its pupils. Returns a JSON array of "+
+				"{course_id, name, split_group, students?, error?}. By default (no arguments) "+
+				"it returns just the course list — one cheap request. Pass `course_id` to get "+
+				"one course **with its student roster** (žáci: {study_id, name, class}); a "+
+				"half-group's roster is the subset of the class in that half. Pass "+
+				"`include_students=true` to populate every course's roster at once (heavier — "+
+				"one request per course; pupils of a class repeat under its half-groups). In "+
+				"that mode a course whose roster failed to load carries a non-empty `error` "+
+				"field (and no `students`), so an empty class is distinguishable from a "+
+				"failed fetch — don't treat a missing roster as 'no pupils' when `error` is set."),
+			mcp.WithString("course_id",
+				mcp.Description("Return just this course with its student roster. Value is a "+
+					"course_id from a prior no-argument call, e.g. \"myc-22909-20102\"."),
+			),
+			mcp.WithBoolean("include_students",
+				mcp.Description("Populate every course's student roster (heavier; ignored when "+
+					"course_id is set). Default false = course list only."),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			courses, err := tools.ListCourses(ctx, cli, tools.CoursesOptions{
+				CourseID:        req.GetString("course_id", ""),
+				IncludeStudents: req.GetBool("include_students", false),
+			})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			b, err := json.Marshal(courses)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("marshal: %v", err)), nil
+			}
+			return mcp.NewToolResultText(string(b)), nil
 		},
 	)
 }
