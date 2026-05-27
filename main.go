@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -345,9 +346,19 @@ func registerViewAttachmentTool(s *server.MCPServer, cli *client.Client) {
 			}
 			content := make([]mcp.Content, 0, len(res.Blocks))
 			for _, b := range res.Blocks {
-				if b.ImageB64 != "" {
+				switch {
+				case b.ResourceB64 != "":
+					content = append(content, mcp.EmbeddedResource{
+						Type: "resource",
+						Resource: mcp.BlobResourceContents{
+							URI:      "edookit://attachment/" + url.PathEscape(b.ResourceName),
+							MIMEType: b.ResourceMime,
+							Blob:     b.ResourceB64,
+						},
+					})
+				case b.ImageB64 != "":
 					content = append(content, mcp.NewImageContent(b.ImageB64, b.ImageMime))
-				} else {
+				default:
 					content = append(content, mcp.NewTextContent(b.Text))
 				}
 			}
