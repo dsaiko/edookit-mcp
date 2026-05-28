@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	// Embed the IANA tzdata so time.LoadLocation works on hosts without
@@ -49,7 +53,11 @@ func main() {
 	dumpMessage := flag.String("dump-message", "", "(dev) fetch the full body of the given message ID (e.g. m-290491 or 290491) and dump the raw JSON response across all plausible endpoints — used to reverse-engineer the full-message + attachments API shape")
 	getMessage := flag.String("get-message", "", "(dev) call tools.GetMessage for the given ID and print the resulting FullMessage JSON (smoke test for the parser)")
 	showVersion := flag.Bool("version", false, "print version and commit, then exit")
+	httpAddr := flag.String("http", "", "Run as a remote MCP server over Streamable HTTP, listening on this address (e.g. \":9000\" or \"127.0.0.1:9000\"); endpoint path is /mcp. When unset (default), runs as a local stdio MCP server. Falls back to EDOOKIT_HTTP_ADDR.")
 	flag.Parse()
+	if *httpAddr == "" {
+		*httpAddr = os.Getenv("EDOOKIT_HTTP_ADDR")
+	}
 
 	if *showVersion {
 		fmt.Printf("edookit-mcp %s (commit %s, built %s)\n", version, commit, date)
@@ -108,8 +116,65 @@ func main() {
 	registerListCoursesTool(s, cli)
 	registerServerInfoTool(s)
 
+	if *httpAddr != "" {
+		runHTTP(s, *httpAddr)
+		return
+	}
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("serve stdio: %v", err)
+	}
+}
+
+// defaultHTTPSessionIdleTTL is how long an idle MCP session is kept on the
+// Streamable HTTP server before being swept. mcp-go disables the sweeper
+// entirely unless WithSessionIdleTTL is set, so on a long-lived remote
+// endpoint sessions would otherwise accumulate indefinitely (one per
+// `initialize`). One hour is a reasonable balance for an interactive
+// connector — clients reconnect within that window in normal use, and a
+// stale session is cheap to recreate.
+const defaultHTTPSessionIdleTTL = time.Hour
+
+// runHTTP serves the MCP server over the Streamable HTTP transport at addr
+// (endpoint `/mcp`). Intended for hosted/remote deployments — fronted by a TLS
+// reverse proxy (Apache/nginx/Caddy) plus an OAuth gateway, since this listener
+// does not implement auth itself. Shuts down gracefully on SIGINT/SIGTERM so a
+// systemd `systemctl stop` exits cleanly.
+func runHTTP(s *server.MCPServer, addr string) {
+	idleTTL := defaultHTTPSessionIdleTTL
+	if raw := os.Getenv("EDOOKIT_HTTP_SESSION_IDLE_TTL"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			log.Fatalf("EDOOKIT_HTTP_SESSION_IDLE_TTL %q: %v", raw, err) //nolint:gosec // G706: env value goes to operator startup log, not untrusted sink
+		}
+		idleTTL = d
+	}
+	httpSrv := server.NewStreamableHTTPServer(s, server.WithSessionIdleTTL(idleTTL))
+	log.Printf("edookit-mcp serving Streamable HTTP on %s/mcp (session idle TTL %s)", addr, idleTTL) //nolint:gosec // G706: addr is the operator's own --http flag / env, logged to operator output
+
+	errCh := make(chan error, 1)
+	go func() {
+		err := httpSrv.Start(addr)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			log.Fatalf("http transport: %v", err)
+		}
+	case sig := <-sigCh:
+		log.Printf("received %v, shutting down", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(ctx); err != nil {
+			log.Printf("http shutdown: %v", err)
+		}
 	}
 }
 

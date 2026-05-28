@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/server"
@@ -106,6 +109,40 @@ func TestRegisterTools_NoPanic(t *testing.T) {
 	registerViewAttachmentTool(s, cli)
 	registerListCoursesTool(s, cli)
 	registerServerInfoTool(s)
+}
+
+// Smoke test for the Streamable HTTP transport: the server must answer a
+// JSON-RPC `initialize` POST to `/mcp` with HTTP 200 and a JSON-RPC result.
+// Exercises the wiring used by `runHTTP` / `--http`, without touching a real
+// listener (httptest gives us the same http.Handler path).
+func TestHTTPTransport_Initialize(t *testing.T) {
+	t.Parallel()
+	s := server.NewMCPServer("edookit-mcp-test", "test", server.WithToolCapabilities(true))
+	ts := httptest.NewServer(server.NewStreamableHTTPServer(s))
+	defer ts.Close()
+
+	body := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize",` +
+		`"params":{"protocolVersion":"2025-06-18","capabilities":{},` +
+		`"clientInfo":{"name":"smoke","version":"1"}}}`)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, ts.URL+"/mcp", body)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /mcp: %v", err)
+	}
+	defer resp.Body.Close()
+	got, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, got)
+	}
+	if !strings.Contains(string(got), `"result"`) {
+		t.Errorf("body = %s, want a JSON-RPC result envelope", got)
+	}
 }
 
 func TestBuildServerInfo(t *testing.T) {
