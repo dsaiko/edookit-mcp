@@ -125,14 +125,31 @@ func main() {
 	}
 }
 
+// defaultHTTPSessionIdleTTL is how long an idle MCP session is kept on the
+// Streamable HTTP server before being swept. mcp-go disables the sweeper
+// entirely unless WithSessionIdleTTL is set, so on a long-lived remote
+// endpoint sessions would otherwise accumulate indefinitely (one per
+// `initialize`). One hour is a reasonable balance for an interactive
+// connector — clients reconnect within that window in normal use, and a
+// stale session is cheap to recreate.
+const defaultHTTPSessionIdleTTL = time.Hour
+
 // runHTTP serves the MCP server over the Streamable HTTP transport at addr
 // (endpoint `/mcp`). Intended for hosted/remote deployments — fronted by a TLS
 // reverse proxy (Apache/nginx/Caddy) plus an OAuth gateway, since this listener
 // does not implement auth itself. Shuts down gracefully on SIGINT/SIGTERM so a
 // systemd `systemctl stop` exits cleanly.
 func runHTTP(s *server.MCPServer, addr string) {
-	httpSrv := server.NewStreamableHTTPServer(s)
-	log.Printf("edookit-mcp serving Streamable HTTP on %s/mcp", addr)
+	idleTTL := defaultHTTPSessionIdleTTL
+	if raw := os.Getenv("EDOOKIT_HTTP_SESSION_IDLE_TTL"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			log.Fatalf("EDOOKIT_HTTP_SESSION_IDLE_TTL %q: %v", raw, err) //nolint:gosec // G706: env value goes to operator startup log, not untrusted sink
+		}
+		idleTTL = d
+	}
+	httpSrv := server.NewStreamableHTTPServer(s, server.WithSessionIdleTTL(idleTTL))
+	log.Printf("edookit-mcp serving Streamable HTTP on %s/mcp (session idle TTL %s)", addr, idleTTL) //nolint:gosec // G706: addr is the operator's own --http flag / env, logged to operator output
 
 	errCh := make(chan error, 1)
 	go func() {
