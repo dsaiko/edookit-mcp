@@ -1,0 +1,30 @@
+[Unit]
+Description=edookit-mcp — Streamable HTTP MCP server for Edookit
+Documentation=https://github.com/dsaiko/edookit-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=edookit-mcp
+Group=edookit-mcp
+EnvironmentFile=/etc/edookit-mcp/edookit-mcp.env
+ExecStart=/usr/bin/edookit-mcp --http 127.0.0.1:9000
+Restart=on-failure
+RestartSec=5s
+
+# State (cookie cache) and cache dirs created by systemd, owned by the service
+# user. EDOOKIT_COOKIE_CACHE in the env file points at $CACHE_DIRECTORY.
+StateDirectory=edookit-mcp
+CacheDirectory=edookit-mcp
+
+# Hardening (kept lenient — chromedp launches headless chromium, which is
+# unhappy under aggressive isolation; tighten further if you confirm logins
+# still succeed).
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
