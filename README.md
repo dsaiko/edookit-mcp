@@ -198,7 +198,13 @@ Transport je MCP **Streamable HTTP** (`mcp-go/server.NewStreamableHTTPServer`), 
 Pro hostovaný server vydává release vedle tarballů i **RPM a DEB balíčky** (linux x86_64 + arm64), které donesou binárku, systemd unit, env-file template (`config(noreplace)` / conffile), deklarují `chromium` jako závislost a založí systémového uživatele `edookit-mcp`.
 
 ```bash
-# Rocky / RHEL / Fedora (aarch64 příklad — pro x86_64 použij .x86_64.rpm):
+# Rocky / RHEL / AlmaLinux: balíček vyžaduje `chromium`, který je v EPEL
+# (ne v base repu). Pokud ještě nemáš EPEL povolený, doinstaluj ho jednou:
+sudo dnf install -y epel-release
+# Pak (aarch64 příklad — pro x86_64 použij .x86_64.rpm):
+sudo dnf install https://github.com/dsaiko/edookit-mcp/releases/download/vX.Y.Z/edookit-mcp-X.Y.Z-1.aarch64.rpm
+
+# Fedora (EPEL netřeba, chromium je v base):
 sudo dnf install https://github.com/dsaiko/edookit-mcp/releases/download/vX.Y.Z/edookit-mcp-X.Y.Z-1.aarch64.rpm
 
 # Debian / Ubuntu:
