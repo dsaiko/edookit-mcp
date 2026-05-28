@@ -193,6 +193,33 @@ edookit-mcp --http 127.0.0.1:9000   # endpoint: http://127.0.0.1:9000/mcp
 
 Transport je MCP **Streamable HTTP** (`mcp-go/server.NewStreamableHTTPServer`), endpoint je vždy `/mcp`. Server sám **TLS ani autentizaci neřeší** — počítá se s tím, že před ním běží reverse-proxy s certifikátem a auth vrstvou (OAuth 2.1 pro ChatGPT konektory). `SIGINT`/`SIGTERM` ukončí server čistě (kompatibilní se `systemctl stop`). Idle MCP session se uklízejí po **1 hodině** (default; přenastav přes `EDOOKIT_HTTP_SESSION_IDLE_TTL`, např. `30m`).
 
+#### Instalace na Linux server (RPM / DEB)
+
+Pro hostovaný server vydává release vedle tarballů i **RPM a DEB balíčky** (linux x86_64 + arm64), které donesou binárku, systemd unit, env-file template (`config(noreplace)` / conffile), deklarují `chromium` jako závislost a založí systémového uživatele `edookit-mcp`.
+
+```bash
+# Rocky / RHEL / AlmaLinux: balíček vyžaduje `chromium`, který je v EPEL
+# (ne v base repu). Pokud ještě nemáš EPEL povolený, doinstaluj ho jednou:
+sudo dnf install -y epel-release
+# Pak (aarch64 příklad — pro x86_64 použij .x86_64.rpm):
+sudo dnf install https://github.com/dsaiko/edookit-mcp/releases/download/vX.Y.Z/edookit-mcp-X.Y.Z-1.aarch64.rpm
+
+# Fedora (EPEL netřeba, chromium je v base):
+sudo dnf install https://github.com/dsaiko/edookit-mcp/releases/download/vX.Y.Z/edookit-mcp-X.Y.Z-1.aarch64.rpm
+
+# Debian / Ubuntu:
+curl -LO https://github.com/dsaiko/edookit-mcp/releases/download/vX.Y.Z/edookit-mcp_X.Y.Z_arm64.deb
+sudo apt install ./edookit-mcp_X.Y.Z_arm64.deb
+```
+
+Pak:
+```bash
+sudo $EDITOR /etc/edookit-mcp/edookit-mcp.env   # vyplň EDOOKIT_URL / USER / PASS
+sudo systemctl enable --now edookit-mcp
+```
+
+Služba poslouchá na `127.0.0.1:9000/mcp`. **Před zveřejněním ven** dej před ni reverse-proxy s TLS a OAuth (pro ChatGPT konektor). Upgrade = stejný `dnf install` / `apt install` s novou verzí (env soubor se nepřepíše).
+
 Po napojení by se v konverzaci měly objevit nástroje `edookit_list_inbox`, `edookit_list_sent`, `edookit_get_message`, `edookit_download_attachments`, `edookit_view_attachment`, `edookit_list_courses` a `edookit_server_info`.
 
 ### Co umí (dostupné nástroje)
