@@ -29,12 +29,11 @@ func Subject(ctx context.Context) string {
 // what MCP clients like ChatGPT use to recover from a missing/expired token).
 func (s *Server) RequireBearer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authz := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authz, "Bearer ") {
+		token, ok := parseBearer(r.Header.Get("Authorization"))
+		if !ok {
 			s.writeUnauthorized(w, "invalid_request", "no bearer token in request")
 			return
 		}
-		token := strings.TrimPrefix(authz, "Bearer ")
 		sub, err := s.verifyJWT(token)
 		if err != nil {
 			s.writeUnauthorized(w, "invalid_token", err.Error())
@@ -45,10 +44,31 @@ func (s *Server) RequireBearer(next http.Handler) http.Handler {
 	})
 }
 
+// parseBearer extracts a Bearer token from an Authorization header value in
+// a way that is forgiving about case (RFC 7235 says scheme tokens are
+// case-insensitive) and about runs of whitespace between the scheme and the
+// credentials (some HTTP clients normalise headers unhelpfully). Returns
+// (token, true) on success; ("", false) on anything else.
+func parseBearer(authz string) (string, bool) {
+	if authz == "" {
+		return "", false
+	}
+	const scheme = "bearer"
+	prefix, rest, ok := strings.Cut(authz, " ")
+	if !ok || !strings.EqualFold(prefix, scheme) {
+		return "", false
+	}
+	tok := strings.TrimLeft(rest, " \t")
+	if tok == "" {
+		return "", false
+	}
+	return tok, true
+}
+
 func (s *Server) writeUnauthorized(w http.ResponseWriter, code, desc string) {
 	w.Header().Set("WWW-Authenticate", fmt.Sprintf(
-		`Bearer realm="edookit-mcp", error=%q, error_description=%q, resource_metadata="%s/.well-known/oauth-protected-resource"`,
-		code, desc, s.cfg.PublicURL,
+		`Bearer realm="edookit-mcp", error=%q, error_description=%q, resource_metadata=%q`,
+		code, desc, s.protectedResourceMetadataURL(),
 	))
 	writeJSONError(w, http.StatusUnauthorized, code, desc)
 }

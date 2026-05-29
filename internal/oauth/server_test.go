@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -331,5 +332,201 @@ func TestBearerMissing(t *testing.T) {
 	auth := rr.Header().Get("WWW-Authenticate")
 	if !strings.Contains(auth, "resource_metadata=") {
 		t.Errorf("WWW-Authenticate missing resource_metadata: %q", auth)
+	}
+	// The path-qualified URL is what RFC 9728 derive-clients construct;
+	// emit the same so we never disagree with them.
+	if !strings.Contains(auth, "/.well-known/oauth-protected-resource/mcp") {
+		t.Errorf("WWW-Authenticate should point at path-qualified well-known: %q", auth)
+	}
+}
+
+func TestParseBearerCaseInsensitive(t *testing.T) {
+	for _, tc := range []struct {
+		hdr      string
+		wantTok  string
+		wantPass bool
+	}{
+		{"Bearer abc", "abc", true},
+		{"bearer abc", "abc", true},
+		{"BEARER abc", "abc", true},
+		{"bEaReR    abc", "abc", true},
+		{"Basic abc", "", false},
+		{"abc", "", false},
+		{"", "", false},
+		{"Bearer ", "", false},
+	} {
+		tok, ok := parseBearer(tc.hdr)
+		if tok != tc.wantTok || ok != tc.wantPass {
+			t.Errorf("parseBearer(%q) = (%q, %v); want (%q, %v)", tc.hdr, tok, ok, tc.wantTok, tc.wantPass)
+		}
+	}
+}
+
+func TestPathQualifiedResourceMetadataServed(t *testing.T) {
+	s, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	s.RegisterRoutes(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cli := noRedirectClient()
+	// Audience = https://mcp.example/mcp ⇒ path-qualified URL must serve
+	// the same metadata document as the bare well-known.
+	for _, path := range []string{
+		"/.well-known/oauth-protected-resource",
+		"/.well-known/oauth-protected-resource/mcp",
+	} {
+		resp := doGet(t, cli, srv.URL+path)
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s: want 200, got %d (%s)", path, resp.StatusCode, body)
+			continue
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(body, &doc); err != nil {
+			t.Errorf("%s: bad JSON: %v", path, err)
+			continue
+		}
+		if doc["resource"] != "https://mcp.example/mcp" {
+			t.Errorf("%s: resource = %v", path, doc["resource"])
+		}
+	}
+}
+
+func TestRegisterRejectsBadRedirectScheme(t *testing.T) {
+	s, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	s.RegisterRoutes(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	cli := noRedirectClient()
+	// `javascript:` URIs are valid url.Parse but unsafe as redirect targets.
+	resp := doJSON(t, cli, srv.URL+"/oauth/register",
+		`{"client_name":"x","redirect_uris":["javascript:alert(1)"]}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("want 400 for javascript: URI, got %d", resp.StatusCode)
+	}
+}
+
+func TestRegisterRejectsOversizedBody(t *testing.T) {
+	s, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	s.RegisterRoutes(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	cli := noRedirectClient()
+	// Build a body well over the 16KB cap.
+	junk := strings.Repeat("A", maxRegisterBodyBytes*2)
+	body := `{"client_name":"` + junk + `","redirect_uris":["https://example.com/cb"]}`
+	resp := doJSON(t, cli, srv.URL+"/oauth/register", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("want 413, got %d", resp.StatusCode)
+	}
+}
+
+func TestRegisterEvictsOldestAtCap(t *testing.T) {
+	s, clock := newTestServer(t)
+	// Fill the map to the cap.
+	for i := range maxClients {
+		*clock = clock.Add(time.Millisecond)
+		s.mu.Lock()
+		s.clients[fmt.Sprintf("mcp_filler_%d", i)] = &ClientRegistration{
+			ClientID: fmt.Sprintf("mcp_filler_%d", i),
+			IssuedAt: *clock,
+		}
+		s.mu.Unlock()
+	}
+	mux := http.NewServeMux()
+	s.RegisterRoutes(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	// One more registration should succeed AND drop the oldest.
+	*clock = clock.Add(time.Second)
+	resp := doJSON(t, noRedirectClient(), srv.URL+"/oauth/register",
+		`{"client_name":"latest","redirect_uris":["https://example.com/cb"]}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("want 201, got %d", resp.StatusCode)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.clients) > maxClients {
+		t.Errorf("clients map exceeded cap: %d > %d", len(s.clients), maxClients)
+	}
+	if _, exists := s.clients["mcp_filler_0"]; exists {
+		t.Error("oldest filler was not evicted")
+	}
+}
+
+func TestLoginThrottleBlocksAfterNFailures(t *testing.T) {
+	s, _ := newTestServer(t)
+	// Make the failure delay zero so the test isn't slow.
+	s.throttle.failureDelay = 0
+	mux := http.NewServeMux()
+	s.RegisterRoutes(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	// Register a client first.
+	cli := noRedirectClient()
+	resp := doJSON(t, cli, srv.URL+"/oauth/register",
+		`{"client_name":"x","redirect_uris":["https://example.com/cb"]}`)
+	defer resp.Body.Close()
+	var reg ClientRegistration
+	if err := json.NewDecoder(resp.Body).Decode(&reg); err != nil {
+		t.Fatalf("decode reg: %v", err)
+	}
+
+	authURL := srv.URL + "/oauth/authorize"
+	doFail := func() int {
+		form := url.Values{}
+		form.Set("response_type", "code")
+		form.Set("client_id", reg.ClientID)
+		form.Set("redirect_uri", "https://example.com/cb")
+		form.Set("code_challenge", "x")
+		form.Set("code_challenge_method", "S256")
+		form.Set("username", "alice")
+		form.Set("password", "WRONG")
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost, authURL, strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("X-Forwarded-For", "203.0.113.42")
+		r, err := cli.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		_ = r.Body.Close()
+		return r.StatusCode
+	}
+
+	// First loginFailureMax-1 failures still return 401 (wrong creds).
+	for i := 1; i < loginFailureMax; i++ {
+		if got := doFail(); got != http.StatusUnauthorized {
+			t.Errorf("attempt %d: want 401, got %d", i, got)
+		}
+	}
+	// The Nth failure trips the block; the (N+1)th attempt should be 429.
+	_ = doFail()
+	if got := doFail(); got != http.StatusTooManyRequests {
+		t.Errorf("after %d failures: want 429, got %d", loginFailureMax+1, got)
+	}
+}
+
+func TestScopeHasExactMatch(t *testing.T) {
+	for _, tc := range []struct {
+		scope, want string
+		expect      bool
+	}{
+		{"openid offline_access mcp", "offline_access", true},
+		{"openid mcp", "offline_access", false},
+		{"x_offline_access_y", "offline_access", false},
+		{"", "offline_access", false},
+		{"offline_access", "offline_access", true},
+	} {
+		if got := scopeHas(tc.scope, tc.want); got != tc.expect {
+			t.Errorf("scopeHas(%q, %q) = %v; want %v", tc.scope, tc.want, got, tc.expect)
+		}
 	}
 }

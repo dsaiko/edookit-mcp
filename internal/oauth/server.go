@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +25,35 @@ const (
 	grantRefreshToken      = "refresh_token"
 	pkceMethodS256         = "S256"
 	tokenTypeBearer        = "Bearer"
+	scopeOfflineAccess     = "offline_access"
+)
+
+// Limits that bound the open-to-the-internet endpoints. Every value here is
+// a defense against turning DCR or /authorize into a DoS / brute-force
+// surface. Tuned for a single-user prototype — bump them if you're hosting
+// multiple humans.
+const (
+	// maxRegisterBodyBytes caps a DCR request body so the open
+	// /oauth/register endpoint cannot be used to drive arbitrary
+	// CPU/memory in the JSON decoder.
+	maxRegisterBodyBytes = 16 * 1024
+	// maxRedirectURIs caps how many redirect_uris a single client
+	// may list at registration time.
+	maxRedirectURIs = 8
+	// maxRedirectURILen caps each individual redirect_uri.
+	maxRedirectURILen = 2048
+	// maxClientNameLen caps the client_name display string.
+	maxClientNameLen = 256
+	// maxClients caps the registered-clients map. When at the cap a
+	// new POST /oauth/register evicts the client with the oldest
+	// IssuedAt so we never grow without bound.
+	maxClients = 256
+
+	// Login throttling — see ratelimit.go for the semantics.
+	loginFailureWindow = 1 * time.Minute
+	loginFailureMax    = 8
+	loginBlockDuration = 15 * time.Minute
+	loginFailureDelay  = 500 * time.Millisecond
 )
 
 // Config bundles the deployment-specific parameters of the OAuth server.
@@ -75,6 +106,7 @@ type Server struct {
 	codes    map[string]*authCode
 	refresh  map[string]*refreshRecord
 	loginTpl *template.Template
+	throttle *loginThrottle
 	// now lets tests inject a deterministic clock; falls back to time.Now.
 	clock func() time.Time
 }
@@ -150,6 +182,7 @@ func New(cfg Config) (*Server, error) {
 		loginTpl: tpl,
 		clock:    time.Now,
 	}
+	s.throttle = newLoginThrottle(s.now)
 	go s.gcLoop()
 	return s, nil
 }
@@ -169,7 +202,6 @@ func (s *Server) gcLoop() {
 func (s *Server) gc() {
 	now := s.now()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for k, c := range s.codes {
 		if now.After(c.expiresAt) {
 			delete(s.codes, k)
@@ -180,6 +212,8 @@ func (s *Server) gc() {
 			delete(s.refresh, k)
 		}
 	}
+	s.mu.Unlock()
+	s.throttle.gc()
 }
 
 // RegisterRoutes mounts the OAuth + discovery endpoints on the given mux.
@@ -187,7 +221,15 @@ func (s *Server) gc() {
 // wrapped in s.RequireBearer().
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/.well-known/oauth-authorization-server", s.handleASMetadata)
+	// RFC 9728 lets a client either probe the bare well-known path OR
+	// derive a path-qualified one from the resource identifier
+	// (`/.well-known/oauth-protected-resource{path-of-resource}`). Mount
+	// both so the discovery survives regardless of which form the client
+	// picks.
 	mux.HandleFunc("/.well-known/oauth-protected-resource", s.handleResourceMetadata)
+	if p := s.protectedResourceMetadataPath(); p != "/.well-known/oauth-protected-resource" {
+		mux.HandleFunc(p, s.handleResourceMetadata)
+	}
 	// Many OIDC libraries probe /.well-known/openid-configuration even when
 	// we advertise only OAuth metadata; serve the same document so they
 	// don't get confused.
@@ -195,6 +237,26 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/oauth/register", s.handleRegister)
 	mux.HandleFunc("/oauth/authorize", s.handleAuthorize)
 	mux.HandleFunc("/oauth/token", s.handleToken)
+}
+
+// protectedResourceMetadataPath returns the RFC 9728 path-qualified
+// well-known URL path for our resource. For audience
+// `https://host/mcp` this yields `/.well-known/oauth-protected-resource/mcp`
+// (so clients that pre-derive the URL from the resource identifier find it
+// without needing to read our WWW-Authenticate header first).
+func (s *Server) protectedResourceMetadataPath() string {
+	const base = "/.well-known/oauth-protected-resource"
+	u, err := url.Parse(s.cfg.Audience)
+	if err != nil || u.Path == "" || u.Path == "/" {
+		return base
+	}
+	return base + u.Path
+}
+
+// protectedResourceMetadataURL is the fully-qualified URL that should be
+// emitted in WWW-Authenticate so MCP clients can fetch it directly.
+func (s *Server) protectedResourceMetadataURL() string {
+	return s.cfg.PublicURL + s.protectedResourceMetadataPath()
 }
 
 // --- handlers ---
@@ -209,7 +271,7 @@ func (s *Server) handleASMetadata(w http.ResponseWriter, _ *http.Request) {
 		"grant_types_supported":                 []string{grantAuthorizationCode, grantRefreshToken},
 		"code_challenge_methods_supported":      []string{pkceMethodS256},
 		"token_endpoint_auth_methods_supported": []string{"none"},
-		"scopes_supported":                      []string{"openid", "offline_access", "mcp"},
+		"scopes_supported":                      []string{"openid", scopeOfflineAccess, "mcp"},
 	}
 	writeJSON(w, http.StatusOK, doc)
 }
@@ -229,6 +291,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
+	// Cap the request body — DCR is open to the internet, so an unbounded
+	// JSON decoder is a CPU/memory DoS vector. MaxBytesReader makes the
+	// decoder surface ErrBodyTooLarge as a transparent decode error.
+	r.Body = http.MaxBytesReader(w, r.Body, maxRegisterBodyBytes)
 	var req struct {
 		ClientName              string   `json:"client_name"`
 		RedirectURIs            []string `json:"redirect_uris"`
@@ -236,7 +302,16 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		ResponseTypes           []string `json:"response_types"`
 		TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
 	}
+	// We intentionally do NOT use DisallowUnknownFields — DCR clients
+	// commonly send extra metadata (application_type, software_id,
+	// software_version, contacts, ...) and rejecting any of those would
+	// be brittle. The body cap above is what protects us from DoS.
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "invalid_client_metadata", "request body too large")
+			return
+		}
 		writeJSONError(w, http.StatusBadRequest, "invalid_client_metadata", "invalid JSON body")
 		return
 	}
@@ -244,9 +319,17 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uris is required and must be non-empty")
 		return
 	}
+	if len(req.RedirectURIs) > maxRedirectURIs {
+		writeJSONError(w, http.StatusBadRequest, "invalid_redirect_uri", fmt.Sprintf("too many redirect_uris (max %d)", maxRedirectURIs))
+		return
+	}
+	if len(req.ClientName) > maxClientNameLen {
+		writeJSONError(w, http.StatusBadRequest, "invalid_client_metadata", "client_name too long")
+		return
+	}
 	for _, u := range req.RedirectURIs {
-		if _, err := url.Parse(u); err != nil {
-			writeJSONError(w, http.StatusBadRequest, "invalid_redirect_uri", fmt.Sprintf("malformed redirect_uri %q", u))
+		if err := validateRedirectURI(u); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid_redirect_uri", err.Error())
 			return
 		}
 	}
@@ -269,10 +352,58 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		ResponseTypes: []string{responseTypeCode},
 	}
 	s.mu.Lock()
+	if len(s.clients) >= maxClients {
+		s.evictOldestClientLocked()
+	}
 	s.clients[reg.ClientID] = reg
 	s.mu.Unlock()
 	log.Printf("oauth: registered client %s (name=%q, redirect_uris=%v)", reg.ClientID, reg.ClientName, reg.RedirectURIs)
 	writeJSON(w, http.StatusCreated, reg)
+}
+
+// validateRedirectURI rejects anything that isn't an absolute http(s) URL
+// with a host and no fragment. We can't trust /authorize's later
+// "is-this-registered" check alone — if `javascript:` URIs survive
+// registration, the very registration call leaks an XSS sink into the
+// system; better to filter them at the door.
+func validateRedirectURI(raw string) error {
+	if len(raw) > maxRedirectURILen {
+		return fmt.Errorf("redirect_uri too long (max %d)", maxRedirectURILen)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("malformed redirect_uri %q: %w", raw, err)
+	}
+	switch u.Scheme {
+	case "http", "https":
+		// OK
+	default:
+		return fmt.Errorf("redirect_uri %q must use http or https", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("redirect_uri %q must have a host", raw)
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("redirect_uri %q must not have a fragment", raw)
+	}
+	return nil
+}
+
+// evictOldestClientLocked drops the client with the oldest IssuedAt. Must be
+// called with s.mu held. Linear scan is fine — maxClients is small (256).
+func (s *Server) evictOldestClientLocked() {
+	var oldestKey string
+	var oldestAt time.Time
+	for k, c := range s.clients {
+		if oldestKey == "" || c.IssuedAt.Before(oldestAt) {
+			oldestKey = k
+			oldestAt = c.IssuedAt
+		}
+	}
+	if oldestKey != "" {
+		log.Printf("oauth: clients map at cap (%d) — evicting oldest %s (registered %s)", maxClients, oldestKey, oldestAt.Format(time.RFC3339))
+		delete(s.clients, oldestKey)
+	}
 }
 
 // handleAuthorize handles BOTH the GET (show login form) and POST (process
@@ -395,9 +526,24 @@ func (s *Server) handleAuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := clientIP(r)
+	if ok, retry := s.throttle.check(ip); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retry.Round(time.Second).Seconds())))
+		// %q escapes any control bytes that an attacker-controlled
+		// X-Forwarded-For could otherwise inject into the log stream.
+		log.Printf("oauth: login blocked for %q (retry in %s)", ip, retry.Round(time.Second)) //nolint:gosec // G706: ip is %q-escaped to neutralize CRLF injection
+		http.Error(w, "too many failed login attempts — try again later", http.StatusTooManyRequests)
+		return
+	}
+
 	password := r.Form.Get("password")
 	username := r.Form.Get("username")
 	if !s.checkLogin(username, password) {
+		// Fixed delay on every failure caps raw brute-force throughput
+		// regardless of the per-IP counter (the counter handles bursts).
+		time.Sleep(loginFailureDelay)
+		s.throttle.recordFail(ip)
+		log.Printf("oauth: login failure for %q (client=%s)", ip, client.ClientID) //nolint:gosec // G706: ip is %q-escaped; client.ClientID is server-generated
 		// Re-render the form with an error. Do NOT redirect anywhere,
 		// and do NOT distinguish "wrong username" from "wrong password"
 		// in the message — a single "invalid credentials" stays opaque.
@@ -422,8 +568,10 @@ func (s *Server) handleAuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Login OK — mint an authorization code and 302 to the client's
-	// registered redirect_uri.
+	// Login OK — clear any prior failure counter for this IP so a user
+	// who fat-fingered then succeeded isn't penalized later, mint an
+	// authorization code, 302.
+	s.throttle.recordSuccess(ip)
 	code, err := randomToken(32)
 	if err != nil {
 		http.Error(w, "server_error: could not mint code", http.StatusInternalServerError)
@@ -449,6 +597,10 @@ func (s *Server) handleAuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		q.Set("state", p.State)
 	}
 	u.RawQuery = q.Encode()
+	// OAuth best practice: don't let intermediaries cache the
+	// code-bearing redirect.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 	http.Redirect(w, r, u.String(), http.StatusFound)
 }
 
@@ -552,21 +704,39 @@ func (s *Server) handleTokenAuthCode(w http.ResponseWriter, r *http.Request) {
 		"expires_in":   int(s.cfg.AccessTTL.Seconds()),
 		"scope":        ac.scope,
 	}
-	if strings.Contains(ac.scope, "offline_access") {
+	if scopeHas(ac.scope, scopeOfflineAccess) {
 		rt, err := randomToken(48)
-		if err == nil {
-			s.mu.Lock()
-			s.refresh[rt] = &refreshRecord{
-				clientID:  ac.clientID,
-				sub:       ac.sub,
-				scope:     ac.scope,
-				expiresAt: s.now().Add(s.cfg.RefreshTTL),
-			}
-			s.mu.Unlock()
-			resp["refresh_token"] = rt
+		if err != nil {
+			// Surface this rather than silently swallowing — if the
+			// client asked for offline_access and we said yes in the
+			// authorize step, returning 200 without a refresh_token
+			// is a contract break that's hard to debug on the client.
+			writeJSONError(w, http.StatusInternalServerError, "server_error", "could not mint refresh token")
+			return
 		}
+		s.mu.Lock()
+		s.refresh[rt] = &refreshRecord{
+			clientID:  ac.clientID,
+			sub:       ac.sub,
+			scope:     ac.scope,
+			expiresAt: s.now().Add(s.cfg.RefreshTTL),
+		}
+		s.mu.Unlock()
+		resp["refresh_token"] = rt
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// scopeHas reports whether the space-delimited `scope` string contains the
+// given token as an exact element. strings.Contains would match e.g.
+// `x_offline_access_y` which is not the same scope.
+func scopeHas(scope, want string) bool {
+	for _, s := range strings.Fields(scope) {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleTokenRefresh(w http.ResponseWriter, r *http.Request) {
@@ -632,17 +802,12 @@ func randomToken(nBytes int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-// constantTimeEqual compares two strings without leaking length difference
-// via early exit. The length-mismatch branch still bails immediately because
-// two strings of different lengths can't be equal — but we pad the compare to
-// the same number of byte operations to keep timing flat in the common case.
+// constantTimeEqual compares two strings in (close to) constant time using
+// crypto/subtle. Note: ConstantTimeCompare itself returns 0 on
+// length mismatch — that's a known small leak shared by the stdlib helper
+// and any naive constant-time compare. It is acceptable here because the
+// expected secret length is fixed by deployment config (env var), not by
+// an external attacker observation.
 func constantTimeEqual(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var diff byte
-	for i := range len(a) {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
