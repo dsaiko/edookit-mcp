@@ -271,7 +271,14 @@ func (s *Server) handleASMetadata(w http.ResponseWriter, _ *http.Request) {
 		"grant_types_supported":                 []string{grantAuthorizationCode, grantRefreshToken},
 		"code_challenge_methods_supported":      []string{pkceMethodS256},
 		"token_endpoint_auth_methods_supported": []string{"none"},
-		"scopes_supported":                      []string{"openid", scopeOfflineAccess, "mcp"},
+		// Only advertise scopes we actually understand. `openid` is a
+		// no-op acknowledged for OIDC compatibility; `offline_access`
+		// gates whether a refresh_token is issued (handleTokenAuthCode
+		// checks scope membership before returning one). The MCP
+		// endpoint itself is gated by Bearer JWT presence, not by a
+		// custom `mcp` scope, so we don't advertise one — that would
+		// promise an enforcement RequireBearer doesn't actually do.
+		"scopes_supported": []string{"openid", scopeOfflineAccess},
 	}
 	writeJSON(w, http.StatusOK, doc)
 }
@@ -281,7 +288,9 @@ func (s *Server) handleResourceMetadata(w http.ResponseWriter, _ *http.Request) 
 		"resource":                 s.cfg.Audience,
 		"authorization_servers":    []string{s.cfg.PublicURL},
 		"bearer_methods_supported": []string{"header"},
-		"scopes_supported":         []string{"mcp"},
+		// No custom scopes are required — Bearer JWT presence alone is
+		// what gates /mcp. We deliberately omit `scopes_supported`
+		// rather than advertise a scope name we don't enforce.
 	}
 	writeJSON(w, http.StatusOK, doc)
 }

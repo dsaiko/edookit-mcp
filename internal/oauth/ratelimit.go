@@ -103,20 +103,45 @@ func (t *loginThrottle) gc() {
 	}
 }
 
-// clientIP returns a stable per-source identifier for rate-limiting. We
-// trust X-Forwarded-For only because the prod deployment is fronted by a
-// known reverse proxy (Apache on localhost) — direct exposure would let an
-// attacker spoof this header and bypass throttling.
+// clientIP returns a stable per-source identifier for rate-limiting under
+// the deployment topology where this process sits behind a single reverse
+// proxy on the loopback interface (Apache on the same box).
+//
+// XFF spoofing was a real bug in the first cut: many proxies, Apache
+// included, *append* the real client IP to a client-supplied
+// X-Forwarded-For value, so the leftmost element is whatever the attacker
+// chose to send. Per-IP throttling that keys on a spoofable string is no
+// throttling at all.
+//
+// We now:
+//   - if the immediate connection is NOT loopback, trust RemoteAddr and
+//     ignore XFF entirely — nothing we'd believe is upstream.
+//   - if it IS loopback, take the *rightmost* XFF entry — the one our
+//     trusted reverse proxy just appended — and ignore everything to the
+//     left. An attacker can prepend whatever they like; they can't change
+//     what the proxy adds.
+//
+// A wrong/missing header keys on the proxy's own IP, which means heavy
+// abuse falls back to a single bucket instead of zero throttling — fine
+// for a single-user prototype, and the error mode is loud (legitimate
+// users notice immediately).
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.Index(xff, ","); i > 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
 	}
-	return host
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return host
+	}
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return host
+	}
+	// Use the rightmost element — that's the one our local reverse proxy
+	// added. Anything to the left of it is attacker-controlled.
+	if i := strings.LastIndex(xff, ","); i >= 0 {
+		return strings.TrimSpace(xff[i+1:])
+	}
+	return strings.TrimSpace(xff)
 }

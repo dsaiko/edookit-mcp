@@ -514,6 +514,69 @@ func TestLoginThrottleBlocksAfterNFailures(t *testing.T) {
 	}
 }
 
+// TestClientIPHonoursTrustedProxyOnly is the regression test for the XFF
+// spoof Codex flagged on the first cut: when the request comes from a
+// non-loopback peer (direct exposure), X-Forwarded-For must be ignored
+// entirely. When it does come from loopback (our Apache proxy), we must
+// pick the rightmost XFF entry — the one the proxy appended — never the
+// leftmost (which is whatever the client typed).
+func TestClientIPHonoursTrustedProxyOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		remoteAddr string
+		xff        string
+		want       string
+	}{
+		{
+			name:       "direct connection, XFF ignored",
+			remoteAddr: "203.0.113.99:50000",
+			xff:        "1.2.3.4",
+			want:       "203.0.113.99",
+		},
+		{
+			name:       "loopback, no XFF, falls back to peer",
+			remoteAddr: "127.0.0.1:50000",
+			xff:        "",
+			want:       "127.0.0.1",
+		},
+		{
+			name:       "loopback, single XFF entry",
+			remoteAddr: "127.0.0.1:50000",
+			xff:        "198.51.100.7",
+			want:       "198.51.100.7",
+		},
+		{
+			name:       "loopback, attacker spoofs leftmost",
+			remoteAddr: "127.0.0.1:50000",
+			xff:        "1.2.3.4, 198.51.100.7", // Apache appended 198.51.100.7
+			want:       "198.51.100.7",
+		},
+		{
+			name:       "loopback, attacker spoofs multiple",
+			remoteAddr: "127.0.0.1:50000",
+			xff:        "1.2.3.4, 5.6.7.8, 198.51.100.7",
+			want:       "198.51.100.7",
+		},
+		{
+			name:       "IPv6 loopback, rightmost wins",
+			remoteAddr: "[::1]:50000",
+			xff:        "evil, 198.51.100.7",
+			want:       "198.51.100.7",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", http.NoBody)
+			req.RemoteAddr = tc.remoteAddr
+			if tc.xff != "" {
+				req.Header.Set("X-Forwarded-For", tc.xff)
+			}
+			if got := clientIP(req); got != tc.want {
+				t.Errorf("clientIP = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestScopeHasExactMatch(t *testing.T) {
 	for _, tc := range []struct {
 		scope, want string

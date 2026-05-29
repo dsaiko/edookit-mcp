@@ -17,9 +17,15 @@ import (
 	"strings"
 )
 
-// jwtHeader is the fixed HS256 JWT header — emitted as-is, never parsed back.
-// Keeping it as a literal makes the hot path allocation-free.
+// jwtHeader is the fixed HS256 JWT header. We emit it as-is and never parse
+// it back, so its base64url-encoded form can be precomputed at package
+// init: every issueJWT call reuses the same string instead of re-encoding.
 const jwtHeader = `{"alg":"HS256","typ":"JWT"}`
+
+// jwtHeaderB64 is the precomputed RawURLEncoding of jwtHeader. Computed
+// once at package load so the hot path in issueJWT does not allocate for
+// the header on every token mint.
+var jwtHeaderB64 = base64.RawURLEncoding.EncodeToString([]byte(jwtHeader))
 
 // jwtClaims is the access-token payload. Fields are the standard registered
 // claims (RFC 7519) plus a free-form `scope` so the resource handler can see
@@ -55,9 +61,8 @@ func (s *Server) issueJWT(sub, scope string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal claims: %w", err)
 	}
-	headerB64 := base64.RawURLEncoding.EncodeToString([]byte(jwtHeader))
 	payloadB64 := base64.RawURLEncoding.EncodeToString(payload)
-	signing := headerB64 + "." + payloadB64
+	signing := jwtHeaderB64 + "." + payloadB64
 	mac := hmac.New(sha256.New, s.cfg.JWTSecret)
 	mac.Write([]byte(signing))
 	sigB64 := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
