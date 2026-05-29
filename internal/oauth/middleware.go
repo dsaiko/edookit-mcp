@@ -44,25 +44,24 @@ func (s *Server) RequireBearer(next http.Handler) http.Handler {
 	})
 }
 
-// parseBearer extracts a Bearer token from an Authorization header value in
-// a way that is forgiving about case (RFC 7235 says scheme tokens are
-// case-insensitive) and about runs of whitespace between the scheme and the
-// credentials (some HTTP clients normalise headers unhelpfully). Returns
+// parseBearer extracts a Bearer token from an Authorization header value
+// in a way that is forgiving about case (RFC 7235 says scheme tokens are
+// case-insensitive) and about whitespace (split on any LWS — SP / HTAB —
+// since some HTTP clients normalise headers unhelpfully). Returns
 // (token, true) on success; ("", false) on anything else.
+//
+// strings.Fields splits on any Unicode whitespace, which is a strict
+// superset of the LWS set we care about. A well-formed token has no
+// internal whitespace, so requiring exactly two fields gives us "scheme +
+// credentials" while still rejecting clearly malformed inputs like
+// "Bearer abc def" or a bare "Bearer".
 func parseBearer(authz string) (string, bool) {
-	if authz == "" {
-		return "", false
-	}
 	const scheme = "bearer"
-	prefix, rest, ok := strings.Cut(authz, " ")
-	if !ok || !strings.EqualFold(prefix, scheme) {
+	fields := strings.Fields(authz)
+	if len(fields) != 2 || !strings.EqualFold(fields[0], scheme) {
 		return "", false
 	}
-	tok := strings.TrimLeft(rest, " \t")
-	if tok == "" {
-		return "", false
-	}
-	return tok, true
+	return fields[1], true
 }
 
 func (s *Server) writeUnauthorized(w http.ResponseWriter, code, desc string) {

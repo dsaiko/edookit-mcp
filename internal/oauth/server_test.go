@@ -350,6 +350,9 @@ func TestParseBearerCaseInsensitive(t *testing.T) {
 		{"bearer abc", "abc", true},
 		{"BEARER abc", "abc", true},
 		{"bEaReR    abc", "abc", true},
+		{"Bearer\tabc", "abc", true},     // HTAB instead of SP
+		{"\tBearer\tabc\t", "abc", true}, // surrounding/internal LWS
+		{"Bearer abc def", "", false},    // token must have no internal whitespace
 		{"Basic abc", "", false},
 		{"abc", "", false},
 		{"", "", false},
@@ -391,6 +394,34 @@ func TestPathQualifiedResourceMetadataServed(t *testing.T) {
 		if doc["resource"] != "https://mcp.example/mcp" {
 			t.Errorf("%s: resource = %v", path, doc["resource"])
 		}
+	}
+}
+
+func TestValidateRedirectURI(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{"https any host", "https://chatgpt.com/cb", false},
+		{"https with port", "https://example.com:8443/cb", false},
+		{"http localhost", "http://localhost:8080/cb", false},
+		{"http 127.0.0.1", "http://127.0.0.1:8080/cb", false},
+		{"http 127.4.5.6", "http://127.4.5.6/cb", false}, // any 127/8
+		{"http IPv6 loopback", "http://[::1]:8080/cb", false},
+		{"http public host", "http://example.com/cb", true},
+		{"javascript scheme", "javascript:alert(1)", true},
+		{"data scheme", "data:text/html,abc", true},
+		{"file scheme", "file:///etc/passwd", true},
+		{"missing host", "https:///cb", true},
+		{"with fragment", "https://example.com/cb#x", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateRedirectURI(tc.raw)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("validateRedirectURI(%q) err=%v; wantErr=%v", tc.raw, err, tc.wantErr)
+			}
+		})
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -371,10 +372,16 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 // validateRedirectURI rejects anything that isn't an absolute http(s) URL
-// with a host and no fragment. We can't trust /authorize's later
-// "is-this-registered" check alone — if `javascript:` URIs survive
-// registration, the very registration call leaks an XSS sink into the
-// system; better to filter them at the door.
+// with a host and no fragment. Authorization codes leave our process via a
+// 302 to this URI, so the bar is set so that:
+//   - `javascript:` and other schemes can't survive registration (XSS
+//     sink that 302 would also walk into);
+//   - `http://` is only accepted for loopback hosts. A public AS that
+//     accepted `http://attacker.example/cb` would 302 codes over the
+//     plaintext network and any on-path observer could pick them up; we
+//     require `https://` for non-loopback callbacks. Loopback `http://`
+//     is kept because that's how native/CLI clients (and tests) register
+//     transient callback URLs on `127.0.0.1:PORT`.
 func validateRedirectURI(raw string) error {
 	if len(raw) > maxRedirectURILen {
 		return fmt.Errorf("redirect_uri too long (max %d)", maxRedirectURILen)
@@ -383,19 +390,35 @@ func validateRedirectURI(raw string) error {
 	if err != nil {
 		return fmt.Errorf("malformed redirect_uri %q: %w", raw, err)
 	}
-	switch u.Scheme {
-	case "http", "https":
-		// OK
-	default:
-		return fmt.Errorf("redirect_uri %q must use http or https", raw)
-	}
 	if u.Host == "" {
 		return fmt.Errorf("redirect_uri %q must have a host", raw)
 	}
 	if u.Fragment != "" {
 		return fmt.Errorf("redirect_uri %q must not have a fragment", raw)
 	}
+	switch u.Scheme {
+	case "https":
+		// OK on any host
+	case "http":
+		if !isLoopbackHost(u.Hostname()) {
+			return fmt.Errorf("redirect_uri %q: http is only allowed for loopback hosts (use https for %q)", raw, u.Hostname())
+		}
+	default:
+		return fmt.Errorf("redirect_uri %q must use https (or http on loopback)", raw)
+	}
 	return nil
+}
+
+// isLoopbackHost reports whether the URL host portion refers to the local
+// machine: the textual `localhost`, IPv4 127.0.0.0/8, or IPv6 ::1.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
 }
 
 // evictOldestClientLocked drops the client with the oldest IssuedAt. Must be
@@ -550,7 +573,9 @@ func (s *Server) handleAuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 	if !s.checkLogin(username, password) {
 		// Fixed delay on every failure caps raw brute-force throughput
 		// regardless of the per-IP counter (the counter handles bursts).
-		time.Sleep(loginFailureDelay)
+		// Reading from the throttle (instead of the package constant)
+		// keeps the value overridable for tests that need 0.
+		time.Sleep(s.throttle.failureDelay)
 		s.throttle.recordFail(ip)
 		log.Printf("oauth: login failure for %q (client=%s)", ip, client.ClientID) //nolint:gosec // G706: ip is %q-escaped; client.ClientID is server-generated
 		// Re-render the form with an error. Do NOT redirect anywhere,
