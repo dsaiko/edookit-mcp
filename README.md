@@ -191,7 +191,23 @@ Pro běžné použití přes lokální MCP host (Claude Desktop, Claude Code, Cu
 edookit-mcp --http 127.0.0.1:9000   # endpoint: http://127.0.0.1:9000/mcp
 ```
 
-Transport je MCP **Streamable HTTP** (`mcp-go/server.NewStreamableHTTPServer`), endpoint je vždy `/mcp`. Server sám **TLS ani autentizaci neřeší** — počítá se s tím, že před ním běží reverse-proxy s certifikátem a auth vrstvou (OAuth 2.1 pro ChatGPT konektory). `SIGINT`/`SIGTERM` ukončí server čistě (kompatibilní se `systemctl stop`). Idle MCP session se uklízejí po **1 hodině** (default; přenastav přes `EDOOKIT_HTTP_SESSION_IDLE_TTL`, např. `30m`).
+Transport je MCP **Streamable HTTP** (`mcp-go/server.NewStreamableHTTPServer`), endpoint je vždy `/mcp`. **TLS neřeší** — počítá se s reverse-proxy s certifikátem před serverem. **Autentizaci ale řeší sám**: vestavěná **OAuth 2.1 Authorization Server** s Dynamic Client Registration (RFC 7591), PKCE S256 a HMAC-SHA256 JWT tokeny — kompatibilní s ChatGPT custom MCP connector flow bez externí auth služby. `SIGINT`/`SIGTERM` ukončí server čistě (kompatibilní se `systemctl stop`). Idle MCP session se uklízejí po **1 hodině** (default; přenastav přes `EDOOKIT_HTTP_SESSION_IDLE_TTL`, např. `30m`).
+
+Pro HTTP transport musí být nastaveny tři **další env vars** (jinak se server odmítne nastartovat — záměrně, aby endpoint nikdy neskončil veřejně bez auth):
+
+| Proměnná | K čemu |
+|---|---|
+| `EDOOKIT_PUBLIC_URL` | Canonical https origin, např. `https://edookit.mcp.example`. Musí přesně sedět s tím, co serveruje reverse-proxy. Jde do `iss` a `aud` claimů JWT. |
+| `EDOOKIT_AUTH_PASSWORD` | Heslo, které zadáš do login formu při přidání connectoru. **Záměrně jiné** než `EDOOKIT_PASS` — leak jednoho nesmí kompromitovat druhé. |
+| `EDOOKIT_JWT_SECRET` | HS256 secret pro podepisování access tokenů, alespoň 32 bytů. Vygeneruj: `openssl rand -base64 48` |
+| `EDOOKIT_AUTH_USERNAME` *(volitelné)* | Pokud nastavené, login form očekává tento username; jinak akceptuje libovolný (heslo je rozhodující). |
+
+Vystavené endpointy nad rámec `/mcp`:
+- `GET /.well-known/oauth-authorization-server` — RFC 8414 metadata (klient si odsud vezme `authorization_endpoint`, `token_endpoint`, `registration_endpoint`).
+- `GET /.well-known/oauth-protected-resource` — RFC 9728 metadata (klient se sem vrátí po 401, aby si zjistil authorization servery).
+- `POST /oauth/register` — open DCR; každé volání založí nový OAuth client.
+- `GET /oauth/authorize` → login form; `POST /oauth/authorize` → ověří heslo a redirectne na `redirect_uri` s `code=`.
+- `POST /oauth/token` — `authorization_code` + `refresh_token` granty.
 
 #### Instalace na Linux server (RPM / DEB)
 
