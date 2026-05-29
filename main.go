@@ -23,6 +23,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/dsaiko/edookit-mcp/internal/client"
+	"github.com/dsaiko/edookit-mcp/internal/oauth"
 	"github.com/dsaiko/edookit-mcp/internal/tools"
 )
 
@@ -135,10 +136,11 @@ func main() {
 const defaultHTTPSessionIdleTTL = time.Hour
 
 // runHTTP serves the MCP server over the Streamable HTTP transport at addr
-// (endpoint `/mcp`). Intended for hosted/remote deployments — fronted by a TLS
-// reverse proxy (Apache/nginx/Caddy) plus an OAuth gateway, since this listener
-// does not implement auth itself. Shuts down gracefully on SIGINT/SIGTERM so a
-// systemd `systemctl stop` exits cleanly.
+// (endpoint `/mcp`). The same listener also serves the built-in OAuth 2.1
+// Authorization Server (`/oauth/*` + `/.well-known/*`) which gates `/mcp` with
+// Bearer JWT validation. Intended for hosted/remote deployments fronted by a
+// TLS reverse proxy (Apache/nginx/Caddy). Shuts down gracefully on
+// SIGINT/SIGTERM so a systemd `systemctl stop` exits cleanly.
 func runHTTP(s *server.MCPServer, addr string) {
 	idleTTL := defaultHTTPSessionIdleTTL
 	if raw := os.Getenv("EDOOKIT_HTTP_SESSION_IDLE_TTL"); raw != "" {
@@ -148,12 +150,27 @@ func runHTTP(s *server.MCPServer, addr string) {
 		}
 		idleTTL = d
 	}
-	httpSrv := server.NewStreamableHTTPServer(s, server.WithSessionIdleTTL(idleTTL))
-	log.Printf("edookit-mcp serving Streamable HTTP on %s/mcp (session idle TTL %s)", addr, idleTTL) //nolint:gosec // G706: addr is the operator's own --http flag / env, logged to operator output
+	mcpHandler := server.NewStreamableHTTPServer(s, server.WithSessionIdleTTL(idleTTL))
+
+	authSrv, err := buildAuthServer()
+	if err != nil {
+		log.Fatalf("oauth: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	authSrv.RegisterRoutes(mux)
+	mux.Handle("/mcp", authSrv.RequireBearer(mcpHandler))
+
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 15 * time.Second,
+	}
+	log.Printf("edookit-mcp serving Streamable HTTP on %s/mcp (session idle TTL %s, OAuth gated)", addr, idleTTL) //nolint:gosec // G706: addr is the operator's own --http flag / env, logged to operator output
 
 	errCh := make(chan error, 1)
 	go func() {
-		err := httpSrv.Start(addr)
+		err := httpSrv.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
@@ -176,6 +193,26 @@ func runHTTP(s *server.MCPServer, addr string) {
 			log.Printf("http shutdown: %v", err)
 		}
 	}
+}
+
+// buildAuthServer assembles the OAuth Authorization Server from env vars. All
+// secrets are required (the server refuses to come up half-configured): a
+// missing EDOOKIT_AUTH_PASSWORD is what stops the endpoint from being open.
+func buildAuthServer() (*oauth.Server, error) {
+	publicURL := getenvRequired("EDOOKIT_PUBLIC_URL")
+	publicURL = strings.TrimRight(publicURL, "/")
+	loginPassword := getenvRequired("EDOOKIT_AUTH_PASSWORD")
+	secretRaw := getenvRequired("EDOOKIT_JWT_SECRET")
+	if len(secretRaw) < 32 {
+		return nil, fmt.Errorf("EDOOKIT_JWT_SECRET must be at least 32 bytes (got %d)", len(secretRaw))
+	}
+	return oauth.New(oauth.Config{
+		PublicURL:     publicURL,
+		Audience:      publicURL + "/mcp",
+		LoginUsername: os.Getenv("EDOOKIT_AUTH_USERNAME"), // optional
+		LoginPassword: loginPassword,
+		JWTSecret:     []byte(secretRaw),
+	})
 }
 
 func registerInboxTool(s *server.MCPServer, cli *client.Client) {

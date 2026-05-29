@@ -1,0 +1,335 @@
+package oauth
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+)
+
+// newTestServer wires up an in-memory Server with safe-but-tiny TTLs and a
+// fixed clock so expiry tests are deterministic. Returns the server and a
+// clock pointer the caller can advance.
+func newTestServer(t *testing.T) (*Server, *time.Time) {
+	t.Helper()
+	now := time.Date(2026, 5, 29, 10, 0, 0, 0, time.UTC)
+	clock := &now
+	s, err := New(Config{
+		PublicURL:     "https://mcp.example",
+		Audience:      "https://mcp.example/mcp",
+		LoginUsername: "alice",
+		LoginPassword: "hunter2",
+		// 32 zero bytes is fine for tests; production validates min length.
+		JWTSecret:  make([]byte, 32),
+		AccessTTL:  time.Hour,
+		RefreshTTL: 24 * time.Hour,
+		CodeTTL:    time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s.clock = func() time.Time { return *clock }
+	return s, clock
+}
+
+func TestJWTRoundTrip(t *testing.T) {
+	s, _ := newTestServer(t)
+	tok, err := s.issueJWT("alice", "mcp openid")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	sub, err := s.verifyJWT(tok)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if sub != "alice" {
+		t.Errorf("sub: want alice, got %q", sub)
+	}
+}
+
+func TestJWTRejectsTamperedSignature(t *testing.T) {
+	s, _ := newTestServer(t)
+	tok, _ := s.issueJWT("alice", "")
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		t.Fatalf("tok shape: %q", tok)
+	}
+	// Flip a byte in the signature.
+	bad := parts[0] + "." + parts[1] + "." + parts[2][:len(parts[2])-1] + "A"
+	if _, err := s.verifyJWT(bad); err == nil {
+		t.Fatal("expected bad-signature error")
+	}
+}
+
+func TestJWTRejectsWrongAudience(t *testing.T) {
+	s, _ := newTestServer(t)
+	// Swap the audience by directly minting via a second server with the
+	// same secret but a different audience. The first server should reject.
+	other, _ := New(Config{
+		PublicURL:     s.cfg.PublicURL,
+		Audience:      "https://other.example/mcp",
+		LoginPassword: "x",
+		JWTSecret:     s.cfg.JWTSecret,
+		LoginUsername: "alice",
+	})
+	other.clock = s.clock
+	tok, _ := other.issueJWT("alice", "")
+	if _, err := s.verifyJWT(tok); err == nil {
+		t.Fatal("expected audience mismatch")
+	}
+}
+
+func TestJWTRejectsExpired(t *testing.T) {
+	s, clock := newTestServer(t)
+	tok, _ := s.issueJWT("alice", "")
+	*clock = clock.Add(2 * time.Hour) // beyond AccessTTL
+	if _, err := s.verifyJWT(tok); err == nil {
+		t.Fatal("expected expired error")
+	}
+}
+
+func TestPKCEVerify(t *testing.T) {
+	verifier := "the-quick-brown-fox-jumps-over-the-lazy-dog-12345"
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	if err := pkceVerify(verifier, challenge, "S256"); err != nil {
+		t.Errorf("expected match, got %v", err)
+	}
+	if err := pkceVerify("other-verifier", challenge, "S256"); err == nil {
+		t.Error("expected mismatch")
+	}
+	if err := pkceVerify(verifier, challenge, "plain"); err == nil {
+		t.Error("plain method must be rejected")
+	}
+}
+
+// noRedirectClient builds an http.Client that returns 3xx responses as-is so
+// the test can inspect the redirect Location instead of following it.
+func noRedirectClient() *http.Client {
+	return &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// doJSON is a context-aware POST application/json helper. It centralizes the
+// req-construction boilerplate so the test bodies stay focused on what
+// they're actually asserting.
+func doJSON(t *testing.T, cli *http.Client, urlStr, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, urlStr, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := cli.Do(req)
+	if err != nil {
+		t.Fatalf("post %s: %v", urlStr, err)
+	}
+	return resp
+}
+
+// doForm is a context-aware POST application/x-www-form-urlencoded helper.
+func doForm(t *testing.T, cli *http.Client, urlStr string, form url.Values) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, urlStr, strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := cli.Do(req)
+	if err != nil {
+		t.Fatalf("post-form %s: %v", urlStr, err)
+	}
+	return resp
+}
+
+// doGet is a context-aware GET helper.
+func doGet(t *testing.T, cli *http.Client, urlStr string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, urlStr, http.NoBody)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		t.Fatalf("get %s: %v", urlStr, err)
+	}
+	return resp
+}
+
+// TestFullFlow drives a complete DCR → /authorize → /token round trip via
+// httptest and asserts the access token returned is good for /mcp.
+func TestFullFlow(t *testing.T) {
+	s, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	s.RegisterRoutes(mux)
+	// Mount a tiny "MCP" handler behind the bearer middleware so we can
+	// confirm the token actually works end-to-end.
+	mux.Handle("/mcp", s.RequireBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok subject="+Subject(r.Context()))
+	})))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cli := noRedirectClient()
+
+	// 1. DCR — register a client with a unique redirect_uri.
+	regBody := `{"client_name":"test","redirect_uris":["` + srv.URL + `/callback"]}`
+	resp := doJSON(t, cli, srv.URL+"/oauth/register", regBody)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("register status %d: %s", resp.StatusCode, body)
+	}
+	var reg ClientRegistration
+	_ = json.NewDecoder(resp.Body).Decode(&reg)
+	if !strings.HasPrefix(reg.ClientID, "mcp_") {
+		t.Fatalf("client_id shape: %q", reg.ClientID)
+	}
+
+	// 2. PKCE — pick a verifier, compute challenge.
+	verifier := "test-verifier-test-verifier-test-verifier-test"
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	// 3. POST /oauth/authorize with credentials + PKCE params.
+	form := url.Values{}
+	form.Set("response_type", "code")
+	form.Set("client_id", reg.ClientID)
+	form.Set("redirect_uri", srv.URL+"/callback")
+	form.Set("scope", "openid offline_access mcp")
+	form.Set("state", "xyz")
+	form.Set("code_challenge", challenge)
+	form.Set("code_challenge_method", "S256")
+	form.Set("username", "alice")
+	form.Set("password", "hunter2")
+	resp2 := doForm(t, cli, srv.URL+"/oauth/authorize", form)
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusFound {
+		body, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("authorize status %d: %s", resp2.StatusCode, body)
+	}
+	loc, err := resp2.Location()
+	if err != nil {
+		t.Fatalf("authorize no Location: %v", err)
+	}
+	if loc.Query().Get("state") != "xyz" {
+		t.Errorf("state lost: %v", loc)
+	}
+	code := loc.Query().Get("code")
+	if code == "" {
+		t.Fatalf("no code in redirect: %v", loc)
+	}
+
+	// 4. POST /oauth/token to exchange code for JWT.
+	tokForm := url.Values{}
+	tokForm.Set("grant_type", "authorization_code")
+	tokForm.Set("code", code)
+	tokForm.Set("redirect_uri", srv.URL+"/callback")
+	tokForm.Set("client_id", reg.ClientID)
+	tokForm.Set("code_verifier", verifier)
+	resp3 := doForm(t, cli, srv.URL+"/oauth/token", tokForm)
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp3.Body)
+		t.Fatalf("token status %d: %s", resp3.StatusCode, body)
+	}
+	var tokResp struct {
+		AccessToken  string `json:"access_token"`
+		TokenType    string `json:"token_type"`
+		ExpiresIn    int    `json:"expires_in"`
+		RefreshToken string `json:"refresh_token"`
+		Scope        string `json:"scope"`
+	}
+	_ = json.NewDecoder(resp3.Body).Decode(&tokResp)
+	if tokResp.TokenType != "Bearer" {
+		t.Errorf("token_type: %q", tokResp.TokenType)
+	}
+	if tokResp.AccessToken == "" {
+		t.Fatal("no access_token")
+	}
+	if tokResp.RefreshToken == "" {
+		t.Error("expected refresh_token because offline_access was in scope")
+	}
+
+	// 5. Hit /mcp with the token — should get 200 and Subject.
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/mcp", http.NoBody)
+	if err != nil {
+		t.Fatalf("build mcp request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tokResp.AccessToken)
+	resp4, err := cli.Do(req)
+	if err != nil {
+		t.Fatalf("mcp call: %v", err)
+	}
+	defer resp4.Body.Close()
+	body, _ := io.ReadAll(resp4.Body)
+	if resp4.StatusCode != http.StatusOK {
+		t.Fatalf("mcp status %d: %s", resp4.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "subject=alice") {
+		t.Errorf("body did not carry subject: %s", body)
+	}
+}
+
+// TestAuthorizeRejectsBadRedirect ensures we never 302 to an attacker-supplied
+// redirect_uri that wasn't registered.
+func TestAuthorizeRejectsBadRedirect(t *testing.T) {
+	s, _ := newTestServer(t)
+	mux := http.NewServeMux()
+	s.RegisterRoutes(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cli := noRedirectClient()
+
+	// Register a client with one URL.
+	regBody := `{"client_name":"x","redirect_uris":["https://good.example/cb"]}`
+	resp := doJSON(t, cli, srv.URL+"/oauth/register", regBody)
+	defer resp.Body.Close()
+	var reg ClientRegistration
+	if err := json.NewDecoder(resp.Body).Decode(&reg); err != nil {
+		t.Fatalf("decode reg: %v", err)
+	}
+
+	// Now hit /authorize with a DIFFERENT redirect_uri. Must NOT 302 anywhere.
+	q := url.Values{}
+	q.Set("response_type", "code")
+	q.Set("client_id", reg.ClientID)
+	q.Set("redirect_uri", "https://evil.example/cb")
+	q.Set("code_challenge", "x")
+	q.Set("code_challenge_method", "S256")
+	r2 := doGet(t, cli, srv.URL+"/oauth/authorize?"+q.Encode())
+	defer r2.Body.Close()
+	if r2.StatusCode == http.StatusFound {
+		t.Fatalf("must NOT redirect to attacker's URL; got 302 -> %s", r2.Header.Get("Location"))
+	}
+	if r2.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: want 400, got %d", r2.StatusCode)
+	}
+}
+
+func TestBearerMissing(t *testing.T) {
+	s, _ := newTestServer(t)
+	h := s.RequireBearer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", http.NoBody)
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("want 401, got %d", rr.Code)
+	}
+	auth := rr.Header().Get("WWW-Authenticate")
+	if !strings.Contains(auth, "resource_metadata=") {
+		t.Errorf("WWW-Authenticate missing resource_metadata: %q", auth)
+	}
+}
