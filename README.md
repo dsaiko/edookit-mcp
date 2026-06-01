@@ -141,7 +141,7 @@ jsou připravené DEB/RPM balíčky se systemd unitou (viz [Distribution](#distr
 |---|---|
 | `edookit_list_inbox` | Vypíše **Přijaté** (volitelně Nepřečtené/S hvězdičkou/Archiv/Vše). Fulltext + filtr podle data. |
 | `edookit_list_sent` | Vypíše **Vytvořené** (odeslané). Stejné filtry. |
-| `edookit_get_message` | Plný text jedné zprávy podle ID — subject, status, autor, datum, body_text, body_html, přílohy, doručenky. |
+| `edookit_get_message` | Plný text jedné zprávy podle ID — subject, status, autor, datum, body_text, body_html, přílohy, doručenky. **Vedlejší efekt:** stažení zprávy ji v Edookitu **označí jako přečtenou** (jako otevření v UI) — slouží i jako „označit jako přečtené". |
 | `edookit_download_attachments` | Stáhne všechny přílohy do lokálního adresáře. Default `<temp>/edookit-mcp/m-<id>/`. |
 | `edookit_view_attachment` | Zobrazí přílohu inline — obrázky, **PDF vyrenderuje na obrázky stránek** + extrahovaný text, text/CSV jako obsah. |
 | `edookit_list_courses` | Kurzy přihlášeného učitele (Hodnocení → Známkování v tabulce), volitelně se žáky. |
