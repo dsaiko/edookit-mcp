@@ -39,7 +39,7 @@ souvislým textem.
 1. **macOS / Linux / Windows** s nainstalovaným Chromem (Chromium, Brave, Edge — cokoli na Chromium jádře).
 2. **Účet v Edookitu** přihlašovaný přes Plus4U.
 3. **AI klient s podporou MCP** (Claude Desktop/Code, ChatGPT, Cursor, VS Code Copilot, Zed, Continue.dev…).
-4. **Rust 1.26+ (edition 2024)** pro sestavení ze zdrojáků.
+4. **Rust 1.88+ (edition 2024)** pro sestavení ze zdrojáků.
 
 ### Instalace
 
@@ -267,7 +267,7 @@ jar atomically (clearing path-scoped cookies a name-based clear would miss).
 
 ```bash
 make build        # fetch PDFium + build
-make test         # 90 tests, race-free
+make test         # 93 tests, race-free
 make check        # fmt + clippy-fix + test (mutates)
 make pre-push     # fmt-check + clippy -D + test + audit + build (the gate)
 make tools        # install cargo-audit (once)
@@ -277,7 +277,7 @@ make smoke-message MSG=m-NNNNNN   # (dev) dump raw message-edit JSON
 
 ### Testing
 
-**90 tests.** White-box `#[cfg(test)]` modules per file (mirroring Go's in-package tests):
+**93 tests.** White-box `#[cfg(test)]` modules per file (mirroring Go's in-package tests):
 HTML/date parsers against captured samples, an `httptest`-equivalent via
 [`wiremock`](https://docs.rs/wiremock) for the client + download flows, an
 injected clock for the OAuth AS, and a full DCR→authorize→token→refresh→replay
@@ -285,18 +285,52 @@ flow via `tower::oneshot`. The PDFium render path is exercised against a synthet
 PDF. The chromiumoxide login is not unit-tested (same as the Go original) — run
 `make smoke-login` against a live account.
 
+### Security notes (accepted residual risks)
+
+The threat model assumes the **operator trusts whoever drives the MCP client** —
+this is a personal connector to your own school account, not a multi-tenant
+service. Two design choices carry residual risk that is accepted deliberately and
+documented here rather than engineered away:
+
+- **Attachment download path is not sandboxed.** `edookit_download_attachments`
+  writes to the caller-supplied `destination_dir` (with `~` expansion), faithful
+  to the Go tool — there is no base directory confining where files land.
+  Mitigations in place: each attachment filename is reduced to a single path
+  component with `..`/traversal, absolute paths, and Windows volume-roots and
+  reserved names rejected (so a hostile *filename* from Edookit can't escape the
+  chosen dir), downloads stream to a `0600` temp file and commit atomically
+  (no-clobber by default), each file is capped at 512 MiB, and all tool arguments
+  arrive wrapped in the untrusted-data envelope so the model treats them as data.
+  Residual risk: a caller can still choose *any* writable directory as the
+  destination. Confine it with OS permissions (the systemd unit runs as an
+  unprivileged `edookit-mcp` user) if that matters for your deployment.
+- **PDFium runs in-process (no WASM sandbox).** PDF rasterization links the
+  native PDFium dylib into the process, unlike the Go build's WASM (wazero)
+  sandbox. A memory-safety bug in PDFium parsing a malicious PDF would therefore
+  execute in the server's address space rather than a sandbox. Mitigations: the
+  library is pinned + SHA-256-verified at fetch, input is your own school
+  attachments (not arbitrary internet PDFs), and rendering is bounded (page count
+  + pixel dimensions) on a dedicated blocking thread under a mutex. The
+  WASM-sandbox property is the one place Go's stack is genuinely safer; see the
+  comparison section. Accepted for the native-render performance and simplicity.
+
 ### Distribution and packaging
 
 `release.yml` builds for darwin/linux/windows × amd64/arm64 on a `v*` tag
 (tar.gz/zip per platform), and on Linux produces DEB + RPM (via `cargo-deb` /
 `cargo-generate-rpm` — metadata in `Cargo.toml`) bundling the binary, the
 matching PDFium library, the systemd unit, and the env conffile, declaring
-`chromium` as a dependency. It also emits a `checksums.txt` and — when the
-`HOMEBREW_TAP_GITHUB_TOKEN` secret is set — pushes a Homebrew formula to
-`dsaiko/homebrew-tap` (skipped otherwise, exactly like GoReleaser's
-`--skip=homebrew`). *(The packaging workflow is provided for GoReleaser parity
-but hasn't been executed yet — the first tag is its shakedown; RPM scriptlets for
-system-user creation are a flagged TODO.)*
+`chromium` as a dependency. Both packages carry maintainer scriptlets that
+create the `edookit-mcp` system user and reload systemd (the DEB via
+`packaging/deb/*`, the RPM via `generate-rpm` scriptlets in `Cargo.toml`). It
+also emits a `checksums.txt` and — when the `HOMEBREW_TAP_GITHUB_TOKEN` secret is
+set — pushes a Homebrew formula to `dsaiko/homebrew-tap` (skipped otherwise,
+exactly like GoReleaser's `--skip=homebrew`). The bundled PDFium is pinned to a
+specific `bblanchon/pdfium-binaries` release and verified against a checked-in
+SHA-256 before use (`scripts/fetch-pdfium.sh`), so a tampered binary fails the
+build instead of being loaded. *(The packaging workflow is provided for
+GoReleaser parity but hasn't been executed against a real tag yet — the first tag
+is its shakedown.)*
 
 ### License
 
@@ -375,8 +409,13 @@ meaningful differentiator. At rest Rust is marginally leaner (no GC, rustls).
   cookie calls to one generation, so that narrow fence is a **documented
   simplification** here (the important behavior — atomic invalidation — is kept).
 - **PDFium.** Go's `go-pdfium` ships PDFium as WASM (wazero) → a no-cgo single
-  binary for free. Rust has no turnkey equivalent, so the port links a native
-  dylib (fetched by `make build`, shipped alongside in packaging).
+  binary for free, *and* runs the C++ parser inside a memory-safe sandbox. Rust
+  has no turnkey equivalent, so the port links a native dylib (fetched by
+  `make build`, pinned + checksum-verified, shipped alongside in packaging) that
+  runs in-process. That costs the second binary *and* the sandbox: a PDFium
+  memory-safety bug is in the process here, not contained — the one place Go's
+  stack is genuinely safer (see *Security notes* above for the mitigations and
+  why it's accepted).
 
 ### Roughly a wash
 

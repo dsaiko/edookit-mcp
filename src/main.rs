@@ -1,7 +1,3 @@
-// TODO(cleanup): tighten these crate-level allowances in the packaging phase
-// once every module + transport is wired and the dead paths are pruned.
-#![allow(dead_code, unused_imports)]
-
 mod client;
 mod http;
 mod oauth;
@@ -10,7 +6,6 @@ mod tools;
 
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{anyhow, bail};
 use clap::Parser;

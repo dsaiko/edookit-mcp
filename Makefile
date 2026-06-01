@@ -10,11 +10,10 @@ PDFIUM_DIR := third_party/pdfium
 
 .PHONY: build run install clean
 
-build: pdfium ## Build the binary into target/ (fetches the bundled PDFium first)
-	cargo build
-
-release: pdfium ## Build an optimized release binary
+build: pdfium ## Build the optimized binary into target/release/ (fetches the bundled PDFium first)
 	cargo build --release
+
+release: build ## Alias for `build` (optimized release binary in target/release/)
 
 run: pdfium ## Run the MCP server locally with .env loaded (expects MCP framing on stdin)
 	@if [ ! -f .env ]; then echo "missing .env — copy .env.example and fill in credentials"; exit 1; fi

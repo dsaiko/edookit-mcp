@@ -13,18 +13,9 @@ use serde_json::json;
 
 use super::server::Server;
 
-/// The authenticated subject, injected into request extensions by
-/// [`require_bearer`] so downstream handlers can read it.
-#[derive(Clone, Debug)]
-pub struct Subject(pub String);
-
 /// Rejects requests without a valid Bearer JWT with 401 + a WWW-Authenticate
 /// header pointing at the protected-resource metadata (RFC 9728 discovery).
-pub async fn require_bearer(
-    State(srv): State<Arc<Server>>,
-    mut req: Request,
-    next: Next,
-) -> Response {
+pub async fn require_bearer(State(srv): State<Arc<Server>>, req: Request, next: Next) -> Response {
     let authz = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -46,7 +37,6 @@ pub async fn require_bearer(
         )
             .into_response();
     }
-    req.extensions_mut().insert(Subject(sub));
     next.run(req).await
 }
 

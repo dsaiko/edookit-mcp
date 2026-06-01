@@ -276,7 +276,9 @@ impl EdookitServer {
     }
 }
 
-#[tool_handler]
+// Dispatch through the pre-built `tool_router` field (constructed once in
+// `new`) rather than the macro's default of rebuilding it on every call.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for EdookitServer {
     fn get_info(&self) -> ServerInfo {
         // ServerInfo / Implementation are #[non_exhaustive] — build from Default
