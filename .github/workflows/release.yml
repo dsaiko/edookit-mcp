@@ -12,8 +12,11 @@ on:
   push:
     tags: ["v*"]
 
+# Least privilege: read by default; only the job that publishes the GitHub
+# Release is granted contents: write. The Homebrew job pushes to a separate
+# repo with its own token (HOMEBREW_TAP_GITHUB_TOKEN), not GITHUB_TOKEN.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # Same gate as ci before any artifact is produced.
@@ -72,15 +75,28 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          ./scripts/fetch-pdfium.sh || true
+          # Pinned + checksum-verified fetch; a failure must fail the release,
+          # not ship a binary without its PDFium dependency.
+          ./scripts/fetch-pdfium.sh
           ver="${GITHUB_REF_NAME#v}"
           stage="edookit-mcp_${ver}_${{ matrix.name }}"
           mkdir -p "$stage" out
           bin=edookit-mcp; [ "${{ runner.os }}" = "Windows" ] && bin=edookit-mcp.exe
           cp "target/release/$bin" "$stage/"
           cp README.md LICENSE .env.example "$stage/" 2>/dev/null || true
-          # Bundle the matching PDFium library next to the binary.
-          find third_party/pdfium -name 'libpdfium.*' -o -name 'pdfium.dll' | head -1 | xargs -I{} cp {} "$stage/" || true
+          # Bundle the matching PDFium library next to the binary. fetch-pdfium
+          # normalizes every platform to third_party/pdfium/lib/; fail loudly if
+          # it is absent rather than shipping an unrenderable build.
+          case "${{ runner.os }}" in
+            macOS)   lib=third_party/pdfium/lib/libpdfium.dylib ;;
+            Linux)   lib=third_party/pdfium/lib/libpdfium.so ;;
+            Windows) lib=third_party/pdfium/lib/pdfium.dll ;;
+          esac
+          if [ ! -f "$lib" ]; then
+            echo "Package: PDFium library '$lib' missing after fetch — aborting." >&2
+            exit 1
+          fi
+          cp "$lib" "$stage/"
           # Archive the staged CONTENTS (no top-level dir) so Homebrew extracts cleanly.
           if [ "${{ runner.os }}" = "Windows" ]; then
             (cd "$stage" && 7z a "../out/${stage}.zip" ./* >/dev/null)
@@ -101,6 +117,9 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    # Only this job needs write access — it creates/updates the GitHub Release.
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with: { path: artifacts }

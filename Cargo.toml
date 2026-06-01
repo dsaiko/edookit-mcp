@@ -2,6 +2,9 @@
 name = "edookit-mcp"
 version = "0.1.0"
 edition = "2024"
+# MSRV: edition 2024 needs 1.85, but the code uses stable let-chains
+# (`if let … && let …`), which landed in 1.88.
+rust-version = "1.88"
 license = "MIT"
 description = "Unofficial MCP connector for Edookit (Czech school information system) — Rust port"
 repository = "https://github.com/dsaiko/edookit-mcp-rs"
@@ -80,8 +83,57 @@ assets = [
     { source = "packaging/edookit-mcp.service", dest = "/usr/lib/systemd/system/edookit-mcp.service", mode = "644" },
     { source = "packaging/edookit-mcp.env.example", dest = "/etc/edookit-mcp/edookit-mcp.env", mode = "640", config = true },
 ]
-# NOTE: RPM scriptlets (system-user creation, daemon-reload) use a different arg
-# convention than the deb maintainer scripts; wire them via post_install_script
-# etc. before the first RPM release. EPEL provides `chromium` on RHEL/Rocky.
+# RPM scriptlets mirror the deb maintainer scripts, but RPM passes an install
+# count in $1 rather than dpkg's "configure"/"remove" verbs: %pre/%post see the
+# post-op count (1 = fresh install, >=2 = upgrade) and %preun/%postun see the
+# remaining count (0 = final erase). EPEL provides `chromium` on RHEL/Rocky.
+#
+# %pre — create the system user/group before files land (for ownership + the
+# systemd unit's User=). Runs on install and upgrade; idempotent.
+pre_install_script = '''
+if ! getent group edookit-mcp >/dev/null 2>&1; then
+    groupadd --system edookit-mcp
+fi
+if ! getent passwd edookit-mcp >/dev/null 2>&1; then
+    useradd --system --gid edookit-mcp --no-create-home \
+        --home-dir /var/lib/edookit-mcp --shell /sbin/nologin \
+        --comment "edookit-mcp service" edookit-mcp
+fi
+'''
+# %post — reload units, then on upgrade restart only if the OAuth env vars are
+# present (else the binary refuses to start and would loop); on fresh install
+# print the setup hint.
+post_install_script = '''
+systemctl daemon-reload >/dev/null 2>&1 || true
+if [ "$1" -ge 2 ]; then
+    ENV=/etc/edookit-mcp/edookit-mcp.env
+    if ( set +u; . "$ENV" 2>/dev/null; [ -n "$EDOOKIT_PUBLIC_URL" ] && [ -n "$EDOOKIT_AUTH_PASSWORD" ] && [ -n "$EDOOKIT_JWT_SECRET" ] ); then
+        systemctl try-restart edookit-mcp.service >/dev/null 2>&1 || true
+    else
+        echo "edookit-mcp: NOT restarting — set EDOOKIT_PUBLIC_URL / EDOOKIT_AUTH_PASSWORD / EDOOKIT_JWT_SECRET in $ENV, then: sudo systemctl restart edookit-mcp" >&2
+    fi
+fi
+if [ "$1" -eq 1 ]; then
+    cat <<'EOF'
+edookit-mcp installed. Next:
+  1) Generate a JWT secret:  openssl rand -base64 48
+  2) sudo $EDITOR /etc/edookit-mcp/edookit-mcp.env   (EDOOKIT_URL/USER/PASS + the three OAuth vars)
+  3) sudo systemctl enable --now edookit-mcp
+Listens on 127.0.0.1:9000/mcp behind the built-in OAuth AS — put a TLS reverse proxy in front.
+EOF
+fi
+'''
+# %preun — on final erase ($1 == 0) stop/disable; on upgrade ($1 >= 1) leave running.
+pre_uninstall_script = '''
+if [ "$1" -eq 0 ]; then
+    systemctl --no-reload disable --now edookit-mcp.service >/dev/null 2>&1 || true
+fi
+'''
+# %postun — reload units. The user, env file, and state dirs are kept so a
+# reinstall preserves config (parity with the deb postrm).
+post_uninstall_script = '''
+systemctl daemon-reload >/dev/null 2>&1 || true
+'''
+
 [package.metadata.generate-rpm.requires]
 chromium = "*"
