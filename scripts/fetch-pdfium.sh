@@ -32,6 +32,16 @@ case "$arch" in
     *) echo "fetch-pdfium: unsupported arch '$arch'" >&2; exit 1 ;;
 esac
 
+# Cross-builds (e.g. an x86_64 macOS binary built on an Apple-Silicon runner)
+# need the PDFium for the TARGET arch, not the host's. Override with
+# PDFIUM_ARCH=x64|arm64.
+if [ -n "${PDFIUM_ARCH:-}" ]; then
+    case "$PDFIUM_ARCH" in
+        arm64|x64) a="$PDFIUM_ARCH" ;;
+        *) echo "fetch-pdfium: invalid PDFIUM_ARCH '$PDFIUM_ARCH' (want arm64 or x64)" >&2; exit 1 ;;
+    esac
+fi
+
 # Canonical install location the runtime resolver checks (third_party/pdfium/lib).
 # Windows ships the DLL in bin/, so we normalize it into lib/ after extraction.
 case "$plat" in

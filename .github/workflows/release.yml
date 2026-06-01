@@ -23,9 +23,9 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-        with: { components: rustfmt, clippy }
+        with: { components: "rustfmt, clippy" }
       - uses: Swatinem/rust-cache@v2
       - run: ./scripts/fetch-pdfium.sh
       - run: cargo fmt --check
@@ -42,17 +42,23 @@ jobs:
         include:
           - { os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,  name: Linux_x86_64 }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: Linux_arm64 }
-          - { os: macos-13,        target: x86_64-apple-darwin,        name: Darwin_x86_64 }
           - { os: macos-14,        target: aarch64-apple-darwin,       name: Darwin_arm64 }
+          # Intel macOS: GitHub is retiring the Intel (macos-13) runners, so
+          # cross-compile x86_64 on the Apple-Silicon runner instead and bundle
+          # the matching x64 PDFium (PDFIUM_ARCH in the Package step).
+          - { os: macos-14,        target: x86_64-apple-darwin,        name: Darwin_x86_64, cross: true }
           - { os: windows-latest,  target: x86_64-pc-windows-msvc,     name: Windows_x86_64 }
           - { os: windows-11-arm,  target: aarch64-pc-windows-msvc,    name: Windows_arm64 }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # Native runner per arch (incl. GitHub's free ubuntu-*-arm for public
-      # repos) → build for the host target; binary lands in target/release/
-      # where the cargo-deb/rpm assets in Cargo.toml expect it.
+      # repos): native builds land in target/release/ where the cargo-deb/rpm
+      # assets in Cargo.toml expect them. The one cross job (Intel macOS on the
+      # Apple-Silicon runner) builds with --target, so its binary lands under
+      # target/<triple>/release/ — handled in the Package step.
       - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
@@ -60,7 +66,12 @@ jobs:
         env:
           EDOOKIT_VERSION: ${{ github.ref_name }}
           EDOOKIT_BUILD_DATE: ${{ github.event.head_commit.timestamp }}
-        run: cargo build --release --locked
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cargo build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked
+          fi
 
       # Linux only: DEB + RPM (systemd unit, conffile, chromium dep, bundled
       # PDFium). fetch-pdfium drops the .so the packages bundle.
@@ -75,14 +86,25 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          # Pinned + checksum-verified fetch; a failure must fail the release,
-          # not ship a binary without its PDFium dependency.
+          # Bundle the PDFium matching the TARGET arch (a cross-build needs the
+          # target's lib, not the host's). Pinned + checksum-verified; a failure
+          # must fail the release, not ship a binary without its dependency.
+          case "${{ matrix.target }}" in
+            x86_64-*)  export PDFIUM_ARCH=x64 ;;
+            aarch64-*) export PDFIUM_ARCH=arm64 ;;
+          esac
           ./scripts/fetch-pdfium.sh
           ver="${GITHUB_REF_NAME#v}"
           stage="edookit-mcp_${ver}_${{ matrix.name }}"
           mkdir -p "$stage" out
           bin=edookit-mcp; [ "${{ runner.os }}" = "Windows" ] && bin=edookit-mcp.exe
-          cp "target/release/$bin" "$stage/"
+          # Cross-built binaries land under target/<triple>/release/.
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            bindir="target/${{ matrix.target }}/release"
+          else
+            bindir="target/release"
+          fi
+          cp "$bindir/$bin" "$stage/"
           cp README.md LICENSE .env.example "$stage/" 2>/dev/null || true
           # Bundle the matching PDFium library next to the binary. fetch-pdfium
           # normalizes every platform to third_party/pdfium/lib/; fail loudly if
@@ -109,7 +131,7 @@ jobs:
             cp target/generate-rpm/*.rpm out/ 2>/dev/null || true
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: edookit-mcp_${{ matrix.name }}
           path: out/*
@@ -121,7 +143,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { path: artifacts }
       - name: Collect artifacts + checksums
         run: |
@@ -130,7 +152,7 @@ jobs:
           (cd out && sha256sum * > checksums.txt)
           ls -l out
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: out/*
           generate_release_notes: true
@@ -141,7 +163,7 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { path: artifacts }
       - name: Push Homebrew formula
         env:
