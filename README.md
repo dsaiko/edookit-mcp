@@ -373,12 +373,18 @@ annoying**, not in the architecture.
 | Cold build | **5.9 s** | ~104 s | Rust's big async dep tree (chromiumoxide, axum, rmcp, reqwest, image) + monomorphization |
 | Warm/incremental build | 0.15 s | a few s | |
 | Startup (`--version`, mean of 30) | 6.6 ms | **3.8 ms** | Rust has no runtime/GC init to amortize |
+| Resident memory (idle HTTP server) | ~25.1 MiB | **~13.5 MiB** | Measured on the production gateway (Rocky Linux 10.2, aarch64): Go 0.1.13 `VmRSS` 25,712 kB / 9 threads / 1.28 GB virtual, vs Rust 0.1.1 `VmRSS` 13,796 kB (14,672 kB after a request) / 3 threads / 163 MB virtual — Rust ~46 % leaner resident, and a fraction of the virtual reservation |
 | Prod LOC (excl. tests) | ~6,600 | ~5,100 | Rust a touch tighter |
-| Tests | somewhat larger by LOC | **90** | Rust now covers the parsers, client (retry/origin/fast-path/concurrency), the full OAuth flow, and grid/download integration; Go's suite is still a bit larger |
+| Tests | somewhat larger by LOC | **93** | Rust now covers the parsers, client (retry/origin/fast-path/concurrency), the full OAuth flow, and grid/download integration; Go's suite is still a bit larger |
 
-Runtime throughput/memory under load wasn't micro-benchmarked — this is a
-single-user, I/O-bound tool (every call waits on Edookit), so it wouldn't be a
-meaningful differentiator. At rest Rust is marginally leaner (no GC, rustls).
+Memory was measured on the actual deployment (the `gateway-ssst` public MCP
+endpoint) — the long-running Go service idled at ~25 MiB resident (its lifetime
+peak, `VmHWM` == `VmRSS`), while the Rust build serves the same endpoint at
+~13–14 MiB with a third of the threads. Throughput under load wasn't
+micro-benchmarked: this is a single-user, I/O-bound tool (every call waits on
+Edookit), so it wouldn't be a meaningful differentiator. The resident-memory
+gap (no GC, rustls, a slimmer thread pool) is the one runtime axis where the
+difference is real and measurable.
 
 ### Where Rust helped (stability / bug-proofness)
 
