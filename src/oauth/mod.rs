@@ -161,8 +161,11 @@ mod flow_tests {
         let tok_json: serde_json::Value = serde_json::from_str(&body_string(tok).await).unwrap();
         let access = tok_json["access_token"].as_str().unwrap();
         let refresh1 = tok_json["refresh_token"].as_str().unwrap().to_string();
-        // the access token verifies.
-        assert_eq!(srv.verify_jwt(access).unwrap(), "dusan");
+        // The access token verifies, and the subject is the fixed constant —
+        // NOT the "dusan" typed into the form. With no EDOOKIT_AUTH_USERNAME
+        // configured the password alone authenticates, so echoing the form
+        // username into `sub` would let the client choose its own identity.
+        assert_eq!(srv.verify_jwt(access).unwrap(), "edookit-mcp-user");
 
         // refresh → new tokens.
         let r = post_form(

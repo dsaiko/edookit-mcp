@@ -431,6 +431,64 @@ async fn get_bytes_keeps_genuine_html_attachment_after_retry() {
 }
 
 #[tokio::test]
+async fn get_to_streams_a_real_json_attachment() {
+    // A genuine .json attachment served as application/json must stream to
+    // disk, not be rejected as an API error envelope (unlike the Go original).
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    Mock::given(method("GET"))
+        .and(mpath("/data.json"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"hello": "world"})),
+        )
+        .mount(&server)
+        .await;
+
+    let cli = build_client(&server.uri(), Arc::new(AtomicUsize::new(0)));
+    let mut buf: Vec<u8> = Vec::new();
+    let n = cli.get_to("/data.json", &mut buf, 1_000_000).await.unwrap();
+    assert_eq!(n as usize, buf.len());
+    assert!(String::from_utf8_lossy(&buf).contains("world"));
+}
+
+#[tokio::test]
+async fn get_to_streams_a_real_html_attachment() {
+    // text/html that survives a re-login is a real HTML attachment → stream it.
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    Mock::given(method("GET"))
+        .and(mpath("/page.html"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("<html>real</html>", "text/html"))
+        .mount(&server)
+        .await;
+
+    let cli = build_client(&server.uri(), Arc::new(AtomicUsize::new(0)));
+    let mut buf: Vec<u8> = Vec::new();
+    cli.get_to("/page.html", &mut buf, 1_000_000).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf).contains("real"));
+}
+
+#[tokio::test]
+async fn get_to_enforces_byte_cap() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    Mock::given(method("GET"))
+        .and(mpath("/big.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/octet-stream")
+                .set_body_bytes(vec![0u8; 200_000]),
+        )
+        .mount(&server)
+        .await;
+
+    let cli = build_client(&server.uri(), Arc::new(AtomicUsize::new(0)));
+    let mut buf: Vec<u8> = Vec::new();
+    let err = cli.get_to("/big.bin", &mut buf, 100_000).await.unwrap_err();
+    assert!(matches!(err, ClientError::AttachmentTooLarge));
+}
+
+#[tokio::test]
 async fn concurrent_requests_with_invalidation_dont_deadlock() {
     let server = MockServer::start().await;
     mount_warmup(&server).await;

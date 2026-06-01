@@ -31,6 +31,12 @@ const DEFAULT_USER_AGENT: &str = "edookit-mcp/0.1 (+https://github.com/dsaiko/ed
 const SCHEME_HTTP: &str = "http";
 const SCHEME_HTTPS: &str = "https";
 
+/// Bytes of a streamed download buffered up front to classify it (real
+/// attachment vs. stale-session login page / `authenticated:false` envelope).
+/// Both artifacts are far smaller than this, so the window never truncates a
+/// classification decision.
+const DOWNLOAD_SNIFF_CAP: usize = 64 * 1024;
+
 /// Errors returned by the client's `get_*` methods. The
 /// [`AttachmentTooLarge`](ClientError::AttachmentTooLarge) variant is a
 /// sentinel matched by the inline-view tool; everything else carries a message.
@@ -69,14 +75,14 @@ pub type LoginFn = Arc<
 /// same-origin requests this client makes, host-only scoping is equivalent to
 /// the captured domain/path, and persistence flattens to name/value anyway
 /// (matching Go's jar, which exposes nothing else).
+/// A cookie captured from a successful login. The jar is keyed by name/value
+/// only (see the cookie-jar divergence in the README): the browser flow already
+/// filters cookies to the target host, so the per-cookie domain/path/secure
+/// attributes the Go port carried are not needed to replay the session.
 #[derive(Debug, Clone)]
 pub struct LoginCookie {
     pub name: String,
     pub value: String,
-    pub domain: String,
-    pub path: String,
-    pub secure: bool,
-    pub http_only: bool,
 }
 
 impl LoginCookie {
@@ -84,10 +90,6 @@ impl LoginCookie {
         LoginCookie {
             name: name.into(),
             value: value.into(),
-            domain: String::new(),
-            path: String::new(),
-            secure: false,
-            http_only: false,
         }
     }
 }
@@ -311,45 +313,22 @@ impl Client {
         }
     }
 
-    /// Fetches `path` as a parsed HTML document. Reserved for the rare
-    /// server-rendered page; use [`get_json`](Self::get_json) for the SPA's
-    /// XHR endpoints.
-    pub async fn get_doc(&self, path: &str) -> Result<scraper::Html, ClientError> {
-        let mut allow_retry = true;
-        loop {
-            self.ensure_logged_in().await?;
-            self.preflight_same_origin(path)?;
-
-            let req = self.new_request(path, false)?;
-            let resp = self.send_retrying(req).await?;
-
-            if !same_origin(resp.url(), &self.base_url) {
-                if !allow_retry {
-                    return Err(ClientError::msg("session expired and re-login failed"));
-                }
-                self.invalidate_session().await;
-                allow_retry = false;
-                continue;
-            }
-            let status = resp.status().as_u16();
-            if status >= 400 {
-                return Err(ClientError::msg(format!("GET {path}: HTTP {status}")));
-            }
-            let text = resp
-                .text()
-                .await
-                .map_err(|e| ClientError::msg(format!("read body from {path}: {e}")))?;
-            return Ok(scraper::Html::parse_document(&text));
-        }
-    }
-
     /// Streams the body of `GET <path>` into `dst`, returning the byte count.
     /// Used for binary downloads where we don't want to buffer the whole file.
-    /// `path` may be relative or an absolute (same-origin) URL.
+    /// `path` may be relative or an absolute (same-origin) URL. Writes at most
+    /// `limit` bytes; a larger body yields [`ClientError::AttachmentTooLarge`]
+    /// (a guard against a runaway or hostile response filling the disk).
+    ///
+    /// Diverges from the Go original (which rejected text/html and
+    /// application/json outright): a bounded prefix is sniffed and run through
+    /// [`classify_download_body`] — the same logic `get_bytes` uses — so genuine
+    /// `.html`/`.json` attachments stream to disk while a stale-session login
+    /// page or `authenticated:false` envelope still triggers re-login.
     pub async fn get_to<W: std::io::Write>(
         &self,
         path: &str,
         dst: &mut W,
+        limit: u64,
     ) -> Result<u64, ClientError> {
         let mut allow_retry = true;
         loop {
@@ -373,34 +352,62 @@ impl Client {
                 return Err(ClientError::msg(format!("GET {path}: HTTP {status}")));
             }
 
-            // Non-file response on a download endpoint: text/html is almost
-            // certainly the login page (stale cookies, no off-origin redirect)
-            // → invalidate + retry. application/json is a deterministic API
-            // error envelope → propagate (a retry would just hit it again).
             let ct = content_type_lower(&resp);
-            if ct.starts_with("text/html") {
-                if !allow_retry {
-                    return Err(ClientError::msg(format!(
-                        "GET {path}: server returned text/html (likely login page) — re-login failed"
-                    )));
+            let mut stream = resp.bytes_stream();
+
+            // Buffer a bounded prefix so we can distinguish a real attachment
+            // from a stale-session artifact without reading the whole (possibly
+            // huge) body into memory. The auth envelope and login page both fit
+            // easily within the sniff window.
+            let mut sniff: Vec<u8> = Vec::new();
+            let mut stream_drained = false;
+            while sniff.len() < DOWNLOAD_SNIFF_CAP {
+                match stream.next().await {
+                    Some(chunk) => {
+                        let chunk =
+                            chunk.map_err(|e| ClientError::msg(format!("GET {path}: {e}")))?;
+                        sniff.extend_from_slice(&chunk);
+                    }
+                    None => {
+                        stream_drained = true;
+                        break;
+                    }
                 }
-                self.invalidate_session().await;
-                allow_retry = false;
-                continue;
-            }
-            if ct.starts_with("application/json") {
-                return Err(ClientError::msg(format!(
-                    "GET {path}: server returned application/json on a binary download endpoint (likely an API error envelope, not a file)"
-                )));
             }
 
-            let mut stream = resp.bytes_stream();
-            let mut written: u64 = 0;
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| ClientError::msg(format!("GET {path}: {e}")))?;
-                dst.write_all(&chunk)
-                    .map_err(|e| ClientError::msg(format!("write to dst: {e}")))?;
-                written += chunk.len() as u64;
+            match classify_download_body(&ct, &sniff, allow_retry) {
+                DownloadDisposition::Reauth => {
+                    self.invalidate_session().await;
+                    allow_retry = false;
+                    continue;
+                }
+                DownloadDisposition::Fail => {
+                    return Err(ClientError::msg(format!(
+                        "GET {path}: stale session (authenticated=false) and re-login failed"
+                    )));
+                }
+                DownloadDisposition::Accept => {}
+            }
+
+            // Commit the sniffed prefix, then stream the remainder — enforcing
+            // the byte cap throughout.
+            if sniff.len() as u64 > limit {
+                return Err(ClientError::AttachmentTooLarge);
+            }
+            dst.write_all(&sniff)
+                .map_err(|e| ClientError::msg(format!("write to dst: {e}")))?;
+            let mut written = sniff.len() as u64;
+
+            if !stream_drained {
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| ClientError::msg(format!("GET {path}: {e}")))?;
+                    written += chunk.len() as u64;
+                    if written > limit {
+                        return Err(ClientError::AttachmentTooLarge);
+                    }
+                    dst.write_all(&chunk)
+                        .map_err(|e| ClientError::msg(format!("write to dst: {e}")))?;
+                }
             }
             return Ok(written);
         }

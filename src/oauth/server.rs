@@ -590,7 +590,7 @@ async fn authorize_submit(
                 challenge: p.code_challenge.clone(),
                 method: p.code_challenge_method.clone(),
                 scope: p.scope.clone(),
-                sub: srv.subject(&raw.username),
+                sub: srv.subject(),
                 expires_at: now + srv.cfg.code_ttl,
             },
         );
@@ -668,13 +668,16 @@ impl Server {
         ct_eq(password, &self.cfg.login_password)
     }
 
-    fn subject(&self, form_username: &str) -> String {
-        if !self.cfg.login_username.is_empty() {
-            self.cfg.login_username.clone()
-        } else if !form_username.is_empty() {
-            form_username.to_string()
-        } else {
+    /// The JWT `sub` for a freshly minted code. This must NOT be derived from
+    /// the login form: when no expected username is configured, `check_login`
+    /// accepts any username for the configured password, so echoing the typed
+    /// username back into `sub` would let the client pick its own subject.
+    /// Use the configured username if present, otherwise a fixed constant.
+    fn subject(&self) -> String {
+        if self.cfg.login_username.is_empty() {
             "edookit-mcp-user".to_string()
+        } else {
+            self.cfg.login_username.clone()
         }
     }
 

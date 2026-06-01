@@ -10,6 +10,12 @@ use serde::Serialize;
 use super::message::{Attachment, get_message};
 use crate::client::Client;
 
+/// Upper bound on a single downloaded attachment (512 MiB). School attachments
+/// (PDFs, images, documents) are far smaller; the cap exists only to stop a
+/// runaway or hostile response from filling the disk. Raise it here if a
+/// legitimate larger file is ever needed.
+const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
 /// One entry per attachment Edookit listed, ordered as the message presents
 /// them. A non-empty `error` means that single download failed (others
 /// continued); a top-level error means the call couldn't even start.
@@ -180,7 +186,7 @@ async fn stream_to_dest(
         }
     }
 
-    let n = match cli.get_to(url, tmp.as_file_mut()).await {
+    let n = match cli.get_to(url, tmp.as_file_mut(), MAX_DOWNLOAD_BYTES).await {
         Ok(n) => n,
         Err(e) => {
             out.error = format!("download: {e}");

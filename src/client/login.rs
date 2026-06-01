@@ -230,14 +230,7 @@ async fn run_login(
         if !host_matches_cookie(base_host, &c.domain) {
             continue;
         }
-        out.push(LoginCookie {
-            name: c.name,
-            value: c.value,
-            domain: c.domain,
-            path: c.path,
-            secure: c.secure,
-            http_only: c.http_only,
-        });
+        out.push(LoginCookie::new(c.name, c.value));
     }
     if out.is_empty() {
         bail!("browser login: no cookies captured for target host");
