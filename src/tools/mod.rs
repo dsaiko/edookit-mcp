@@ -12,4 +12,6 @@ mod pdfrender;
 pub mod untrusted;
 pub mod view;
 
-pub use untrusted::{untrusted_attachment_banner, untrusted_attachment_close, wrap_as_untrusted_json};
+pub use untrusted::{
+    untrusted_attachment_banner, untrusted_attachment_close, wrap_as_untrusted_json,
+};

@@ -80,12 +80,20 @@ pub async fn view_attachment(
     };
 
     let mime = resolve_mime(&ctype, &att.name);
-    let mut blocks = vec![ViewBlock::Text(format!("Příloha: {} ({}, {} B)", att.name, mime, body.len()))];
+    let mut blocks = vec![ViewBlock::Text(format!(
+        "Příloha: {} ({}, {} B)",
+        att.name,
+        mime,
+        body.len()
+    ))];
 
     if let Some(rest) = mime.strip_prefix("image/") {
         let _ = rest;
         let (b64, out_mime) = encode_image_for_view(&body, &mime);
-        blocks.push(ViewBlock::Image { b64, mime: out_mime });
+        blocks.push(ViewBlock::Image {
+            b64,
+            mime: out_mime,
+        });
     } else if mime == MIME_PDF {
         blocks.extend(pdf_blocks(&body, opts.max_pages).await);
     } else if is_text_like(&mime, &att.name) {
@@ -116,7 +124,11 @@ fn resolve_mime(content_type: &str, filename: &str) -> String {
     if !mt.is_empty() && mt != MIME_OCTET {
         return mt;
     }
-    if let Some(ext) = Path::new(filename).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
+    if let Some(ext) = Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+    {
         if let Some(m) = mime_guess::from_ext(&ext).first_raw() {
             return m.split(';').next().unwrap_or(m).trim().to_ascii_lowercase();
         }
@@ -136,7 +148,11 @@ fn parse_media_type(v: &str) -> String {
     if v.is_empty() {
         return String::new();
     }
-    v.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+    v.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// Whether the attachment is plain-text-ish and safe to inline as text.
@@ -144,12 +160,32 @@ fn is_text_like(mime: &str, filename: &str) -> bool {
     if mime.starts_with("text/") {
         return true;
     }
-    if matches!(mime, "application/json" | "application/xml" | "application/x-yaml" | "application/yaml") {
+    if matches!(
+        mime,
+        "application/json" | "application/xml" | "application/x-yaml" | "application/yaml"
+    ) {
         return true;
     }
     matches!(
-        Path::new(filename).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
-        Some("txt" | "csv" | "tsv" | "md" | "json" | "xml" | "ics" | "html" | "htm" | "log" | "yaml" | "yml")
+        Path::new(filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some(
+            "txt"
+                | "csv"
+                | "tsv"
+                | "md"
+                | "json"
+                | "xml"
+                | "ics"
+                | "html"
+                | "htm"
+                | "log"
+                | "yaml"
+                | "yml"
+        )
     )
 }
 
@@ -161,14 +197,24 @@ async fn pdf_blocks(body: &[u8], max_pages: i64) -> Vec<ViewBlock> {
     let text = extract_pdf_text(body);
     let text = text.trim();
     if !text.is_empty() {
-        blocks.push(ViewBlock::Text(format!("--- text PDF ---\n{}", truncate_runes(text, MAX_VIEW_TEXT_RUNES))));
+        blocks.push(ViewBlock::Text(format!(
+            "--- text PDF ---\n{}",
+            truncate_runes(text, MAX_VIEW_TEXT_RUNES)
+        )));
     }
 
     match rasterize_pdf(body, max_pages).await {
         Ok((pngs, total)) => {
             for (i, png) in pngs.iter().enumerate() {
-                blocks.push(ViewBlock::Text(format!("--- strana {}/{} ---", i + 1, total)));
-                blocks.push(ViewBlock::Image { b64: B64.encode(png), mime: "image/png".to_string() });
+                blocks.push(ViewBlock::Text(format!(
+                    "--- strana {}/{} ---",
+                    i + 1,
+                    total
+                )));
+                blocks.push(ViewBlock::Image {
+                    b64: B64.encode(png),
+                    mime: "image/png".to_string(),
+                });
             }
             if total > pngs.len() {
                 blocks.push(ViewBlock::Text(format!(
@@ -218,11 +264,21 @@ fn downscale_image(body: &[u8]) -> Option<(Vec<u8>, String)> {
     }
     // Pin the longest edge to MAX_IMAGE_DIM exactly, preserving aspect.
     let (nw, nh) = if w >= h {
-        (MAX_IMAGE_DIM, (h as f64 * MAX_IMAGE_DIM as f64 / w as f64) as u32)
+        (
+            MAX_IMAGE_DIM,
+            (h as f64 * MAX_IMAGE_DIM as f64 / w as f64) as u32,
+        )
     } else {
-        ((w as f64 * MAX_IMAGE_DIM as f64 / h as f64) as u32, MAX_IMAGE_DIM)
+        (
+            (w as f64 * MAX_IMAGE_DIM as f64 / h as f64) as u32,
+            MAX_IMAGE_DIM,
+        )
     };
-    let resized = img.resize_exact(nw.max(1), nh.max(1), image::imageops::FilterType::CatmullRom);
+    let resized = img.resize_exact(
+        nw.max(1),
+        nh.max(1),
+        image::imageops::FilterType::CatmullRom,
+    );
 
     let mut buf = Vec::new();
     let out_format = if format == image::ImageFormat::Jpeg {
@@ -230,8 +286,14 @@ fn downscale_image(body: &[u8]) -> Option<(Vec<u8>, String)> {
     } else {
         image::ImageFormat::Png
     };
-    resized.write_to(&mut std::io::Cursor::new(&mut buf), out_format).ok()?;
-    let mime = if out_format == image::ImageFormat::Jpeg { "image/jpeg" } else { "image/png" };
+    resized
+        .write_to(&mut std::io::Cursor::new(&mut buf), out_format)
+        .ok()?;
+    let mime = if out_format == image::ImageFormat::Jpeg {
+        "image/jpeg"
+    } else {
+        "image/png"
+    };
     Some((buf, mime.to_string()))
 }
 
@@ -243,7 +305,10 @@ mod tests {
     fn resolve_mime_prefers_server_then_extension() {
         assert_eq!(resolve_mime("image/png", "x.png"), "image/png");
         // octet-stream falls back to extension
-        assert_eq!(resolve_mime("application/octet-stream", "x.pdf"), "application/pdf");
+        assert_eq!(
+            resolve_mime("application/octet-stream", "x.pdf"),
+            "application/pdf"
+        );
         assert_eq!(resolve_mime("", "notes.txt"), "text/plain");
         assert_eq!(resolve_mime("", "cal.ics"), "text/calendar");
         assert_eq!(resolve_mime("", "blob"), "application/octet-stream");
@@ -262,7 +327,8 @@ mod tests {
     fn png_bytes(w: u32, h: u32) -> Vec<u8> {
         let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(w, h));
         let mut buf = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
         buf
     }
 
@@ -286,8 +352,14 @@ mod tests {
 
     #[test]
     fn clamp_view_knobs() {
-        assert_eq!(clamp_i64(0, DEFAULT_VIEW_MAX_MB, MAX_VIEW_MAX_MB), DEFAULT_VIEW_MAX_MB);
-        assert_eq!(clamp_i64(100, DEFAULT_VIEW_MAX_MB, MAX_VIEW_MAX_MB), MAX_VIEW_MAX_MB);
+        assert_eq!(
+            clamp_i64(0, DEFAULT_VIEW_MAX_MB, MAX_VIEW_MAX_MB),
+            DEFAULT_VIEW_MAX_MB
+        );
+        assert_eq!(
+            clamp_i64(100, DEFAULT_VIEW_MAX_MB, MAX_VIEW_MAX_MB),
+            MAX_VIEW_MAX_MB
+        );
         assert_eq!(clamp_i64(10, DEFAULT_VIEW_MAX_MB, MAX_VIEW_MAX_MB), 10);
     }
 }

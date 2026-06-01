@@ -2,6 +2,10 @@
 name = "edookit-mcp"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Unofficial MCP connector for Edookit (Czech school information system) — Rust port"
+repository = "https://github.com/dsaiko/edookit-mcp-rs"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -17,7 +21,7 @@ ego-tree = "0.11.0"
 futures = "0.3.32"
 getrandom = "0.4.2"
 hmac = "0.13.0"
-image = "0.25.10"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif"] }
 jiff = { version = "0.2.28", features = ["tzdb-bundle-always"] }
 mime_guess = "2.0.5"
 parking_lot = "0.12.5"
@@ -26,7 +30,6 @@ pdfium-render = "0.9.1"
 regex = "1.12.3"
 reqwest = { version = "0.13.4", features = ["json", "stream", "cookies"] }
 rmcp = { version = "1.7.0", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
-schemars = "1.2.1"
 scraper = "0.27.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -44,3 +47,41 @@ url = "2.5.8"
 [dev-dependencies]
 tempfile = "3.27.0"
 wiremock = "0.6.5"
+
+# Strip symbols from release builds (parity with the Go build's -s -w ldflags).
+[profile.release]
+strip = true
+
+# --- Linux packaging (cargo-deb) -------------------------------------------
+# Bundles the binary, the matching PDFium library, the systemd unit, and the
+# env conffile; declares the chromium runtime dependency. The env file points
+# EDOOKIT_PDFIUM_LIB at the installed library.
+[package.metadata.deb]
+maintainer = "Dušan Saiko <dusan.saiko@oddin.gg>"
+license-file = ["LICENSE", "0"]
+extended-description = "Unofficial MCP server for Edookit (Czech school information system). Exposes message/attachment/course tools over MCP via a captured Plus4U OIDC session cookie."
+section = "net"
+priority = "optional"
+depends = "chromium"
+conf-files = ["/etc/edookit-mcp/edookit-mcp.env"]
+maintainer-scripts = "packaging/deb"
+assets = [
+    ["target/release/edookit-mcp", "usr/bin/", "755"],
+    ["third_party/pdfium/lib/libpdfium.so", "usr/lib/edookit-mcp/libpdfium.so", "644"],
+    ["packaging/edookit-mcp.service", "usr/lib/systemd/system/edookit-mcp.service", "644"],
+    ["packaging/edookit-mcp.env.example", "etc/edookit-mcp/edookit-mcp.env", "640"],
+]
+
+# --- Linux packaging (cargo-generate-rpm) ----------------------------------
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/edookit-mcp", dest = "/usr/bin/edookit-mcp", mode = "755" },
+    { source = "third_party/pdfium/lib/libpdfium.so", dest = "/usr/lib/edookit-mcp/libpdfium.so", mode = "644" },
+    { source = "packaging/edookit-mcp.service", dest = "/usr/lib/systemd/system/edookit-mcp.service", mode = "644" },
+    { source = "packaging/edookit-mcp.env.example", dest = "/etc/edookit-mcp/edookit-mcp.env", mode = "640", config = true },
+]
+# NOTE: RPM scriptlets (system-user creation, daemon-reload) use a different arg
+# convention than the deb maintainer scripts; wire them via post_install_script
+# etc. before the first RPM release. EPEL provides `chromium` on RHEL/Rocky.
+[package.metadata.generate-rpm.requires]
+chromium = "*"

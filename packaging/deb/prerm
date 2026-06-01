@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stop/disable only on real removal (not on upgrade).
+set -e
+if [ "$1" = "remove" ]; then
+    systemctl --no-reload disable --now edookit-mcp.service >/dev/null 2>&1 || true
+fi
+exit 0

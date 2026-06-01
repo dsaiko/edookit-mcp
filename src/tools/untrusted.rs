@@ -63,6 +63,9 @@ mod tests {
     #[test]
     fn attachment_markers_pair_up() {
         assert!(untrusted_attachment_banner().starts_with("BEGIN_UNTRUSTED_EDOOKIT_ATTACHMENT"));
-        assert_eq!(untrusted_attachment_close(), "END_UNTRUSTED_EDOOKIT_ATTACHMENT");
+        assert_eq!(
+            untrusted_attachment_close(),
+            "END_UNTRUSTED_EDOOKIT_ATTACHMENT"
+        );
     }
 }

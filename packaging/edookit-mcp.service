@@ -1,0 +1,28 @@
+[Unit]
+Description=edookit-mcp — Streamable HTTP MCP server for Edookit
+Documentation=https://github.com/dsaiko/edookit-mcp-rs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=edookit-mcp
+Group=edookit-mcp
+EnvironmentFile=/etc/edookit-mcp/edookit-mcp.env
+ExecStart=/usr/bin/edookit-mcp --http 127.0.0.1:9000
+Restart=on-failure
+RestartSec=5s
+
+# State (cookie cache) + cache dirs, owned by the service user.
+StateDirectory=edookit-mcp
+CacheDirectory=edookit-mcp
+
+# Hardening (kept lenient — chromiumoxide launches headless chromium, which is
+# unhappy under aggressive isolation; tighten further if logins still succeed).
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

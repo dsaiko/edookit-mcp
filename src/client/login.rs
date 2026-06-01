@@ -76,7 +76,9 @@ pub async fn login_via_browser(cfg: BrowserLoginConfig) -> anyhow::Result<Vec<Lo
     if !cfg.headless {
         builder = builder.with_head();
     }
-    let config = builder.build().map_err(|e| anyhow!("browser config: {e}"))?;
+    let config = builder
+        .build()
+        .map_err(|e| anyhow!("browser config: {e}"))?;
 
     let (browser, mut handler) = Browser::launch(config).await.context("launch chromium")?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
@@ -161,17 +163,25 @@ async fn run_login(
         .into_value()
         .context("client_id into_value")?;
     if cid.is_empty() {
-        bail!("OIDC client_id empty (UU5.Environment may have been reset between readiness check and read)");
+        bail!(
+            "OIDC client_id empty (UU5.Environment may have been reset between readiness check and read)"
+        );
     }
     tracing::info!("[login] OIDC client_id: {cid}");
     client_id.store(Arc::new(cid));
 
     // 5. Trigger the Plus4U OIDC flow. The lib emits its auth request with
-    //    prompt=none for silent SSO — the interceptor strips that.
+    //    prompt=none for silent SSO — the interceptor strips that. The eval
+    //    usually returns an "execution context destroyed" error because
+    //    idmLoginClick() starts a navigation that tears down the page context —
+    //    that's success, not failure, so we tolerate it; the redirect-wait
+    //    below is the real signal.
     tracing::info!("[login] trigger Plus4U login");
-    page.evaluate("idmLoginClick()")
-        .await
-        .context("trigger Plus4U login")?;
+    if let Err(e) = page.evaluate("idmLoginClick()").await {
+        tracing::debug!(
+            "[login] idmLoginClick eval returned (likely navigation tore down the context): {e}"
+        );
+    }
 
     // 6. Wait for redirect to Plus4U identity.
     tracing::info!("[login] wait for redirect to Plus4U identity");
@@ -181,21 +191,31 @@ async fn run_login(
 
     // 7. Fill credentials.
     tracing::info!("[login] fill username");
-    wait_visible(&page, r#"input[autocomplete="username"]"#, Duration::from_secs(30))
-        .await
-        .context("wait for username input")?;
-    let user_el = page.find_element(r#"input[autocomplete="username"]"#).await?;
+    wait_visible(
+        &page,
+        r#"input[autocomplete="username"]"#,
+        Duration::from_secs(30),
+    )
+    .await
+    .context("wait for username input")?;
+    let user_el = page
+        .find_element(r#"input[autocomplete="username"]"#)
+        .await?;
     user_el.click().await?.type_str(&cfg.username).await?;
 
     tracing::info!("[login] fill password");
-    let pass_el = page.find_element(r#"input[autocomplete="current-password"]"#).await?;
+    let pass_el = page
+        .find_element(r#"input[autocomplete="current-password"]"#)
+        .await?;
     pass_el.click().await?.type_str(&cfg.password).await?;
 
     // 8. Submit the form.
     tracing::info!("[login] submit credentials");
-    page.evaluate(r#"document.querySelector('input[autocomplete="current-password"]').form.submit()"#)
-        .await
-        .context("submit credentials")?;
+    page.evaluate(
+        r#"document.querySelector('input[autocomplete="current-password"]').form.submit()"#,
+    )
+    .await
+    .context("submit credentials")?;
 
     // 9. Wait for redirect back to Edookit.
     tracing::info!("[login] wait for redirect back to Edookit");
@@ -240,7 +260,9 @@ async fn spawn_fetch_interceptor(
             let mut params = ContinueRequestParams::new(ev.request_id.clone());
             let new_url = strip_prompt_none_for_client(&ev.request.url, &cid);
             if let Some(u) = new_url {
-                tracing::info!("[fetch-intercept] stripped prompt=none from outer auth (client={cid})");
+                tracing::info!(
+                    "[fetch-intercept] stripped prompt=none from outer auth (client={cid})"
+                );
                 params.url = Some(u);
             }
             if let Err(e) = page.execute(params).await {
@@ -255,11 +277,17 @@ async fn spawn_fetch_interceptor(
 /// via `alert()`, which headless chrome auto-dismisses but headful mode blocks
 /// on. Accept any dialog so the flow behaves identically in both modes.
 async fn spawn_dialog_dismisser(page: &Page) -> anyhow::Result<AbortOnDrop> {
-    let mut events = page.event_listener::<EventJavascriptDialogOpening>().await?;
+    let mut events = page
+        .event_listener::<EventJavascriptDialogOpening>()
+        .await?;
     let page = page.clone();
     let task = tokio::spawn(async move {
         while let Some(ev) = events.next().await {
-            tracing::info!("[browser-dialog {:?}] {} (auto-dismissing)", ev.r#type, ev.message);
+            tracing::info!(
+                "[browser-dialog {:?}] {} (auto-dismissing)",
+                ev.r#type,
+                ev.message
+            );
             let _ = page
                 .execute(HandleJavaScriptDialogParams {
                     accept: true,
@@ -282,7 +310,9 @@ fn strip_prompt_none_for_client(raw: &str, client_id: &str) -> Option<String> {
     }
     let mut u = Url::parse(raw).ok()?;
     let prompt_is_none = u.query_pairs().any(|(k, v)| k == "prompt" && v == "none");
-    let client_matches = u.query_pairs().any(|(k, v)| k == "client_id" && v == client_id);
+    let client_matches = u
+        .query_pairs()
+        .any(|(k, v)| k == "client_id" && v == client_id);
     if !prompt_is_none || !client_matches {
         return None;
     }
@@ -359,7 +389,9 @@ pub async fn dump_landing_html(base_url: &str, headless: bool) -> anyhow::Result
     if !headless {
         builder = builder.with_head();
     }
-    let config = builder.build().map_err(|e| anyhow!("browser config: {e}"))?;
+    let config = builder
+        .build()
+        .map_err(|e| anyhow!("browser config: {e}"))?;
     let (browser, mut handler) = Browser::launch(config).await.context("launch chromium")?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 

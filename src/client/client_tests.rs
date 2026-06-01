@@ -14,8 +14,14 @@ use wiremock::{Mock, MockServer, Request as WReq, Respond, ResponseTemplate};
 #[test]
 fn parse_base_url_validation() {
     assert!(parse_base_url("", false).is_err(), "empty rejected");
-    assert!(parse_base_url("school.edookit.net", false).is_err(), "schemeless rejected");
-    assert!(parse_base_url("ftp://x.test", false).is_err(), "non-http scheme rejected");
+    assert!(
+        parse_base_url("school.edookit.net", false).is_err(),
+        "schemeless rejected"
+    );
+    assert!(
+        parse_base_url("ftp://x.test", false).is_err(),
+        "non-http scheme rejected"
+    );
     assert!(parse_base_url("https://school.edookit.net", false).is_ok());
 
     // Plain http to a non-loopback host is rejected unless opted in.
@@ -41,10 +47,22 @@ fn base_url_default_port_is_normalized() {
 #[test]
 fn same_origin_compares_scheme_host_port() {
     let base = Url::parse("https://h.test").unwrap();
-    assert!(same_origin(&Url::parse("https://h.test/path").unwrap(), &base));
-    assert!(!same_origin(&Url::parse("http://h.test").unwrap(), &base), "scheme differs");
-    assert!(!same_origin(&Url::parse("https://other.test").unwrap(), &base), "host differs");
-    assert!(!same_origin(&Url::parse("https://h.test:8443").unwrap(), &base), "port differs");
+    assert!(same_origin(
+        &Url::parse("https://h.test/path").unwrap(),
+        &base
+    ));
+    assert!(
+        !same_origin(&Url::parse("http://h.test").unwrap(), &base),
+        "scheme differs"
+    );
+    assert!(
+        !same_origin(&Url::parse("https://other.test").unwrap(), &base),
+        "host differs"
+    );
+    assert!(
+        !same_origin(&Url::parse("https://h.test:8443").unwrap(), &base),
+        "port differs"
+    );
 }
 
 #[test]
@@ -61,24 +79,45 @@ fn transient_status_set() {
 fn classify_download_body_cases() {
     // auth-envelope JSON → reauth while retries remain, else fail.
     let env = br#"{"authenticated":false}"#;
-    assert_eq!(classify_download_body("application/json", env, true), DownloadDisposition::Reauth);
-    assert_eq!(classify_download_body("application/json", env, false), DownloadDisposition::Fail);
+    assert_eq!(
+        classify_download_body("application/json", env, true),
+        DownloadDisposition::Reauth
+    );
+    assert_eq!(
+        classify_download_body("application/json", env, false),
+        DownloadDisposition::Fail
+    );
     // any other JSON is a real attachment.
     assert_eq!(
         classify_download_body("application/json", br#"{"k":1}"#, true),
         DownloadDisposition::Accept
     );
     // html → reauth once, but a genuine html attachment after re-login is kept.
-    assert_eq!(classify_download_body("text/html", b"<html>", true), DownloadDisposition::Reauth);
-    assert_eq!(classify_download_body("text/html", b"<html>", false), DownloadDisposition::Accept);
+    assert_eq!(
+        classify_download_body("text/html", b"<html>", true),
+        DownloadDisposition::Reauth
+    );
+    assert_eq!(
+        classify_download_body("text/html", b"<html>", false),
+        DownloadDisposition::Accept
+    );
     // binary → always accept.
-    assert_eq!(classify_download_body("application/pdf", b"%PDF", true), DownloadDisposition::Accept);
+    assert_eq!(
+        classify_download_body("application/pdf", b"%PDF", true),
+        DownloadDisposition::Accept
+    );
 }
 
 #[test]
 fn auth_envelope_parsing() {
-    assert_eq!(parse_auth_envelope(br#"{"authenticated":false}"#), Some(false));
-    assert_eq!(parse_auth_envelope(br#"{"authenticated":true}"#), Some(true));
+    assert_eq!(
+        parse_auth_envelope(br#"{"authenticated":false}"#),
+        Some(false)
+    );
+    assert_eq!(
+        parse_auth_envelope(br#"{"authenticated":true}"#),
+        Some(true)
+    );
     assert_eq!(parse_auth_envelope(br#"{"other":1}"#), None);
     assert_eq!(parse_auth_envelope(b"not json"), None);
 }
@@ -102,14 +141,22 @@ struct Seq {
 
 impl Seq {
     fn new(steps: Vec<(u16, Option<serde_json::Value>)>) -> Self {
-        Seq { i: AtomicUsize::new(0), steps }
+        Seq {
+            i: AtomicUsize::new(0),
+            steps,
+        }
     }
 }
 
 impl Respond for Seq {
     fn respond(&self, _: &WReq) -> ResponseTemplate {
         let idx = self.i.fetch_add(1, Ordering::SeqCst);
-        let (code, body) = self.steps.get(idx).or_else(|| self.steps.last()).unwrap().clone();
+        let (code, body) = self
+            .steps
+            .get(idx)
+            .or_else(|| self.steps.last())
+            .unwrap()
+            .clone();
         let mut t = ResponseTemplate::new(code);
         if let Some(b) = body {
             t = t.set_body_json(b);
@@ -190,7 +237,10 @@ async fn persistent_503_errors_after_attempts() {
         .await;
 
     let cli = build_client(&server.uri(), Arc::new(AtomicUsize::new(0)));
-    let err = cli.get_json::<serde_json::Value>("/handler/x").await.unwrap_err();
+    let err = cli
+        .get_json::<serde_json::Value>("/handler/x")
+        .await
+        .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("503"), "got: {msg}");
     assert!(msg.contains("3 attempt"), "got: {msg}");
@@ -209,7 +259,10 @@ async fn http_500_is_not_retried() {
         .await;
 
     let cli = build_client(&server.uri(), Arc::new(AtomicUsize::new(0)));
-    let err = cli.get_json::<serde_json::Value>("/handler/x").await.unwrap_err();
+    let err = cli
+        .get_json::<serde_json::Value>("/handler/x")
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("HTTP 500"), "got: {err}");
     server.verify().await;
 }
@@ -222,7 +275,10 @@ async fn authenticated_false_triggers_reauth() {
         .and(mpath("/handler/x"))
         .respond_with(Seq::new(vec![
             (200, Some(serde_json::json!({"authenticated": false}))),
-            (200, Some(serde_json::json!({"authenticated": true, "ok": 1}))),
+            (
+                200,
+                Some(serde_json::json!({"authenticated": true, "ok": 1})),
+            ),
         ]))
         .mount(&server)
         .await;
@@ -231,7 +287,10 @@ async fn authenticated_false_triggers_reauth() {
     let cli = build_client(&server.uri(), calls.clone());
     let v: serde_json::Value = cli.get_json("/handler/x").await.unwrap();
     assert_eq!(v["ok"], serde_json::json!(1));
-    assert!(calls.load(Ordering::SeqCst) >= 2, "re-logged in after authenticated:false");
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "re-logged in after authenticated:false"
+    );
 }
 
 #[tokio::test]
@@ -253,7 +312,10 @@ async fn off_origin_redirect_exhausts_and_errors() {
         .await;
 
     let cli = build_client(&server_a.uri(), Arc::new(AtomicUsize::new(0)));
-    let err = cli.get_json::<serde_json::Value>("/handler/x").await.unwrap_err();
+    let err = cli
+        .get_json::<serde_json::Value>("/handler/x")
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("session expired"), "got: {err}");
 }
 
@@ -291,7 +353,9 @@ async fn get_bytes_accepts_real_json_attachment() {
     mount_warmup(&server).await;
     Mock::given(method("GET"))
         .and(mpath("/data.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"hello": "world"})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"hello": "world"})),
+        )
         .mount(&server)
         .await;
 

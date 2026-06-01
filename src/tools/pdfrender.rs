@@ -72,7 +72,9 @@ pub async fn rasterize_pdf(body: &[u8], max_pages: usize) -> Result<(Vec<Vec<u8>
 fn render_blocking(body: &[u8], max_pages: usize) -> Result<(Vec<Vec<u8>>, usize), String> {
     let lock = pdfium()?;
     // Serialize: PDFium is single-threaded.
-    let pdfium = lock.lock().map_err(|_| "pdfium mutex poisoned".to_string())?;
+    let pdfium = lock
+        .lock()
+        .map_err(|_| "pdfium mutex poisoned".to_string())?;
 
     let doc = pdfium
         .load_pdf_from_byte_slice(body, None)
@@ -90,7 +92,9 @@ fn render_blocking(body: &[u8], max_pages: usize) -> Result<(Vec<Vec<u8>>, usize
         let bitmap = page
             .render_with_config(&config)
             .map_err(|e| format!("render page {}: {e}", i + 1))?;
-        let image = bitmap.as_image().map_err(|e| format!("page {} as_image: {e}", i + 1))?;
+        let image = bitmap
+            .as_image()
+            .map_err(|e| format!("page {} as_image: {e}", i + 1))?;
         let mut buf = Vec::new();
         image
             .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
@@ -136,7 +140,10 @@ mod tests {
         assert_eq!(total, 1, "one page");
         assert_eq!(pngs.len(), 1);
         // PNG magic number.
-        assert_eq!(&pngs[0][..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        assert_eq!(
+            &pngs[0][..8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+        );
     }
 
     #[tokio::test]

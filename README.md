@@ -1,116 +1,387 @@
 # edookit-mcp-rs
 
-A **Rust port** of [`edookit-mcp`](../edookit-mcp) (originally Go) — an unofficial MCP
-connector for the Edookit Czech school information system. This repo exists to
-**compare the two implementations** side by side: same behavior, same security
-posture, two languages.
+Neoficiální MCP konektor pro Edookit — umožňuje AI asistentům (Claude, ChatGPT,
+Cursor, VS Code Copilot a dalším MCP-kompatibilním klientům) číst zprávy z
+žákovské knížky.
 
-> ⚠️ **Work in progress.** This is a faithful re-implementation in flight. The
-> table below tracks what's done. The Go project is the reference spec.
+> **Rust port.** Toto je přepis [`edookit-mcp`](../edookit-mcp) (původně v Go) do
+> Rustu, vytvořený pro **srovnání obou implementací**. Chování, sada nástrojů i
+> bezpečnostní model jsou stejné jako u Go verze. Upřímné srovnání Go vs Rust je
+> na konci tohoto souboru. **Neoficiální projekt — nemá nic společného s Edookit
+> s.r.o.**
 
-## Status
+---
 
-| Area | State | Tests |
-|---|---|---|
-| Scaffold, `build.rs` version injection, `--version` | ✅ done | — |
-| `client` — config/URL validation, swappable cookie jar, retry/origin/auth-envelope, `get_json`/`get_doc`/`get_to`/`get_bytes`, cookie cache | ✅ done | 23 |
-| `client::login` — chromiumoxide OIDC (fetch-intercept `prompt=none` strip, step sequence, cookie capture) | ✅ compiles¹ | — |
-| `tools::untrusted` — prompt-injection envelopes | ✅ done | 2 |
-| `tools::messages` — `list_inbox` / `list_sent` (row HTML, dates, pagination, `since`) | ✅ done | 8 |
-| `tools::message` — `get_message` (workspace JSON, body→text, recipients) | ✅ done | 7 |
-| `tools::courses` — `list_courses` (+ rosters) | ✅ done | 5 |
-| `tools::attachments` — `download_attachments` (traversal guards, race-free commit) | ✅ done | 6 |
-| `tools::view` — `view_attachment` (image downscale, PDF text + raster) | ⏳ todo | — |
-| MCP server wiring (`main`, rmcp stdio, tool registration) | ⏳ todo | — |
-| `oauth` — built-in OAuth 2.1 AS | ⏳ todo | — |
-| Streamable HTTP transport + axum integration | ⏳ todo | — |
-| Packaging (cargo-dist, deb/rpm, systemd, Homebrew, CI) | ⏳ todo | — |
-| **Total** | | **51 passing** |
+## 🇨🇿 Pro uživatele
 
-¹ The browser-login path has no automated tests (same as the Go original) — it's
-verified by `--login-test` against a live Edookit instance.
+### Co to je
 
-## Build / test
+`edookit-mcp` propojuje vašeho AI asistenta s vaším účtem v
+[Edookitu](https://edookit.com) přes [MCP](https://modelcontextprotocol.io/). Po
+napojení se můžete ptát přirozeným jazykem:
+
+- *„Mám nějaké nové zprávy?"*
+- *„Ukaž mi zprávy od ředitele za poslední týden."*
+- *„Co mi přišlo s přílohou?"*
+
+Asistent zavolá konektor, stáhne aktuální data přímo z Edookitu a odpoví českým
+souvislým textem.
+
+### K čemu to neslouží
+
+- Nepřepisuje zprávy ani neposílá za vás (zatím jen čte).
+- Nesleduje vás na pozadí — spouští se jen, když ho asistent vyvolá.
+- Neukládá data do cloudu — vše zůstává na vašem počítači. (Tělo zpráv ovšem
+  prochází přes poskytovatele vašeho AI asistenta — viz [Bezpečnost](#bezpečnost-a-soukromí).)
+
+### Co je potřeba
+
+1. **macOS / Linux / Windows** s nainstalovaným Chromem (Chromium, Brave, Edge — cokoli na Chromium jádře).
+2. **Účet v Edookitu** přihlašovaný přes Plus4U.
+3. **AI klient s podporou MCP** (Claude Desktop/Code, ChatGPT, Cursor, VS Code Copilot, Zed, Continue.dev…).
+4. **Rust 1.26+ (edition 2024)** pro sestavení ze zdrojáků.
+
+### Instalace
 
 ```bash
-cargo build              # debug build (TLS via rustls — no OpenSSL needed)
-cargo test               # 51 tests, race-free, ~ms
-cargo clippy             # lints
-./target/debug/edookit-mcp --version
+git clone git@github.com:dsaiko/edookit-mcp-rs.git
+cd edookit-mcp-rs
+make build          # stáhne přibalený PDFium a sestaví bin do target/release/
 ```
 
-Rust 1.96+, edition 2024.
+`make build` je jazykově neutrální — nemusíte řešit `cargo`. Binárku najdete v
+`target/release/edookit-mcp`. (Předkompilované binárky pro každý release jsou na
+[GitHub Releases](https://github.com/dsaiko/edookit-mcp-rs/releases) — archiv
+obsahuje binárku i přibalenou knihovnu PDFium.)
+
+> **PDFium:** rasterizace PDF příloh používá nativní knihovnu PDFium, kterou
+> `make build` stáhne do `third_party/pdfium/`. Při běhu z repozitáře se najde
+> automaticky; přesunutou/nainstalovanou binárku nasměrujte přes
+> `EDOOKIT_PDFIUM_LIB` nebo položte `libpdfium.*` vedle ní.
+
+### Konfigurace
+
+```bash
+cp .env.example .env
+chmod 600 .env       # ať heslo není čitelné pro ostatní uživatele systému
+$EDITOR .env
+```
+
+```env
+EDOOKIT_URL=https://your-school-login.edookit.net
+EDOOKIT_USER=vase.jmeno@example.cz
+EDOOKIT_PASS=vase-heslo
+```
+
+URL je specifická pro vaši školu (najdete ji v adresním řádku po přihlášení).
+
+### První spuštění (ověření)
+
+```bash
+make smoke-login        # ověří přihlášení (Chrome se na pár vteřin otevře)
+make test-messages      # vytiskne pár posledních zpráv ze schránky
+```
+
+Cookies se uloží do uživatelské cache (na macOS
+`~/Library/Caches/edookit-mcp-rs/cookies.json`) a další spuštění už Chrome
+neotevírá (~10 h). Vynucené nové přihlášení: `make clear-cookies`. Debug s
+viditelným prohlížečem: `EDOOKIT_HEADLESS_LOGIN=false`.
+
+### Připojení k AI asistentovi
+
+`edookit-mcp` je standardní MCP server přes stdio. Společná JSON konfigurace
+(Anthropic / Claude formát, který přejala většina ekosystému):
+
+```json
+{
+  "mcpServers": {
+    "edookit": {
+      "command": "/absolutní/cesta/k/edookit-mcp-rs/target/release/edookit-mcp",
+      "env": {
+        "EDOOKIT_URL": "https://your-school-login.edookit.net",
+        "EDOOKIT_USER": "vase.jmeno@example.cz",
+        "EDOOKIT_PASS": "vase-heslo"
+      }
+    }
+  }
+}
+```
+
+Liší se hlavně **kam ji vložit**: Claude Code `~/.claude.json`; Claude Desktop
+`~/Library/Application Support/Claude/claude_desktop_config.json`; Cursor
+`~/.cursor/mcp.json`; VS Code Copilot `<workspace>/.vscode/mcp.json` (jiný shape
+— klíč `servers`). Po každé změně klienta restartujte.
+
+> **Tip: heslo mimo config (Keychain).** Wrapper skript načte heslo z OS secret
+> store až při startu — viz [`scripts/edookit-mcp-wrapper.sh.example`](scripts/edookit-mcp-wrapper.sh.example).
+> V `command` ukážete na skript a `env` blok vynecháte.
+
+### Vzdálené nasazení (Streamable HTTP)
+
+Pro běžné lokální použití zůstává **stdio** výchozí. Pro vystavení jako
+**vzdálený konektor přes HTTP** (typicky za TLS reverse-proxy, např. pro ChatGPT)
+spusťte s `--http <addr>`. Autentizaci řeší **vestavěný OAuth 2.1 Authorization
+Server** (Dynamic Client Registration, PKCE S256, HMAC-SHA256 JWT), takže externí
+auth gateway není potřeba — stačí TLS terminátor:
+
+```bash
+EDOOKIT_PUBLIC_URL=https://edookit.mcp.example \
+EDOOKIT_AUTH_PASSWORD=… EDOOKIT_JWT_SECRET="$(openssl rand -base64 48)" \
+edookit-mcp --http 127.0.0.1:9000
+```
+
+HTTP transport se odmítne nastartovat bez `EDOOKIT_PUBLIC_URL`,
+`EDOOKIT_AUTH_PASSWORD` a `EDOOKIT_JWT_SECRET` (≥ 32 B) — `/mcp` se tak nikdy
+nevystaví bez auth. `SIGINT`/`SIGTERM` ukončí server čistě. Pro server install
+jsou připravené DEB/RPM balíčky se systemd unitou (viz [Distribution](#distribution-and-packaging)).
+
+### Co umí (dostupné nástroje)
+
+| Nástroj | Co dělá |
+|---|---|
+| `edookit_list_inbox` | Vypíše **Přijaté** (volitelně Nepřečtené/S hvězdičkou/Archiv/Vše). Fulltext + filtr podle data. |
+| `edookit_list_sent` | Vypíše **Vytvořené** (odeslané). Stejné filtry. |
+| `edookit_get_message` | Plný text jedné zprávy podle ID — subject, status, autor, datum, body_text, body_html, přílohy, doručenky. |
+| `edookit_download_attachments` | Stáhne všechny přílohy do lokálního adresáře. Default `<temp>/edookit-mcp/m-<id>/`. |
+| `edookit_view_attachment` | Zobrazí přílohu inline — obrázky, **PDF vyrenderuje na obrázky stránek** + extrahovaný text, text/CSV jako obsah. |
+| `edookit_list_courses` | Kurzy přihlášeného učitele (Hodnocení → Známkování v tabulce), volitelně se žáky. |
+| `edookit_server_info` | Build metadata běžícího serveru (`{version, commit, build_time}`). |
+
+Nástroje nevoláte přímo — píšete asistentovi přirozeně a on rozhodne, kdy je
+použít. Když máte připojený i Gmail/Slack MCP, pomáhá v promptu zmínit
+**„v Edookitu" / „ze školy"**.
+
+### Bezpečnost a soukromí
+
+- **Heslo** v `.env` (nebo bezpečněji v OS secret store přes wrapper). Doporučená
+  oprávnění `0600` (`chmod 600 .env`).
+- **Cookies** v uživatelské cache s oprávněními `0600` (off-Windows).
+- **Žádné externí servery** ze strany konektoru — komunikuje jen mezi vaším
+  počítačem, Edookitem a Plus4U. **Ale** AI asistent posílá výstup nástrojů (těla
+  zpráv, jména třetích stran) na servery svého poskytovatele. Pro citlivá data
+  (jména dětí, zdravotní/studijní detaily) použijte **no-train placený tarif s
+  DPA** nebo **lokální LLM** (Continue.dev/Goose + Ollama). Na free tarifech
+  zapněte opt-out z trénování. *(Nejde o právní radu — pro školní/firemní kontext
+  se zeptejte DPO/IT.)*
+
+### Časté problémy
+
+- **Chrome se otevře, ale zůstane na úvodní stránce** → změnil se HTML layout
+  Edookitu; otevřete issue se snímkem.
+- **„login failed … interaction_required"** → přihlaste se ručně do
+  uuidentity.plus4u.net, pak zkuste znovu.
+- **opakovaně „session expired"** → `make clear-cookies`.
+- **PDF příloha se nezobrazí jako obrázek** → nenašla se knihovna PDFium;
+  nastavte `EDOOKIT_PDFIUM_LIB` nebo spusťte `make build` (text se extrahuje i tak).
+- **občasná „network error" / 502/503/504** → tyhle blipy konektor 2× opakuje s
+  backoffem; když chybu vidíte i tak, selhaly všechny tři pokusy.
+
+---
+
+## 🇬🇧 Technical reference
+
+### Architecture
+
+```
+                                    ┌────────────────────────┐
+                                    │  Plus4U OIDC provider  │
+                                    │ uuidentity.plus4u.net  │
+                                    └──────────┬─────────────┘
+                                               │ (auth code flow)
+┌──────────────┐  stdio / HTTP ┌─────────────┐ │
+│ AI assistant │ ◄──────────►  │ edookit-mcp │ ◄┴── chromium (chromiumoxide)
+│ (Claude / …) │   (+ OAuth)   │   (rmcp)    │      only for login
+└──────────────┘               └──────┬──────┘
+                                       │ reqwest + swappable cookie jar
+                                       ▼
+                              ┌────────────────────┐
+                              │  Edookit backend   │
+                              │  *.edookit.net     │
+                              └────────────────────┘
+```
+
+Runs as a stdio MCP subprocess (default) or a Streamable HTTP server (`--http`).
+On the first tool call it warms the session with `GET /` (which resurrects a PHP
+session from the persistent `X-EdooAuthToken` / `X-Auth-Id` cookies), then issues
+authenticated calls to the SPA's internal JSON API. If cookies are missing/stale,
+chromium is driven through the full Plus4U OIDC flow and the resulting cookies are
+cached (~10 h).
+
+### Why a real browser for login
+
+Edookit federates to Plus4U OIDC — a uu5loader-driven SPA with reCAPTCHA. The
+token endpoint needs `client_secret_basic` (secret lives in Edookit's PHP
+backend), so ROPC is closed. Cheapest reliable answer: drive chromium once per
+~10 h via [chromiumoxide](https://github.com/mattsse/chromiumoxide), then hand the
+session cookie to reqwest. A `Fetch`-domain interceptor strips the lib's hardcoded
+`prompt=none` from the outgoing auth request **only** when its `client_id` matches
+the per-tenant one captured from the landing page (the IdM SPA's nested silent
+renewal, a different `client_id`, is left alone).
+
+### Cookie persistence + warmup, transient retries
+
+Edookit rotates `PHPSESSID` on every response; the persistent tokens are
+`X-EdooAuthToken` / `X-Auth-Id`. `ensure_logged_in` always does a warmup `GET /`
+before declaring success. All reads funnel through one helper that retries net
+errors and HTTP 408/502/503/504 with exponential backoff (default 500 ms → 1 s);
+HTTP 500/501/505+ and all 4xx propagate immediately (deterministic, not masked).
+The cookie jar is an `ArcSwap<Mutex<…>>` so session invalidation swaps the whole
+jar atomically (clearing path-scoped cookies a name-based clear would miss).
+
+### Data flow
+
+- **Lists** (`list_inbox`/`list_sent`): `/handler/grid/objects-for-me-data` /
+  `…/created-objects-data`, 100 rows/page; each row is `[uid, uid, html]` parsed
+  with `scraper`. Returns `messages` + optional `parse_warnings` (rows the server
+  returned that we couldn't parse). Rows-fetched-but-none-parsed → error, not a
+  silent empty mailbox.
+- **Message** (`get_message`): `/handler/page/message-edit?__index=N` — one
+  workspace JSON carrying the form, the attachment list, and the acceptance
+  (read-receipt) grid. Interpreted via `serde_json::Value` (the `data` field is an
+  object for the form/fileviewer panels but a bare array for the grid).
+
+### Project layout
+
+| Path | Purpose |
+|---|---|
+| `src/main.rs` | flag parsing (clap), env wiring, transport selection, dev runners |
+| `src/server.rs` | rmcp tool registration (the 7 tools) + MCP `ServerHandler` |
+| `src/http.rs` | Streamable HTTP transport + axum integration + `validate_public_url` / `guard_bind_address` |
+| `src/client/` | reqwest session client, swappable cookie jar, retry/origin, cookie cache, chromiumoxide login |
+| `src/tools/` | one module per tool + HTML/date utils + untrusted-data envelope + PDFium worker |
+| `src/oauth/` | built-in OAuth 2.1 AS (jwt HS256, server, middleware, ratelimit, login template) |
+| `packaging/` | systemd unit + env template + Debian maintainer scripts |
+| `.github/workflows/` | `ci.yml` (fmt/clippy/test/audit) + `release.yml` (cross-platform + deb/rpm) |
+
+### Dependencies
+
+[`rmcp`](https://docs.rs/rmcp) (MCP runtime), [`chromiumoxide`](https://docs.rs/chromiumoxide)
+(CDP login), [`reqwest`](https://docs.rs/reqwest) (rustls TLS) +
+[`cookie_store`](https://docs.rs/cookie_store), [`scraper`](https://docs.rs/scraper)
+(html5ever), [`pdfium-render`](https://docs.rs/pdfium-render) + bundled PDFium,
+[`pdf-extract`](https://docs.rs/pdf-extract), [`image`](https://docs.rs/image),
+[`jiff`](https://docs.rs/jiff) (bundled tzdata), [`axum`](https://docs.rs/axum) +
+`tower`, hand-rolled HS256 via `hmac`/`sha2`/`subtle`, [`tokio`](https://docs.rs/tokio).
+
+### Development
+
+```bash
+make build        # fetch PDFium + build
+make test         # 79 tests, race-free
+make check        # fmt + clippy-fix + test (mutates)
+make pre-push     # fmt-check + clippy -D + test + audit + build (the gate)
+make tools        # install cargo-audit (once)
+make smoke-login  # one-shot OIDC login against EDOOKIT_URL/USER/PASS
+make smoke-message MSG=m-NNNNNN   # (dev) dump raw message-edit JSON
+```
+
+### Testing
+
+White-box `#[cfg(test)]` modules per file (mirroring Go's in-package tests):
+HTML/date parsers against captured samples, an `httptest`-equivalent via
+[`wiremock`](https://docs.rs/wiremock) for the client + download flows, an
+injected clock for the OAuth AS, and a full DCR→authorize→token→refresh→replay
+flow via `tower::oneshot`. The PDFium render path is exercised against a synthetic
+PDF. The chromiumoxide login is not unit-tested (same as the Go original) — run
+`make smoke-login` against a live account.
+
+### Distribution and packaging
+
+`release.yml` builds for darwin/linux/windows × amd64/arm64 on a `v*` tag and, on
+Linux, produces DEB + RPM (via `cargo-deb` / `cargo-generate-rpm` — metadata in
+`Cargo.toml`) bundling the binary, the matching PDFium library, the systemd unit,
+and the env conffile, declaring `chromium` as a dependency. *(The packaging
+workflow is provided for parity but hasn't been executed yet — the first tag is
+its shakedown; RPM scriptlets for system-user creation are a flagged TODO.)*
+
+### License
+
+[MIT](LICENSE) © 2026 Dušan Saiko
 
 ---
 
 ## Go vs Rust — an honest comparison
 
-> *Preliminary, written from the actual port experience so far (client + login +
-> 5/6 tools). Expanded as the remaining phases land. The author wrote both; this
-> is engineering observation, not advocacy.*
+*Written from the actual port (the whole app: client, chromedp login, 6 tools,
+stdio + HTTP transports, OAuth AS). The author wrote both; this is engineering
+observation, not advocacy.*
 
-A caveat first: the Go original is **already very mature and defensive** — it has
-absorbed many review rounds and edge-case fixes. Porting it faithfully means the
-Rust inherits that design. So this is mostly *"the same careful design, in two
-languages"* rather than *"which language produces a better design"*.
+**Framing caveat:** the Go original is a mature, much-reviewed codebase. Porting
+it faithfully means the Rust inherits its design and defensive edge-case
+handling. So this is largely *"the same careful design, in two languages"* — the
+interesting differences are in what each language made **easy, safe, or
+annoying**, not in the architecture.
+
+### Measured (Apple Silicon, release builds)
+
+| Metric | Go | Rust | Notes |
+|---|---|---|---|
+| Binary size (stripped) | **33.8 MB**, single static file | 25.7 MB binary **+ 6.8 MB PDFium dylib** (≈ 32 MB, two files) | Comparable total; the Rust binary alone is smaller because Go embeds PDFium-as-WASM + the Go runtime, whereas Rust keeps PDFium as a separate native dylib (the chosen tradeoff) |
+| Cold build | **5.9 s** | ~104 s | Rust's big async dep tree (chromiumoxide, axum, rmcp, reqwest, image) + monomorphization |
+| Warm/incremental build | 0.15 s | a few s | |
+| Startup (`--version`, mean of 30) | 6.6 ms | **3.8 ms** | Rust has no runtime/GC init to amortize |
+| Prod LOC (excl. tests) | ~6,600 | ~5,100 | Rust a touch tighter |
+| Tests | larger suite | 79 (port in progress) | Go's coverage is more complete today |
+
+Runtime throughput/memory under load wasn't micro-benchmarked — this is a
+single-user, I/O-bound tool (every call waits on Edookit), so it wouldn't be a
+meaningful differentiator. At rest Rust is marginally leaner (no GC, rustls).
 
 ### Where Rust helped (stability / bug-proofness)
 
-- **The type system caught real mistakes at compile time** that Go would only
-  surface (if at all) at runtime: an `i64`/`u64` byte-count mismatch, a
-  non-exhaustive match on the download-classification states, and several
-  "did you handle the missing field?" spots where `Option` forced a decision.
+- **The compiler caught real mistakes** during the port that Go would surface
+  only at runtime (if at all): an `i64`/`u64` byte-count mismatch, a
+  non-exhaustive `match` on download-classification states, several
+  "did you handle the missing field?" spots where `Option` forced the decision,
+  and `#[non_exhaustive]` structs that refused silent construction.
 - **Errors are values you can't forget.** `Result` + `?` makes the
-  re-login/retry control flow explicit; there's no `if err != nil` to omit, and
-  no accidental use of a half-initialized value after an error.
-- **The cookie-jar swap is provably race-free.** Go used an `atomic.Pointer`
-  with careful comments; the Rust `ArcSwap<Mutex<…>>` expresses the same intent,
-  and the borrow checker guarantees no torn read — the invariant is in the types,
-  not the comments.
-- **Sentinel errors are exhaustive.** `ClientError::AttachmentTooLarge` as an enum
-  variant (matched with `matches!`) beats Go's `errors.Is(err, ErrX)` sentinel —
-  the compiler knows the full set.
-- **Tests are fast and deterministic.** `wiremock` + `#[tokio::test]` gave the
-  same HTTP-fake coverage as Go's `httptest`, running in milliseconds; white-box
-  `#[cfg(test)] mod` modules mirror Go's in-package tests one-for-one.
+  re-login/retry and OAuth grant flows explicit — no `if err != nil` to omit, no
+  use-after-error.
+- **The hairiest logic ported with structural guarantees.** The OAuth
+  refresh-rotation + replay-detection state machine runs under one
+  `parking_lot::Mutex`; the type system makes "held a lock across `.await`"
+  impossible by construction, and exhaustive enums model the grant outcomes.
+- **Concurrency is checked, not hoped.** The swappable cookie jar
+  (`ArcSwap<Mutex<…>>`) and the shared `Arc<Client>` are `Send + Sync` by proof;
+  `cargo test` needs no `-race` flag because the races can't compile.
 
-### Where Rust was more friction (difficulties)
+### Where Rust was more friction (Go won)
 
-- **Ecosystem archaeology.** Getting the cookie/`cookie_store` API right, and
-  discovering `scraper` doesn't re-export `ego-tree` (so a transitive dep had to
-  be version-pinned by hand) cost time Go's std-library-centric stack doesn't.
-- **One place Go's design was genuinely easier.** Go's hand-rolled cookie jar let
-  it snapshot the jar *per request attempt* to fence a set-cookie-during-reset
+- **Compile times.** 104 s cold is felt on every dependency change; Go's ~6 s is
+  a materially nicer inner loop.
+- **Ecosystem archaeology.** Aligning `cookie_store`/`ego-tree` versions and
+  learning the exact APIs of rmcp, axum 0.8, chromiumoxide, and pdfium-render
+  each cost real time. Go's std-library-centric surface needed almost none.
+- **axum 0.8 sharp edges.** `Option<ConnectInfo>` isn't a valid extractor (needs
+  a custom one); `ServerInfo`/`Implementation` are `#[non_exhaustive]`.
+- **chromiumoxide vs chromedp.** Driving the login surfaced a real behavioural
+  gap: `page.evaluate("idmLoginClick()")` *errors* because the click starts a
+  navigation that tears down the JS context — chromedp's `Evaluate` returns
+  before that happens. The fix (tolerate the eval error; the redirect-wait is the
+  real signal) is a line of code, but it's the kind of thing the Go API hid.
+- **One place Go's design was simply better.** Go's hand-rolled cookie jar
+  snapshots the jar *per request attempt* to fence a set-cookie-during-reset
   race. reqwest's `cookie_provider` can't bind the pre-send and post-response
   cookie calls to one generation, so that narrow fence is a **documented
-  simplification** in the Rust port (the important behavior — atomic
-  invalidation clearing path-scoped cookies — is preserved).
-- **Async lifecycle is more ceremony.** The chromiumoxide login has to juggle a
-  browser handle, a spawned handler task, and abort-on-drop guards for the event
-  listeners — where Go leaned on `defer cancel()` and goroutines with less
-  boilerplate.
-- **`!Send` will bite PDFium.** PDFium isn't thread-safe, so the Rust view tool
-  needs a dedicated worker thread + channel; Go's `go-pdfium` pool abstracted
-  that away. (And the WASM-no-cgo trick the Go build used has no turnkey Rust
-  equivalent — hence the native-lib dependency, a deliberate divergence.)
-- **More upfront design.** serde derives, explicit lifetimes on DOM node refs,
-  and choosing concrete types cost more keystrokes than Go's structural typing —
-  though they're also what bought the compile-time guarantees above.
+  simplification** here (the important behavior — atomic invalidation — is kept).
+- **PDFium.** Go's `go-pdfium` ships PDFium as WASM (wazero) → a no-cgo single
+  binary for free. Rust has no turnkey equivalent, so the port links a native
+  dylib (fetched by `make build`, shipped alongside in packaging).
 
 ### Roughly a wash
 
-- **HTML scraping:** `scraper` (CSS + html5ever) vs goquery — comparable; raw
-  tree-walking for the text renderers is similar effort either way.
-- **JSON:** serde's typed derive is nicer than `encoding/json` for fixed shapes,
-  but the loosely-typed `message-edit` response needed `serde_json::Value` — the
-  direct analog of Go's `map[string]any`. Net neutral.
-- **Lines of code:** comparable so far (the Rust is marginally longer due to
-  explicit error types and derives).
+- **HTML scraping** (`scraper` vs goquery), **JSON** (serde `Value` vs
+  `map[string]any`), and **MCP plumbing** (rmcp `#[tool]` macros vs mcp-go
+  `AddTool`) — different ergonomics, similar effort.
 
-### Performance
+### Bottom line
 
-**Not yet measured** — benchmarking is a later phase. Early structural notes: the
-Rust build defaults to rustls (no system OpenSSL), `jiff` bundles tzdata like
-Go's `time/tzdata`, and the binary is a single artifact (modulo the PDFium native
-lib). Real numbers (cold-start, per-request latency, memory, binary size) will go
-here once both are measured on the same workload.
+For *this* workload the two are closer than the language wars suggest, because the
+design was fixed in advance. Rust's dividend is **compile-time correctness
+guarantees** (several latent bugs caught for free) and a slightly faster/leaner
+runtime; the price is **build times and ecosystem friction**. Go's dividend is a
+**dramatically tighter build loop** and a **simpler single-artifact story** (the
+PDFium-as-WASM trick especially); the price is that a class of bugs the Rust
+compiler rejected would only show up in tests or production. Neither is "better"
+here — they optimize for different things, and this port made the trade-offs
+concrete rather than theoretical.

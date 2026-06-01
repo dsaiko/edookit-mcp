@@ -53,7 +53,8 @@ pub async fn download_attachments(
     let msg = get_message(cli, message_id).await?;
 
     let dest_dir = resolve_dest_dir(&opts.dest_dir, &msg.id)?;
-    create_dir_secure(&dest_dir).with_context(|| format!("create destination dir {}", dest_dir.display()))?;
+    create_dir_secure(&dest_dir)
+        .with_context(|| format!("create destination dir {}", dest_dir.display()))?;
 
     let mut res = DownloadResult {
         message_id: msg.id.clone(),
@@ -105,10 +106,12 @@ fn validate_attachment(a: &Attachment) -> Option<String> {
     }
     let safe = base_name(&a.name);
     match safe.as_deref() {
-        None | Some("") | Some(".") | Some("..") => {
-            Some(format!("attachment name {:?} is not safe to use as a filename", a.name))
-        }
-        Some(name) => windows_unsafe_name(name).map(|r| format!("attachment name {:?} rejected: {}", a.name, r)),
+        None | Some("") | Some(".") | Some("..") => Some(format!(
+            "attachment name {:?} is not safe to use as a filename",
+            a.name
+        )),
+        Some(name) => windows_unsafe_name(name)
+            .map(|r| format!("attachment name {:?} rejected: {}", a.name, r)),
     }
 }
 
@@ -119,7 +122,8 @@ fn plan_destination(
     dest_dir: &Path,
     used_names: &mut HashMap<String, ()>,
 ) -> Result<PathBuf, String> {
-    let base = base_name(name).ok_or_else(|| format!("attachment name {name:?} is not safe to use as a filename"))?;
+    let base = base_name(name)
+        .ok_or_else(|| format!("attachment name {name:?} is not safe to use as a filename"))?;
     let safe = unique_filename(&base, used_names);
     used_names.insert(safe.to_lowercase(), ());
 
@@ -127,7 +131,9 @@ fn plan_destination(
     // Containment: the chosen name is a single component, so dst's parent must
     // be exactly dest_dir. (Defends against volume-rooted Windows names too.)
     if dst.parent() != Some(dest_dir) {
-        return Err(format!("attachment name {name:?} would escape destination dir"));
+        return Err(format!(
+            "attachment name {name:?} would escape destination dir"
+        ));
     }
     Ok(dst)
 }
@@ -151,7 +157,11 @@ async fn stream_to_dest(
         return out;
     }
 
-    let mut tmp = match tempfile::Builder::new().prefix(".edookit-download-").suffix(".part").tempfile_in(dest_dir) {
+    let mut tmp = match tempfile::Builder::new()
+        .prefix(".edookit-download-")
+        .suffix(".part")
+        .tempfile_in(dest_dir)
+    {
         Ok(t) => t,
         Err(e) => {
             out.error = format!("create temp in {}: {e}", dest_dir.display());
@@ -161,7 +171,10 @@ async fn stream_to_dest(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = tmp.as_file().set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        if let Err(e) = tmp
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+        {
             out.error = format!("chmod temp: {e}");
             return out;
         }
@@ -217,7 +230,11 @@ fn unique_filename(base: &str, used_names: &HashMap<String, ()>) -> String {
         return base.to_string();
     }
     let p = Path::new(base);
-    let ext = p.extension().and_then(|e| e.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
     let stem = base.strip_suffix(&ext).unwrap_or(base);
     let mut n = 2;
     loop {
@@ -232,7 +249,10 @@ fn unique_filename(base: &str, used_names: &HashMap<String, ()>) -> String {
 /// `filepath.Base` equivalent: the final path component, or `None` for paths
 /// with no usable file name (`""`, `"."`, `".."`, `"/"`).
 fn base_name(name: &str) -> Option<String> {
-    Path::new(name).file_name().and_then(|s| s.to_str()).map(|s| s.to_string())
+    Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
 }
 
 /// Applies the default-path policy and expands a leading tilde. Empty →
@@ -244,10 +264,16 @@ fn resolve_dest_dir(raw: &str, msg_id: &str) -> anyhow::Result<PathBuf> {
     }
     if raw == "~" || raw.starts_with("~/") {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("expand ~ in {raw:?}: no home dir"))?;
-        return Ok(if raw == "~" { home } else { home.join(&raw[2..]) });
+        return Ok(if raw == "~" {
+            home
+        } else {
+            home.join(&raw[2..])
+        });
     }
     if !Path::new(raw).is_absolute() {
-        bail!("destination_dir {raw:?} must be absolute or start with ~/ (the MCP server's cwd is not a stable anchor)");
+        bail!(
+            "destination_dir {raw:?} must be absolute or start with ~/ (the MCP server's cwd is not a stable anchor)"
+        );
     }
     Ok(PathBuf::from(raw))
 }
@@ -255,7 +281,10 @@ fn resolve_dest_dir(raw: &str, msg_id: &str) -> anyhow::Result<PathBuf> {
 #[cfg(unix)]
 fn create_dir_secure(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
 }
 #[cfg(not(unix))]
 fn create_dir_secure(dir: &Path) -> std::io::Result<()> {
@@ -266,15 +295,22 @@ fn create_dir_secure(dir: &Path) -> std::io::Result<()> {
 fn windows_unsafe_name(name: &str) -> Option<String> {
     const RESERVED: &[&str] = &[
         "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
+        "LPT9",
     ];
     for c in name.chars() {
         if (c as u32) < 32 {
             return Some("contains a control character (Windows-reserved)".into());
         }
         match c {
-            ':' => return Some("contains ':' (would create an NTFS Alternate Data Stream on Windows)".into()),
-            '<' | '>' | '"' | '|' | '?' | '*' => return Some(format!("contains Windows-reserved character {c:?}")),
+            ':' => {
+                return Some(
+                    "contains ':' (would create an NTFS Alternate Data Stream on Windows)".into(),
+                );
+            }
+            '<' | '>' | '"' | '|' | '?' | '*' => {
+                return Some(format!("contains Windows-reserved character {c:?}"));
+            }
             _ => {}
         }
     }
@@ -285,7 +321,9 @@ fn windows_unsafe_name(name: &str) -> Option<String> {
     }
     let stem = name.split_once('.').map(|(s, _)| s).unwrap_or(name);
     if RESERVED.contains(&stem.to_uppercase().as_str()) {
-        return Some(format!("basename {stem:?} is a reserved Windows device name"));
+        return Some(format!(
+            "basename {stem:?} is a reserved Windows device name"
+        ));
     }
     None
 }
@@ -309,7 +347,10 @@ mod tests {
         let d = resolve_dest_dir("", "m-1").unwrap();
         assert!(d.ends_with("edookit-mcp/m-1"));
         // absolute passes through
-        assert_eq!(resolve_dest_dir("/tmp/x", "m-1").unwrap(), PathBuf::from("/tmp/x"));
+        assert_eq!(
+            resolve_dest_dir("/tmp/x", "m-1").unwrap(),
+            PathBuf::from("/tmp/x")
+        );
         // relative rejected
         assert!(resolve_dest_dir("rel/path", "m-1").is_err());
         // ~ expands
@@ -338,7 +379,12 @@ mod tests {
 
     #[test]
     fn validate_attachment_rejects_empty_url() {
-        let a = Attachment { id: "1".into(), name: "x.txt".into(), url: "".into(), date: String::new() };
+        let a = Attachment {
+            id: "1".into(),
+            name: "x.txt".into(),
+            url: "".into(),
+            date: String::new(),
+        };
         assert!(validate_attachment(&a).is_some());
     }
 
@@ -349,7 +395,8 @@ mod tests {
     }
 
     fn build_client(uri: &str) -> Client {
-        let login_fn: LoginFn = Arc::new(|| Box::pin(async { Ok(vec![LoginCookie::new("X-EdooAuthToken", "tok")]) }));
+        let login_fn: LoginFn =
+            Arc::new(|| Box::pin(async { Ok(vec![LoginCookie::new("X-EdooAuthToken", "tok")]) }));
         let mut cfg = Config::new(uri, "u", "p");
         cfg.retry_base_delay = Duration::from_millis(1);
         cfg.login_fn = Some(login_fn);
@@ -378,12 +425,18 @@ mod tests {
     #[tokio::test]
     async fn downloads_attachment_to_dir() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(mpath("/")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(mpath("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
         let dl_url = format!("{}/handler/download/file1", server.uri());
         Mock::given(method("GET"))
             .and(mpath("/handler/page/message-edit"))
             .and(query_param("__index", "1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(message_edit_with_attachment(&dl_url)))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(message_edit_with_attachment(&dl_url)),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -401,7 +454,10 @@ mod tests {
         let res = download_attachments(
             &cli,
             "m-1",
-            DownloadOptions { dest_dir: tmp.path().display().to_string(), overwrite: false },
+            DownloadOptions {
+                dest_dir: tmp.path().display().to_string(),
+                overwrite: false,
+            },
         )
         .await
         .unwrap();

@@ -60,8 +60,9 @@ impl From<anyhow::Error> for ClientError {
 /// A login callback that replaces the default chromiumoxide-driven OIDC flow.
 /// Production leaves this `None`; tests inject a fake so `ensure_logged_in`'s
 /// retry/invalidation paths can run without bringing up a real browser.
-pub type LoginFn =
-    Arc<dyn Fn() -> futures::future::BoxFuture<'static, anyhow::Result<Vec<LoginCookie>>> + Send + Sync>;
+pub type LoginFn = Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, anyhow::Result<Vec<LoginCookie>>> + Send + Sync,
+>;
 
 /// A cookie captured from the browser at login (or returned by a test
 /// [`LoginFn`]). Only name/value are used when seeding the jar — for the
@@ -125,7 +126,11 @@ pub struct Config {
 
 impl Config {
     /// A minimal config with the required credentials and all-default knobs.
-    pub fn new(base_url: impl Into<String>, username: impl Into<String>, password: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
         Config {
             base_url: base_url.into(),
             username: username.into(),
@@ -178,10 +183,7 @@ impl Client {
         if cfg.login_timeout.is_zero() {
             cfg.login_timeout = Duration::from_secs(90);
         }
-        let tz = cfg
-            .timezone
-            .clone()
-            .unwrap_or_else(default_timezone);
+        let tz = cfg.timezone.clone().unwrap_or_else(default_timezone);
 
         let base_url = parse_base_url(&cfg.base_url, cfg.allow_insecure_http)?;
 
@@ -407,7 +409,11 @@ impl Client {
     /// Fetches `GET <path>` fully into memory (up to `limit` bytes) and returns
     /// the body with its `Content-Type`. Returns
     /// [`ClientError::AttachmentTooLarge`] if the body would exceed `limit`.
-    pub async fn get_bytes(&self, path: &str, limit: u64) -> Result<(Vec<u8>, String), ClientError> {
+    pub async fn get_bytes(
+        &self,
+        path: &str,
+        limit: u64,
+    ) -> Result<(Vec<u8>, String), ClientError> {
         let mut allow_retry = true;
         loop {
             self.ensure_logged_in().await?;
@@ -439,7 +445,8 @@ impl Client {
             let mut stream = resp.bytes_stream();
             let mut buf: Vec<u8> = Vec::new();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| ClientError::msg(format!("read body from {path}: {e}")))?;
+                let chunk =
+                    chunk.map_err(|e| ClientError::msg(format!("read body from {path}: {e}")))?;
                 buf.extend_from_slice(&chunk);
                 if buf.len() as u64 > limit {
                     return Err(ClientError::AttachmentTooLarge);
@@ -469,7 +476,9 @@ impl Client {
             Ok((cookies, age)) if age < self.cfg.cookie_max_age => {
                 let n = cookies.len();
                 self.jar.set_name_values(&self.base_url, &cookies);
-                tracing::info!("loaded {n} cached cookies (age {age:?}); will verify on first call");
+                tracing::info!(
+                    "loaded {n} cached cookies (age {age:?}); will verify on first call"
+                );
             }
             Ok((_, age)) => {
                 tracing::info!(
@@ -563,11 +572,16 @@ impl Client {
             // Mark as XHR so the server returns JSON rather than the SPA loader.
             builder = builder
                 .header(ACCEPT, HeaderValue::from_static("application/json"))
-                .header("X-Requested-With", HeaderValue::from_static("XMLHttpRequest"));
+                .header(
+                    "X-Requested-With",
+                    HeaderValue::from_static("XMLHttpRequest"),
+                );
         } else {
             builder = builder.header(
                 ACCEPT,
-                HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+                HeaderValue::from_static(
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                ),
             );
         }
         builder
@@ -619,7 +633,9 @@ impl Client {
                 }
             }
         }
-        Err(ClientError::msg(format!("after {attempts} attempt(s): {last_err}")))
+        Err(ClientError::msg(format!(
+            "after {attempts} attempt(s): {last_err}"
+        )))
     }
 }
 
@@ -657,7 +673,9 @@ fn parse_auth_envelope(body: &[u8]) -> Option<bool> {
     struct Env {
         authenticated: Option<bool>,
     }
-    serde_json::from_slice::<Env>(body).ok().and_then(|e| e.authenticated)
+    serde_json::from_slice::<Env>(body)
+        .ok()
+        .and_then(|e| e.authenticated)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -708,7 +726,9 @@ fn parse_base_url(raw: &str, allow_insecure_http: bool) -> anyhow::Result<Url> {
         anyhow!("BaseURL {raw:?} must use http or https scheme (e.g. https://your-school-login.edookit.net): {e}")
     })?;
     if u.scheme() != SCHEME_HTTP && u.scheme() != SCHEME_HTTPS {
-        bail!("BaseURL {raw:?} must use http or https scheme (e.g. https://your-school-login.edookit.net)");
+        bail!(
+            "BaseURL {raw:?} must use http or https scheme (e.g. https://your-school-login.edookit.net)"
+        );
     }
     if u.host().is_none() || u.host_str().is_none_or(|h| h.is_empty()) {
         bail!("BaseURL {raw:?} has no host");
@@ -754,7 +774,8 @@ impl Jar {
     }
 
     fn reset(&self) {
-        self.inner.store(Arc::new(Mutex::new(cookie_store::new_store())));
+        self.inner
+            .store(Arc::new(Mutex::new(cookie_store::new_store())));
     }
 
     fn has_cookies_for(&self, url: &Url) -> bool {
@@ -792,7 +813,12 @@ impl Jar {
     }
 }
 
-fn insert_name_value(store: &mut cookie_store::CookieStoreImpl, base: &Url, name: &str, value: &str) {
+fn insert_name_value(
+    store: &mut cookie_store::CookieStoreImpl,
+    base: &Url,
+    name: &str,
+    value: &str,
+) {
     let raw = cookie_store::RawCookie::new(name.to_string(), value.to_string());
     let _ = store.insert_raw(&raw, base);
 }

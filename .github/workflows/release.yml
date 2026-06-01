@@ -1,0 +1,97 @@
+name: release
+
+# Cross-platform release on a v* tag, mirroring the Go project's GoReleaser
+# matrix: tarballs/zip for each OS/arch + DEB/RPM for Linux (with the systemd
+# unit, env conffile, chromium dependency, and the bundled PDFium library).
+#
+# NOTE: this workflow is provided for parity but has not been executed in the
+# port environment (no Linux/cross runners available here). Treat the first
+# real tag as the shakedown run.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # Same gate as ci before any artifact is produced.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/fetch-pdfium.sh
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  name: Linux_x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: Linux_arm64 }
+          - { os: macos-13,        target: x86_64-apple-darwin,        name: Darwin_x86_64 }
+          - { os: macos-14,        target: aarch64-apple-darwin,       name: Darwin_arm64 }
+          - { os: windows-latest,  target: x86_64-pc-windows-msvc,     name: Windows_x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        shell: bash
+        env:
+          EDOOKIT_VERSION: ${{ github.ref_name }}
+          EDOOKIT_BUILD_DATE: ${{ github.event.head_commit.timestamp }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Linux packages: DEB + RPM with systemd unit, conffile, chromium dep,
+      # bundled PDFium. cargo-deb / cargo-generate-rpm read the metadata in
+      # Cargo.toml; fetch-pdfium drops the .so the package bundles.
+      - name: Linux packages (deb/rpm)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          ./scripts/fetch-pdfium.sh
+          cargo install cargo-deb cargo-generate-rpm
+          cargo deb --no-build --target ${{ matrix.target }}
+          cargo generate-rpm --target ${{ matrix.target }}
+
+      - name: Stage archive
+        shell: bash
+        run: |
+          ./scripts/fetch-pdfium.sh || true
+          mkdir -p dist
+          bin=edookit-mcp; [ "${{ runner.os }}" = "Windows" ] && bin=edookit-mcp.exe
+          cp "target/${{ matrix.target }}/release/$bin" dist/
+          cp README.md LICENSE .env.example dist/ 2>/dev/null || true
+          # Bundle the matching PDFium library next to the binary.
+          find third_party/pdfium -name 'libpdfium.*' -o -name 'pdfium.dll' | head -1 | xargs -I{} cp {} dist/ || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edookit-mcp_${{ matrix.name }}
+          path: |
+            dist/*
+            target/${{ matrix.target }}/debian/*.deb
+            target/generate-rpm/*.rpm
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
