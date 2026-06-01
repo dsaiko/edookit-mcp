@@ -1,0 +1,46 @@
+[package]
+name = "edookit-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+arc-swap = "1.9.1"
+askama = "0.16.0"
+axum = "0.8.9"
+base64 = "0.22.1"
+chromiumoxide = "0.9.1"
+clap = { version = "4.6.1", features = ["derive", "env"] }
+cookie_store = { version = "0.22.1", features = ["public_suffix"] }
+dirs = "6.0.0"
+ego-tree = "0.11.0"
+futures = "0.3.32"
+getrandom = "0.4.2"
+hmac = "0.13.0"
+image = "0.25.10"
+jiff = { version = "0.2.28", features = ["tzdb-bundle-always"] }
+mime_guess = "2.0.5"
+parking_lot = "0.12.5"
+pdf-extract = "0.10.0"
+pdfium-render = "0.9.1"
+regex = "1.12.3"
+reqwest = { version = "0.13.4", features = ["json", "stream", "cookies"] }
+rmcp = { version = "1.7.0", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+schemars = "1.2.1"
+scraper = "0.27.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["full"] }
+tower = "0.5.3"
+tower-http = { version = "0.6.11", features = ["limit"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+wiremock = "0.6.5"
