@@ -34,14 +34,20 @@ pub async fn run_http(template: EdookitServer, addr: String) -> anyhow::Result<(
 
     let auth = Arc::new(build_auth_server()?);
     auth.start_gc();
-    let allowed_hosts = Arc::new(build_allowed_hosts(auth.public_url(), &[]));
+    let allowed = build_allowed_hosts(auth.public_url(), &[]);
 
     // rmcp Streamable HTTP service — a fresh server instance per session.
+    // rmcp has its OWN Host allow-list (DNS-rebinding guard) that defaults to
+    // loopback only; behind a reverse proxy that preserves Host, an inbound
+    // `Host: <public>` would be rejected on /mcp. Teach it the same set the
+    // outer require_known_host layer enforces (public host + loopback).
     let mcp_service = StreamableHttpService::new(
         move || Ok(template.clone()),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        StreamableHttpServerConfig::default().with_allowed_hosts(allowed.iter().cloned()),
     );
+
+    let allowed_hosts = Arc::new(allowed);
 
     // /mcp under the bearer gate + body cap.
     let mcp_router = Router::new()
