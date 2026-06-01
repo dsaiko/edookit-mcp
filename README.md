@@ -43,6 +43,18 @@ souvislým textem.
 
 ### Instalace
 
+**Homebrew (macOS / Linux) — nejjednodušší:**
+
+```bash
+brew install dsaiko/tap/edookit-mcp-rs
+```
+
+Nainstaluje se příkaz `edookit-mcp-rs` (i s přibalenou knihovnou PDFium). Tap
+[`dsaiko/homebrew-tap`](https://github.com/dsaiko/homebrew-tap) hostí i Go verzi
+jako `edookit-mcp` — obě mohou být nainstalované zároveň.
+
+**Ze zdrojáků:**
+
 ```bash
 git clone git@github.com:dsaiko/edookit-mcp-rs.git
 cd edookit-mcp-rs
@@ -106,6 +118,9 @@ viditelným prohlížečem: `EDOOKIT_HEADLESS_LOGIN=false`.
   }
 }
 ```
+
+Při instalaci přes Homebrew je `command` jen `"edookit-mcp-rs"` (je na PATH);
+absolutní cesta k `target/release/edookit-mcp` platí pro build ze zdrojáků.
 
 Liší se hlavně **kam ji vložit**: Claude Code `~/.claude.json`; Claude Desktop
 `~/Library/Application Support/Claude/claude_desktop_config.json`; Cursor
