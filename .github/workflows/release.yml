@@ -43,8 +43,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # Every matrix entry is a NATIVE runner for its arch (incl. GitHub's free
+      # ubuntu-*-arm for public repos), so we build for the host target — no
+      # cross-compilation, and the binary lands in target/release/ where the
+      # cargo-deb/rpm assets in Cargo.toml expect it. `matrix.target` is kept for
+      # the artifact name only.
       - uses: dtolnay/rust-toolchain@stable
-        with: { targets: "${{ matrix.target }}" }
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
@@ -52,7 +56,7 @@ jobs:
         env:
           EDOOKIT_VERSION: ${{ github.ref_name }}
           EDOOKIT_BUILD_DATE: ${{ github.event.head_commit.timestamp }}
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked
 
       # Linux packages: DEB + RPM with systemd unit, conffile, chromium dep,
       # bundled PDFium. cargo-deb / cargo-generate-rpm read the metadata in
@@ -62,8 +66,8 @@ jobs:
         run: |
           ./scripts/fetch-pdfium.sh
           cargo install cargo-deb cargo-generate-rpm
-          cargo deb --no-build --target ${{ matrix.target }}
-          cargo generate-rpm --target ${{ matrix.target }}
+          cargo deb --no-build
+          cargo generate-rpm
 
       - name: Stage archive
         shell: bash
@@ -71,7 +75,7 @@ jobs:
           ./scripts/fetch-pdfium.sh || true
           mkdir -p dist
           bin=edookit-mcp; [ "${{ runner.os }}" = "Windows" ] && bin=edookit-mcp.exe
-          cp "target/${{ matrix.target }}/release/$bin" dist/
+          cp "target/release/$bin" dist/
           cp README.md LICENSE .env.example dist/ 2>/dev/null || true
           # Bundle the matching PDFium library next to the binary.
           find third_party/pdfium -name 'libpdfium.*' -o -name 'pdfium.dll' | head -1 | xargs -I{} cp {} dist/ || true
@@ -81,7 +85,7 @@ jobs:
           name: edookit-mcp_${{ matrix.name }}
           path: |
             dist/*
-            target/${{ matrix.target }}/debian/*.deb
+            target/debian/*.deb
             target/generate-rpm/*.rpm
 
   release:
