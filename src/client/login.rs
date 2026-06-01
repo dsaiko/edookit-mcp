@@ -183,45 +183,45 @@ async fn run_login(
         );
     }
 
-    // 6. Wait for redirect to Plus4U identity.
-    tracing::info!("[login] wait for redirect to Plus4U identity");
-    wait_for_host(&page, PLUS4U_HOST, Duration::from_secs(30))
-        .await
-        .context("wait for redirect to Plus4U identity")?;
-
-    // 7. Fill credentials.
-    tracing::info!("[login] fill username");
-    wait_visible(
-        &page,
-        r#"input[autocomplete="username"]"#,
-        Duration::from_secs(30),
-    )
-    .await
-    .context("wait for username input")?;
-    let user_el = page
-        .find_element(r#"input[autocomplete="username"]"#)
-        .await?;
-    user_el.click().await?.type_str(&cfg.username).await?;
-
-    tracing::info!("[login] fill password");
-    let pass_el = page
-        .find_element(r#"input[autocomplete="current-password"]"#)
-        .await?;
-    pass_el.click().await?.type_str(&cfg.password).await?;
-
-    // 8. Submit the form.
-    tracing::info!("[login] submit credentials");
-    page.evaluate(
-        r#"document.querySelector('input[autocomplete="current-password"]').form.submit()"#,
-    )
-    .await
-    .context("submit credentials")?;
-
-    // 9. Wait for redirect back to Edookit.
-    tracing::info!("[login] wait for redirect back to Edookit");
-    wait_for_host(&page, base_host, Duration::from_secs(60))
-        .await
-        .context("wait for redirect back to Edookit")?;
+    // 6. Complete the flow resiliently. After the trigger, two paths are
+    //    possible:
+    //      (a) no active Plus4U session → the login form is shown → fill it;
+    //      (b) an active Plus4U session → silent SSO bounces straight back to
+    //          Edookit with NO form shown.
+    //    A rigid "wait-for-Plus4U → fill → wait-for-Edookit" sequence hangs on
+    //    (b): the fast bounce slips past the host poll. So instead we poll for
+    //    the real success signal — the persistent Edookit auth cookie set by the
+    //    OIDC callback — and fill the Plus4U form only if/when it appears.
+    tracing::info!("[login] completing OIDC flow (filling Plus4U form if shown)");
+    let deadline = Instant::now() + Duration::from_secs(75);
+    let mut filled = false;
+    loop {
+        if authenticated(&page, base_host).await {
+            break;
+        }
+        if !filled && fill_plus4u_form_if_present(&page, &cfg.username, &cfg.password).await? {
+            filled = true;
+            tracing::info!("[login] submitted Plus4U credentials");
+        }
+        if Instant::now() >= deadline {
+            let url = page.url().await.ok().flatten().unwrap_or_default();
+            // Surface the cookies we DID see for the host, so a cookie-name
+            // mismatch in `authenticated()` is obvious without another round-trip.
+            let names: Vec<String> = page
+                .get_cookies()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| host_matches_cookie(base_host, &c.domain))
+                .map(|c| c.name)
+                .collect();
+            bail!(
+                "login did not complete within 75s (no Edookit auth cookie; last URL: {url}; cookies seen for host: {names:?})"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    tracing::info!("[login] authenticated session detected");
 
     // 10. Capture cookies for the target host.
     let raw = page.get_cookies().await.context("read cookies")?;
@@ -362,22 +362,55 @@ async fn wait_js_true(page: &Page, expr: &str, timeout: Duration) -> anyhow::Res
     }
 }
 
-/// Polls the current page URL until the host matches, signalling the OIDC
-/// redirect chain has progressed.
-async fn wait_for_host(page: &Page, want_host: &str, timeout: Duration) -> anyhow::Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(Some(current)) = page.url().await
-            && let Ok(u) = Url::parse(&current)
-            && u.host_str() == Some(want_host)
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("timed out waiting for redirect to {want_host}");
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+/// True once the persistent Edookit auth cookie (set by the OIDC callback) is
+/// present for the target host — the real "login complete" signal, regardless
+/// of whether the Plus4U form was shown or silent SSO bounced straight back.
+async fn authenticated(page: &Page, base_host: &str) -> bool {
+    let Ok(cookies) = page.get_cookies().await else {
+        return false;
+    };
+    cookies.iter().any(|c| {
+        (c.name == "X-EdooAuthToken" || c.name == "X-Auth-Id")
+            && host_matches_cookie(base_host, &c.domain)
+    })
+}
+
+/// Fills + submits the Plus4U login form if its username field is currently
+/// visible. Returns true if it submitted, false if the form wasn't there (e.g.
+/// silent SSO already bounced us back). Submitting navigates away, so the
+/// submit eval's "context destroyed" error is tolerated.
+async fn fill_plus4u_form_if_present(
+    page: &Page,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<bool> {
+    let on_plus4u = page
+        .url()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|u| Url::parse(&u).ok())
+        .and_then(|u| u.host_str().map(str::to_string))
+        .is_some_and(|h| h == PLUS4U_HOST);
+    if !on_plus4u {
+        return Ok(false);
     }
+    let Ok(user_el) = page.find_element(r#"input[autocomplete="username"]"#).await else {
+        return Ok(false);
+    };
+    user_el.click().await?.type_str(username).await?;
+    if let Ok(pass_el) = page
+        .find_element(r#"input[autocomplete="current-password"]"#)
+        .await
+    {
+        pass_el.click().await?.type_str(password).await?;
+    }
+    let _ = page
+        .evaluate(
+            r#"document.querySelector('input[autocomplete="current-password"]').form.submit()"#,
+        )
+        .await;
+    Ok(true)
 }
 
 /// Launches chromium against `base_url`, waits for the page to render, and

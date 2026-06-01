@@ -361,8 +361,14 @@ meaningful differentiator. At rest Rust is marginally leaner (no GC, rustls).
 - **chromiumoxide vs chromedp.** Driving the login surfaced a real behavioural
   gap: `page.evaluate("idmLoginClick()")` *errors* because the click starts a
   navigation that tears down the JS context — chromedp's `Evaluate` returns
-  before that happens. The fix (tolerate the eval error; the redirect-wait is the
-  real signal) is a line of code, but it's the kind of thing the Go API hid.
+  before that happens, so you tolerate the eval error instead. Chasing that also
+  exposed a latent flaw the Go original *shares*: its rigid "wait-for-Plus4U →
+  fill form → wait-for-Edookit" sequence **hangs when Plus4U has an active
+  session and silent-SSO's straight back** (the form never shows, and the fast
+  bounce slips past the host poll). The Rust port instead waits on the real
+  success signal — the `X-EdooAuthToken` cookie the OIDC callback sets — and
+  fills the form only if it appears, so both the form and silent-SSO paths work.
+  A case where porting *improved* on the reference.
 - **One place Go's design was simply better.** Go's hand-rolled cookie jar
   snapshots the jar *per request attempt* to fence a set-cookie-during-reset
   race. reqwest's `cookie_provider` can't bind the pre-send and post-response
