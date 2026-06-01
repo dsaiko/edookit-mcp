@@ -267,4 +267,42 @@ mod flow_tests {
             .unwrap();
         assert_eq!(pr.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn dcr_throttle_blocks_after_max_registrations() {
+        let srv = test_server();
+        let body = r#"{"redirect_uris":["https://c.example/cb"]}"#;
+        let mut statuses = Vec::new();
+        // Fixed clock → window never advances; the 6th (dcr max = 5) is blocked.
+        for _ in 0..6 {
+            let resp = app(srv.clone())
+                .oneshot(
+                    Request::post("/oauth/register")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            statuses.push(resp.status());
+        }
+        assert_eq!(statuses[0], StatusCode::CREATED);
+        assert_eq!(
+            *statuses.last().unwrap(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "6th DCR from one IP is rate-limited"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_rejects_oversized_body() {
+        let srv = test_server();
+        // > 16 KiB body → the DefaultBodyLimit on /oauth/register rejects it.
+        let big = format!(
+            r#"{{"redirect_uris":["https://c.example/cb"],"client_name":"{}"}}"#,
+            "x".repeat(20_000)
+        );
+        let resp = post_form(&srv, "/oauth/register", big).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }

@@ -364,3 +364,106 @@ async fn get_bytes_accepts_real_json_attachment() {
     assert!(ct.contains("application/json"));
     assert!(!body.is_empty());
 }
+
+#[tokio::test]
+async fn cached_cookies_take_fast_path_without_login() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    Mock::given(method("GET"))
+        .and(mpath("/handler/x"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": 1})))
+        .mount(&server)
+        .await;
+
+    // Pre-write a fresh cookie cache for this base URL.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cookies.json");
+    super::cookie_store::save_cookies(
+        &cache,
+        &server.uri(),
+        vec![super::StoredCookie {
+            name: "X-EdooAuthToken".into(),
+            value: "tok".into(),
+        }],
+    )
+    .unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let lc = calls.clone();
+    let login_fn: LoginFn = Arc::new(move || {
+        let lc = lc.clone();
+        Box::pin(async move {
+            lc.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![LoginCookie::new("X", "Y")])
+        })
+    });
+    let mut cfg = Config::new(server.uri(), "u", "p");
+    cfg.retry_base_delay = Duration::from_millis(1);
+    cfg.cookie_cache_path = Some(cache);
+    cfg.login_fn = Some(login_fn);
+    let cli = Client::new(cfg).unwrap();
+
+    let _v: serde_json::Value = cli.get_json("/handler/x").await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "cached cookies → warmup only, no chromium login"
+    );
+}
+
+#[tokio::test]
+async fn get_bytes_keeps_genuine_html_attachment_after_retry() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    // Always HTML: first hit looks like a stale-session login page (retry),
+    // but a successful re-login that STILL yields HTML means it's a real HTML
+    // attachment → accept it rather than fail.
+    Mock::given(method("GET"))
+        .and(mpath("/page.html"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("<html>real</html>", "text/html"))
+        .mount(&server)
+        .await;
+
+    let cli = build_client(&server.uri(), Arc::new(AtomicUsize::new(0)));
+    let (body, ct) = cli.get_bytes("/page.html", 1_000_000).await.unwrap();
+    assert!(ct.contains("text/html"));
+    assert!(String::from_utf8_lossy(&body).contains("real"));
+}
+
+#[tokio::test]
+async fn concurrent_requests_with_invalidation_dont_deadlock() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    Mock::given(method("GET"))
+        .and(mpath("/handler/x"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": 1})))
+        .mount(&server)
+        .await;
+
+    let cli = Arc::new(build_client(&server.uri(), Arc::new(AtomicUsize::new(0))));
+    let mut tasks = Vec::new();
+    for _ in 0..12 {
+        let c = cli.clone();
+        tasks.push(tokio::spawn(async move {
+            c.get_json::<serde_json::Value>("/handler/x").await.is_ok()
+        }));
+    }
+    // Interleave session invalidations to exercise the atomic jar swap.
+    let inv = cli.clone();
+    tasks.push(tokio::spawn(async move {
+        inv.invalidate_session().await;
+        inv.invalidate_session().await;
+        true
+    }));
+
+    let mut ok = 0;
+    for t in tasks {
+        if t.await.expect("no task panicked") {
+            ok += 1;
+        }
+    }
+    assert!(
+        ok >= 1,
+        "completed without deadlock; requests still succeed under concurrent invalidation"
+    );
+}

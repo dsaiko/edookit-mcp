@@ -267,7 +267,7 @@ jar atomically (clearing path-scoped cookies a name-based clear would miss).
 
 ```bash
 make build        # fetch PDFium + build
-make test         # 79 tests, race-free
+make test         # 90 tests, race-free
 make check        # fmt + clippy-fix + test (mutates)
 make pre-push     # fmt-check + clippy -D + test + audit + build (the gate)
 make tools        # install cargo-audit (once)
@@ -277,7 +277,7 @@ make smoke-message MSG=m-NNNNNN   # (dev) dump raw message-edit JSON
 
 ### Testing
 
-White-box `#[cfg(test)]` modules per file (mirroring Go's in-package tests):
+**90 tests.** White-box `#[cfg(test)]` modules per file (mirroring Go's in-package tests):
 HTML/date parsers against captured samples, an `httptest`-equivalent via
 [`wiremock`](https://docs.rs/wiremock) for the client + download flows, an
 injected clock for the OAuth AS, and a full DCR→authorize→token→refresh→replay
@@ -287,12 +287,16 @@ PDF. The chromiumoxide login is not unit-tested (same as the Go original) — ru
 
 ### Distribution and packaging
 
-`release.yml` builds for darwin/linux/windows × amd64/arm64 on a `v*` tag and, on
-Linux, produces DEB + RPM (via `cargo-deb` / `cargo-generate-rpm` — metadata in
-`Cargo.toml`) bundling the binary, the matching PDFium library, the systemd unit,
-and the env conffile, declaring `chromium` as a dependency. *(The packaging
-workflow is provided for parity but hasn't been executed yet — the first tag is
-its shakedown; RPM scriptlets for system-user creation are a flagged TODO.)*
+`release.yml` builds for darwin/linux/windows × amd64/arm64 on a `v*` tag
+(tar.gz/zip per platform), and on Linux produces DEB + RPM (via `cargo-deb` /
+`cargo-generate-rpm` — metadata in `Cargo.toml`) bundling the binary, the
+matching PDFium library, the systemd unit, and the env conffile, declaring
+`chromium` as a dependency. It also emits a `checksums.txt` and — when the
+`HOMEBREW_TAP_GITHUB_TOKEN` secret is set — pushes a Homebrew formula to
+`dsaiko/homebrew-tap` (skipped otherwise, exactly like GoReleaser's
+`--skip=homebrew`). *(The packaging workflow is provided for GoReleaser parity
+but hasn't been executed yet — the first tag is its shakedown; RPM scriptlets for
+system-user creation are a flagged TODO.)*
 
 ### License
 
@@ -321,7 +325,7 @@ annoying**, not in the architecture.
 | Warm/incremental build | 0.15 s | a few s | |
 | Startup (`--version`, mean of 30) | 6.6 ms | **3.8 ms** | Rust has no runtime/GC init to amortize |
 | Prod LOC (excl. tests) | ~6,600 | ~5,100 | Rust a touch tighter |
-| Tests | larger suite | 79 (port in progress) | Go's coverage is more complete today |
+| Tests | somewhat larger by LOC | **90** | Rust now covers the parsers, client (retry/origin/fast-path/concurrency), the full OAuth flow, and grid/download integration; Go's suite is still a bit larger |
 
 Runtime throughput/memory under load wasn't micro-benchmarked — this is a
 single-user, I/O-bound tool (every call waits on Edookit), so it wouldn't be a

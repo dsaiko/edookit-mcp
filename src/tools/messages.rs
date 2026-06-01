@@ -556,4 +556,223 @@ mod tests {
         assert_eq!(normalize_limit(10), 10);
         assert_eq!(normalize_limit(9999), MAX_LIMIT);
     }
+
+    // --- integration: fetch_and_parse via a fake Edookit grid server ---
+
+    use crate::client::{Client, Config, LoginCookie, LoginFn};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path as mpath, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn build_client(uri: &str) -> Client {
+        let login_fn: LoginFn =
+            Arc::new(|| Box::pin(async { Ok(vec![LoginCookie::new("X-EdooAuthToken", "tok")]) }));
+        let mut cfg = Config::new(uri, "u", "p");
+        cfg.retry_base_delay = Duration::from_millis(1);
+        cfg.timezone = Some(tz());
+        cfg.login_fn = Some(login_fn);
+        Client::new(cfg).unwrap()
+    }
+
+    async fn mount_warmup(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(mpath("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+    }
+
+    /// Each grid row is `[uid, uid, html]`.
+    fn grid(rows: Vec<(String, String)>) -> serde_json::Value {
+        let data: Vec<Vec<String>> = rows
+            .into_iter()
+            .map(|(uid, html)| vec![uid.clone(), uid, html])
+            .collect();
+        serde_json::json!({ "components": { "workspace": [ { "data": data } ] } })
+    }
+
+    fn inbox_html(date: &str, sender: &str, subject: &str) -> String {
+        format!(
+            r#"<small><b>{date}</b> <span>{sender}</span></small><div><a href="x"><b>{subject}</b></a></div>"#
+        )
+    }
+
+    #[tokio::test]
+    async fn list_inbox_paginates_and_truncates_to_limit() {
+        let server = MockServer::start().await;
+        mount_warmup(&server).await;
+        // Page 1 is a full page (PAGE_SIZE) → triggers a second fetch.
+        let page1: Vec<(String, String)> = (0..100)
+            .map(|i| {
+                (
+                    format!("m-{i}"),
+                    inbox_html("21.05.2026 12:31", "S", &format!("Subj {i}")),
+                )
+            })
+            .collect();
+        let page2: Vec<(String, String)> = (100..130)
+            .map(|i| {
+                (
+                    format!("m-{i}"),
+                    inbox_html("21.05.2026 12:31", "S", &format!("Subj {i}")),
+                )
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(mpath("/handler/grid/objects-for-me-data"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(grid(page1)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(mpath("/handler/grid/objects-for-me-data"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(grid(page2)))
+            .mount(&server)
+            .await;
+
+        let cli = build_client(&server.uri());
+        let res = list_inbox(
+            &cli,
+            InboxOptions {
+                limit: 120,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            res.messages.len(),
+            120,
+            "100 from page 1 + 20 from page 2, capped at limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_inbox_since_skips_older_but_keeps_scanning() {
+        let server = MockServer::start().await;
+        mount_warmup(&server).await;
+        let rows = vec![
+            (
+                "m-3".to_string(),
+                inbox_html("26.05.2026 10:00", "S", "Newest"),
+            ),
+            (
+                "m-2".to_string(),
+                inbox_html("10.05.2026 10:00", "S", "Older"),
+            ), // before floor, mid-list
+            (
+                "m-1".to_string(),
+                inbox_html("25.05.2026 10:00", "S", "Newer"),
+            ),
+        ];
+        Mock::given(method("GET"))
+            .and(mpath("/handler/grid/objects-for-me-data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(grid(rows)))
+            .mount(&server)
+            .await;
+
+        let cli = build_client(&server.uri());
+        let res = list_inbox(
+            &cli,
+            InboxOptions {
+                since: "2026-05-20".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let subjects: Vec<_> = res.messages.iter().map(|m| m.subject.as_str()).collect();
+        assert_eq!(
+            subjects,
+            vec!["Newest", "Newer"],
+            "older row skipped; scan continued past it"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_inbox_propagates_fulltext_and_view() {
+        let server = MockServer::start().await;
+        mount_warmup(&server).await;
+        // Responds only if BOTH the view filter and fulltext are in the query.
+        Mock::given(method("GET"))
+            .and(mpath("/handler/grid/objects-for-me-data"))
+            .and(query_param("object_filter", "unread"))
+            .and(query_param("fulltext", "exkurze"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(grid(vec![(
+                "m-1".into(),
+                inbox_html("21.05.2026 12:31", "S", "Hit"),
+            )])))
+            .mount(&server)
+            .await;
+
+        let cli = build_client(&server.uri());
+        let res = list_inbox(
+            &cli,
+            InboxOptions {
+                view: "unread".into(),
+                fulltext: "exkurze".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.messages.len(), 1);
+        assert_eq!(res.messages[0].subject, "Hit");
+    }
+
+    #[tokio::test]
+    async fn all_rows_unparseable_is_error_not_empty() {
+        let server = MockServer::start().await;
+        mount_warmup(&server).await;
+        let rows = vec![
+            ("m-1".into(), "<div></div>".into()),
+            ("m-2".into(), "<div></div>".into()),
+        ];
+        Mock::given(method("GET"))
+            .and(mpath("/handler/grid/objects-for-me-data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(grid(rows)))
+            .mount(&server)
+            .await;
+
+        let cli = build_client(&server.uri());
+        let err = list_inbox(&cli, InboxOptions::default()).await.unwrap_err();
+        assert!(err.to_string().contains("schema"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn list_sent_uses_status_and_created_objects_endpoint() {
+        let server = MockServer::start().await;
+        mount_warmup(&server).await;
+        let row = r#"<small><b>21.05.2026 12:31</b> <span>Publikováno</span></small><div><a href="x"><b>Test</b></a></div>"#;
+        Mock::given(method("GET"))
+            .and(mpath("/handler/grid/created-objects-data"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(grid(vec![("m-9".into(), row.into())])),
+            )
+            .mount(&server)
+            .await;
+
+        let cli = build_client(&server.uri());
+        let res = list_sent(&cli, SentOptions::default()).await.unwrap();
+        assert_eq!(res.messages.len(), 1);
+        assert_eq!(res.messages[0].status, "Publikováno");
+        assert!(res.messages[0].sender.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_view_rejected_before_any_request() {
+        let cli = build_client("https://localhost");
+        let err = list_inbox(
+            &cli,
+            InboxOptions {
+                view: "bogus".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid view"));
+    }
 }
