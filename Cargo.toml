@@ -2,6 +2,13 @@
 name = "edookit-mcp"
 version = "0.1.0"
 edition = "2024"
+# MSRV: edition 2024 needs 1.85, but the code uses stable let-chains
+# (`if let … && let …`), which landed in 1.88.
+rust-version = "1.88"
+license = "MIT"
+description = "Unofficial MCP connector for Edookit (Czech school information system) — Rust port"
+repository = "https://github.com/dsaiko/edookit-mcp-rs"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -17,7 +24,7 @@ ego-tree = "0.11.0"
 futures = "0.3.32"
 getrandom = "0.4.2"
 hmac = "0.13.0"
-image = "0.25.10"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif"] }
 jiff = { version = "0.2.28", features = ["tzdb-bundle-always"] }
 mime_guess = "2.0.5"
 parking_lot = "0.12.5"
@@ -26,7 +33,6 @@ pdfium-render = "0.9.1"
 regex = "1.12.3"
 reqwest = { version = "0.13.4", features = ["json", "stream", "cookies"] }
 rmcp = { version = "1.7.0", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
-schemars = "1.2.1"
 scraper = "0.27.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -44,3 +50,90 @@ url = "2.5.8"
 [dev-dependencies]
 tempfile = "3.27.0"
 wiremock = "0.6.5"
+
+# Strip symbols from release builds (parity with the Go build's -s -w ldflags).
+[profile.release]
+strip = true
+
+# --- Linux packaging (cargo-deb) -------------------------------------------
+# Bundles the binary, the matching PDFium library, the systemd unit, and the
+# env conffile; declares the chromium runtime dependency. The env file points
+# EDOOKIT_PDFIUM_LIB at the installed library.
+[package.metadata.deb]
+maintainer = "Dušan Saiko <dusan.saiko@oddin.gg>"
+license-file = ["LICENSE", "0"]
+extended-description = "Unofficial MCP server for Edookit (Czech school information system). Exposes message/attachment/course tools over MCP via a captured Plus4U OIDC session cookie."
+section = "net"
+priority = "optional"
+depends = "chromium"
+conf-files = ["/etc/edookit-mcp/edookit-mcp.env"]
+maintainer-scripts = "packaging/deb"
+assets = [
+    ["target/release/edookit-mcp", "usr/bin/", "755"],
+    ["third_party/pdfium/lib/libpdfium.so", "usr/lib/edookit-mcp/libpdfium.so", "644"],
+    ["packaging/edookit-mcp.service", "usr/lib/systemd/system/edookit-mcp.service", "644"],
+    ["packaging/edookit-mcp.env.example", "etc/edookit-mcp/edookit-mcp.env", "640"],
+]
+
+# --- Linux packaging (cargo-generate-rpm) ----------------------------------
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/edookit-mcp", dest = "/usr/bin/edookit-mcp", mode = "755" },
+    { source = "third_party/pdfium/lib/libpdfium.so", dest = "/usr/lib/edookit-mcp/libpdfium.so", mode = "644" },
+    { source = "packaging/edookit-mcp.service", dest = "/usr/lib/systemd/system/edookit-mcp.service", mode = "644" },
+    { source = "packaging/edookit-mcp.env.example", dest = "/etc/edookit-mcp/edookit-mcp.env", mode = "640", config = true },
+]
+# RPM scriptlets mirror the deb maintainer scripts, but RPM passes an install
+# count in $1 rather than dpkg's "configure"/"remove" verbs: %pre/%post see the
+# post-op count (1 = fresh install, >=2 = upgrade) and %preun/%postun see the
+# remaining count (0 = final erase). EPEL provides `chromium` on RHEL/Rocky.
+#
+# %pre — create the system user/group before files land (for ownership + the
+# systemd unit's User=). Runs on install and upgrade; idempotent.
+pre_install_script = '''
+if ! getent group edookit-mcp >/dev/null 2>&1; then
+    groupadd --system edookit-mcp
+fi
+if ! getent passwd edookit-mcp >/dev/null 2>&1; then
+    useradd --system --gid edookit-mcp --no-create-home \
+        --home-dir /var/lib/edookit-mcp --shell /sbin/nologin \
+        --comment "edookit-mcp service" edookit-mcp
+fi
+'''
+# %post — reload units, then on upgrade restart only if the OAuth env vars are
+# present (else the binary refuses to start and would loop); on fresh install
+# print the setup hint.
+post_install_script = '''
+systemctl daemon-reload >/dev/null 2>&1 || true
+if [ "$1" -ge 2 ]; then
+    ENV=/etc/edookit-mcp/edookit-mcp.env
+    if ( set +u; . "$ENV" 2>/dev/null; [ -n "$EDOOKIT_PUBLIC_URL" ] && [ -n "$EDOOKIT_AUTH_PASSWORD" ] && [ -n "$EDOOKIT_JWT_SECRET" ] ); then
+        systemctl try-restart edookit-mcp.service >/dev/null 2>&1 || true
+    else
+        echo "edookit-mcp: NOT restarting — set EDOOKIT_PUBLIC_URL / EDOOKIT_AUTH_PASSWORD / EDOOKIT_JWT_SECRET in $ENV, then: sudo systemctl restart edookit-mcp" >&2
+    fi
+fi
+if [ "$1" -eq 1 ]; then
+    cat <<'EOF'
+edookit-mcp installed. Next:
+  1) Generate a JWT secret:  openssl rand -base64 48
+  2) sudo $EDITOR /etc/edookit-mcp/edookit-mcp.env   (EDOOKIT_URL/USER/PASS + the three OAuth vars)
+  3) sudo systemctl enable --now edookit-mcp
+Listens on 127.0.0.1:9000/mcp behind the built-in OAuth AS — put a TLS reverse proxy in front.
+EOF
+fi
+'''
+# %preun — on final erase ($1 == 0) stop/disable; on upgrade ($1 >= 1) leave running.
+pre_uninstall_script = '''
+if [ "$1" -eq 0 ]; then
+    systemctl --no-reload disable --now edookit-mcp.service >/dev/null 2>&1 || true
+fi
+'''
+# %postun — reload units. The user, env file, and state dirs are kept so a
+# reinstall preserves config (parity with the deb postrm).
+post_uninstall_script = '''
+systemctl daemon-reload >/dev/null 2>&1 || true
+'''
+
+[package.metadata.generate-rpm.requires]
+chromium = "*"

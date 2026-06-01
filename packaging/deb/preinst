@@ -1,0 +1,12 @@
+#!/bin/sh
+# Create the system user/group before files are unpacked (for file ownership).
+set -e
+if ! getent group edookit-mcp >/dev/null 2>&1; then
+    groupadd --system edookit-mcp
+fi
+if ! getent passwd edookit-mcp >/dev/null 2>&1; then
+    useradd --system --gid edookit-mcp --no-create-home \
+        --home-dir /var/lib/edookit-mcp --shell /sbin/nologin \
+        --comment "edookit-mcp service" edookit-mcp
+fi
+exit 0

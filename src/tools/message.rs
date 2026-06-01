@@ -105,9 +105,8 @@ fn parse_full_message(num: i64, raw: &Value, tz: &TimeZone) -> anyhow::Result<Fu
         .get("components")
         .and_then(|c| c.get("workspace"))
         .and_then(Value::as_array);
-    let workspace = workspace.ok_or_else(|| {
-        anyhow!("message-edit response has no components.workspace array")
-    })?;
+    let workspace = workspace
+        .ok_or_else(|| anyhow!("message-edit response has no components.workspace array"))?;
 
     let mut form: Option<&Value> = None;
     let mut fileviewer: Option<&Value> = None;
@@ -145,7 +144,11 @@ fn parse_full_message(num: i64, raw: &Value, tz: &TimeZone) -> anyhow::Result<Fu
     // Schema-drift guard: empty status AND subject AND body means the form lost
     // all human-readable content (real drift). Author-deletion leaves status
     // non-empty, so this won't false-positive on it.
-    if msg.status.is_empty() && msg.subject.is_empty() && msg.body_text.is_empty() && msg.body_html.is_empty() {
+    if msg.status.is_empty()
+        && msg.subject.is_empty()
+        && msg.body_text.is_empty()
+        && msg.body_html.is_empty()
+    {
         bail!(
             "message {num}: parsed message has empty status AND subject AND body — Edookit form schema may have drifted"
         );
@@ -177,7 +180,11 @@ fn populate_message_fields(msg: &mut FullMessage, form_data: &Value, tz: &TimeZo
     if let Some(item) = find_form_item(panels, "description__editor") {
         // Prefer readValue (single-escaped, ready to render); val is double-escaped.
         let read = value_to_string(item.get("readValue"));
-        msg.body_html = if read.is_empty() { value_to_string(item.get("val")) } else { read };
+        msg.body_html = if read.is_empty() {
+            value_to_string(item.get("val"))
+        } else {
+            read
+        };
         msg.body_text = html_to_text(&msg.body_html);
     }
 }
@@ -227,7 +234,10 @@ fn collect_attachments(fileviewer_data: &Value, tz: &TimeZone) -> Vec<Attachment
             id: value_to_string(a.get("id")),
             name: value_to_string(a.get("name")),
             url: value_to_string(a.get("link")),
-            date: super::date::unix_to_rfc3339(a.get("date").and_then(Value::as_i64).unwrap_or(0), tz),
+            date: super::date::unix_to_rfc3339(
+                a.get("date").and_then(Value::as_i64).unwrap_or(0),
+                tz,
+            ),
         });
     }
     out
@@ -238,13 +248,18 @@ fn collect_attachments(fileviewer_data: &Value, tz: &TimeZone) -> Vec<Attachment
 fn collect_recipients(rows: &[Value]) -> Vec<Recipient> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let Some(cells) = row.as_array() else { continue };
+        let Some(cells) = row.as_array() else {
+            continue;
+        };
         if cells.len() < 5 {
             continue;
         }
         let cell = |i: usize| cells[i].as_str().unwrap_or("");
         let parents = split_br(cell(3));
-        let parents_read: Vec<String> = split_br(cell(4)).iter().map(|s| czech_date_to_iso(s)).collect();
+        let parents_read: Vec<String> = split_br(cell(4))
+            .iter()
+            .map(|s| czech_date_to_iso(s))
+            .collect();
         out.push(Recipient {
             name: cell(1).trim().to_string(),
             read_at: czech_date_to_iso(cell(2)),
@@ -268,7 +283,11 @@ fn align_parents_read(read: &[String], n_parents: usize) -> Vec<String> {
     if read.len() < n_parents {
         let mut out = Vec::with_capacity(n_parents);
         for i in 0..n_parents {
-            out.push(read.get(i).cloned().unwrap_or_else(|| read[read.len() - 1].clone()));
+            out.push(
+                read.get(i)
+                    .cloned()
+                    .unwrap_or_else(|| read[read.len() - 1].clone()),
+            );
         }
         return out;
     }
@@ -285,7 +304,9 @@ fn czech_date_to_iso(s: &str) -> String {
     // Tolerate stray internal spaces ("21. 5. 2026"), then parse strictly.
     let compact = s.replace(' ', "");
     let mut parts = compact.split('.');
-    let (Some(d), Some(m), Some(y), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+    let (Some(d), Some(m), Some(y), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
         return String::new();
     };
     let (Ok(d), Ok(m), Ok(y)) = (d.parse::<i8>(), m.parse::<i8>(), y.parse::<i16>()) else {
@@ -304,8 +325,9 @@ fn split_br(s: &str) -> Vec<String> {
     s.split("<br>").map(|x| x.to_string()).collect()
 }
 
-static STATUS_DATE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"Od\s+(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{1,2})").unwrap());
+static STATUS_DATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"Od\s+(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{1,2})").unwrap()
+});
 static SPAN_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("span").unwrap());
 static SPAN_B_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("span b").unwrap());
 
@@ -482,7 +504,10 @@ mod tests {
         assert_eq!(msg.recipients.len(), 2);
         assert_eq!(msg.recipients[0].name, "Fajkus Eliáš");
         assert_eq!(msg.recipients[0].read_at, "2026-05-21");
-        assert_eq!(msg.recipients[0].parents, vec!["Fajkus Martin", "Fajkusová Soňa"]);
+        assert_eq!(
+            msg.recipients[0].parents,
+            vec!["Fajkus Martin", "Fajkusová Soňa"]
+        );
         assert_eq!(msg.recipients[0].parents_read_at, vec!["", "2026-05-21"]);
         // Staff recipient (no parents): "Ne" read_at → empty, no parents.
         assert_eq!(msg.recipients[1].read_at, "");

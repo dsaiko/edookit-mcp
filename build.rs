@@ -20,8 +20,9 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "none".to_string());
 
-    let version = env_nonempty("EDOOKIT_VERSION")
-        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "dev".to_string()));
+    let version = env_nonempty("EDOOKIT_VERSION").unwrap_or_else(|| {
+        std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "dev".to_string())
+    });
 
     let date = env_nonempty("EDOOKIT_BUILD_DATE").unwrap_or_else(|| "unknown".to_string());
 

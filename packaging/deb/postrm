@@ -1,0 +1,5 @@
+#!/bin/sh
+# Keep the user, env file, and state dirs so a reinstall preserves config.
+set -e
+systemctl daemon-reload >/dev/null 2>&1 || true
+exit 0

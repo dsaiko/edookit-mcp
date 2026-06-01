@@ -76,7 +76,9 @@ pub async fn login_via_browser(cfg: BrowserLoginConfig) -> anyhow::Result<Vec<Lo
     if !cfg.headless {
         builder = builder.with_head();
     }
-    let config = builder.build().map_err(|e| anyhow!("browser config: {e}"))?;
+    let config = builder
+        .build()
+        .map_err(|e| anyhow!("browser config: {e}"))?;
 
     let (browser, mut handler) = Browser::launch(config).await.context("launch chromium")?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
@@ -161,47 +163,65 @@ async fn run_login(
         .into_value()
         .context("client_id into_value")?;
     if cid.is_empty() {
-        bail!("OIDC client_id empty (UU5.Environment may have been reset between readiness check and read)");
+        bail!(
+            "OIDC client_id empty (UU5.Environment may have been reset between readiness check and read)"
+        );
     }
     tracing::info!("[login] OIDC client_id: {cid}");
     client_id.store(Arc::new(cid));
 
     // 5. Trigger the Plus4U OIDC flow. The lib emits its auth request with
-    //    prompt=none for silent SSO — the interceptor strips that.
+    //    prompt=none for silent SSO — the interceptor strips that. The eval
+    //    usually returns an "execution context destroyed" error because
+    //    idmLoginClick() starts a navigation that tears down the page context —
+    //    that's success, not failure, so we tolerate it; the redirect-wait
+    //    below is the real signal.
     tracing::info!("[login] trigger Plus4U login");
-    page.evaluate("idmLoginClick()")
-        .await
-        .context("trigger Plus4U login")?;
+    if let Err(e) = page.evaluate("idmLoginClick()").await {
+        tracing::debug!(
+            "[login] idmLoginClick eval returned (likely navigation tore down the context): {e}"
+        );
+    }
 
-    // 6. Wait for redirect to Plus4U identity.
-    tracing::info!("[login] wait for redirect to Plus4U identity");
-    wait_for_host(&page, PLUS4U_HOST, Duration::from_secs(30))
-        .await
-        .context("wait for redirect to Plus4U identity")?;
-
-    // 7. Fill credentials.
-    tracing::info!("[login] fill username");
-    wait_visible(&page, r#"input[autocomplete="username"]"#, Duration::from_secs(30))
-        .await
-        .context("wait for username input")?;
-    let user_el = page.find_element(r#"input[autocomplete="username"]"#).await?;
-    user_el.click().await?.type_str(&cfg.username).await?;
-
-    tracing::info!("[login] fill password");
-    let pass_el = page.find_element(r#"input[autocomplete="current-password"]"#).await?;
-    pass_el.click().await?.type_str(&cfg.password).await?;
-
-    // 8. Submit the form.
-    tracing::info!("[login] submit credentials");
-    page.evaluate(r#"document.querySelector('input[autocomplete="current-password"]').form.submit()"#)
-        .await
-        .context("submit credentials")?;
-
-    // 9. Wait for redirect back to Edookit.
-    tracing::info!("[login] wait for redirect back to Edookit");
-    wait_for_host(&page, base_host, Duration::from_secs(60))
-        .await
-        .context("wait for redirect back to Edookit")?;
+    // 6. Complete the flow resiliently. After the trigger, two paths are
+    //    possible:
+    //      (a) no active Plus4U session → the login form is shown → fill it;
+    //      (b) an active Plus4U session → silent SSO bounces straight back to
+    //          Edookit with NO form shown.
+    //    A rigid "wait-for-Plus4U → fill → wait-for-Edookit" sequence hangs on
+    //    (b): the fast bounce slips past the host poll. So instead we poll for
+    //    the real success signal — the persistent Edookit auth cookie set by the
+    //    OIDC callback — and fill the Plus4U form only if/when it appears.
+    tracing::info!("[login] completing OIDC flow (filling Plus4U form if shown)");
+    let deadline = Instant::now() + Duration::from_secs(75);
+    let mut filled = false;
+    loop {
+        if authenticated(&page, base_host).await {
+            break;
+        }
+        if !filled && fill_plus4u_form_if_present(&page, &cfg.username, &cfg.password).await? {
+            filled = true;
+            tracing::info!("[login] submitted Plus4U credentials");
+        }
+        if Instant::now() >= deadline {
+            let url = page.url().await.ok().flatten().unwrap_or_default();
+            // Surface the cookies we DID see for the host, so a cookie-name
+            // mismatch in `authenticated()` is obvious without another round-trip.
+            let names: Vec<String> = page
+                .get_cookies()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| host_matches_cookie(base_host, &c.domain))
+                .map(|c| c.name)
+                .collect();
+            bail!(
+                "login did not complete within 75s (no Edookit auth cookie; last URL: {url}; cookies seen for host: {names:?})"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    tracing::info!("[login] authenticated session detected");
 
     // 10. Capture cookies for the target host.
     let raw = page.get_cookies().await.context("read cookies")?;
@@ -210,14 +230,7 @@ async fn run_login(
         if !host_matches_cookie(base_host, &c.domain) {
             continue;
         }
-        out.push(LoginCookie {
-            name: c.name,
-            value: c.value,
-            domain: c.domain,
-            path: c.path,
-            secure: c.secure,
-            http_only: c.http_only,
-        });
+        out.push(LoginCookie::new(c.name, c.value));
     }
     if out.is_empty() {
         bail!("browser login: no cookies captured for target host");
@@ -240,7 +253,9 @@ async fn spawn_fetch_interceptor(
             let mut params = ContinueRequestParams::new(ev.request_id.clone());
             let new_url = strip_prompt_none_for_client(&ev.request.url, &cid);
             if let Some(u) = new_url {
-                tracing::info!("[fetch-intercept] stripped prompt=none from outer auth (client={cid})");
+                tracing::info!(
+                    "[fetch-intercept] stripped prompt=none from outer auth (client={cid})"
+                );
                 params.url = Some(u);
             }
             if let Err(e) = page.execute(params).await {
@@ -255,11 +270,17 @@ async fn spawn_fetch_interceptor(
 /// via `alert()`, which headless chrome auto-dismisses but headful mode blocks
 /// on. Accept any dialog so the flow behaves identically in both modes.
 async fn spawn_dialog_dismisser(page: &Page) -> anyhow::Result<AbortOnDrop> {
-    let mut events = page.event_listener::<EventJavascriptDialogOpening>().await?;
+    let mut events = page
+        .event_listener::<EventJavascriptDialogOpening>()
+        .await?;
     let page = page.clone();
     let task = tokio::spawn(async move {
         while let Some(ev) = events.next().await {
-            tracing::info!("[browser-dialog {:?}] {} (auto-dismissing)", ev.r#type, ev.message);
+            tracing::info!(
+                "[browser-dialog {:?}] {} (auto-dismissing)",
+                ev.r#type,
+                ev.message
+            );
             let _ = page
                 .execute(HandleJavaScriptDialogParams {
                     accept: true,
@@ -282,7 +303,9 @@ fn strip_prompt_none_for_client(raw: &str, client_id: &str) -> Option<String> {
     }
     let mut u = Url::parse(raw).ok()?;
     let prompt_is_none = u.query_pairs().any(|(k, v)| k == "prompt" && v == "none");
-    let client_matches = u.query_pairs().any(|(k, v)| k == "client_id" && v == client_id);
+    let client_matches = u
+        .query_pairs()
+        .any(|(k, v)| k == "client_id" && v == client_id);
     if !prompt_is_none || !client_matches {
         return None;
     }
@@ -332,22 +355,55 @@ async fn wait_js_true(page: &Page, expr: &str, timeout: Duration) -> anyhow::Res
     }
 }
 
-/// Polls the current page URL until the host matches, signalling the OIDC
-/// redirect chain has progressed.
-async fn wait_for_host(page: &Page, want_host: &str, timeout: Duration) -> anyhow::Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(Some(current)) = page.url().await
-            && let Ok(u) = Url::parse(&current)
-            && u.host_str() == Some(want_host)
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("timed out waiting for redirect to {want_host}");
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+/// True once the persistent Edookit auth cookie (set by the OIDC callback) is
+/// present for the target host — the real "login complete" signal, regardless
+/// of whether the Plus4U form was shown or silent SSO bounced straight back.
+async fn authenticated(page: &Page, base_host: &str) -> bool {
+    let Ok(cookies) = page.get_cookies().await else {
+        return false;
+    };
+    cookies.iter().any(|c| {
+        (c.name == "X-EdooAuthToken" || c.name == "X-Auth-Id")
+            && host_matches_cookie(base_host, &c.domain)
+    })
+}
+
+/// Fills + submits the Plus4U login form if its username field is currently
+/// visible. Returns true if it submitted, false if the form wasn't there (e.g.
+/// silent SSO already bounced us back). Submitting navigates away, so the
+/// submit eval's "context destroyed" error is tolerated.
+async fn fill_plus4u_form_if_present(
+    page: &Page,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<bool> {
+    let on_plus4u = page
+        .url()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|u| Url::parse(&u).ok())
+        .and_then(|u| u.host_str().map(str::to_string))
+        .is_some_and(|h| h == PLUS4U_HOST);
+    if !on_plus4u {
+        return Ok(false);
     }
+    let Ok(user_el) = page.find_element(r#"input[autocomplete="username"]"#).await else {
+        return Ok(false);
+    };
+    user_el.click().await?.type_str(username).await?;
+    if let Ok(pass_el) = page
+        .find_element(r#"input[autocomplete="current-password"]"#)
+        .await
+    {
+        pass_el.click().await?.type_str(password).await?;
+    }
+    let _ = page
+        .evaluate(
+            r#"document.querySelector('input[autocomplete="current-password"]').form.submit()"#,
+        )
+        .await;
+    Ok(true)
 }
 
 /// Launches chromium against `base_url`, waits for the page to render, and
@@ -359,7 +415,9 @@ pub async fn dump_landing_html(base_url: &str, headless: bool) -> anyhow::Result
     if !headless {
         builder = builder.with_head();
     }
-    let config = builder.build().map_err(|e| anyhow!("browser config: {e}"))?;
+    let config = builder
+        .build()
+        .map_err(|e| anyhow!("browser config: {e}"))?;
     let (browser, mut handler) = Browser::launch(config).await.context("launch chromium")?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 

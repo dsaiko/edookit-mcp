@@ -1,0 +1,205 @@
+name: release
+
+# Cross-platform release on a v* tag, mirroring the Go project's GoReleaser
+# pipeline: a check gate, then tar.gz/zip per OS/arch + DEB/RPM for Linux (with
+# the systemd unit, env conffile, chromium dependency, and the bundled PDFium
+# library), a checksums.txt, a GitHub Release, and a Homebrew formula push.
+#
+# NOTE: provided for parity but not yet executed in the port environment (no
+# Linux/cross runners, no tap token). Treat the first real tag as the shakedown.
+
+on:
+  push:
+    tags: ["v*"]
+
+# Least privilege: read by default; only the job that publishes the GitHub
+# Release is granted contents: write. The Homebrew job pushes to a separate
+# repo with its own token (HOMEBREW_TAP_GITHUB_TOKEN), not GITHUB_TOKEN.
+permissions:
+  contents: read
+
+jobs:
+  # Same gate as ci before any artifact is produced.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/fetch-pdfium.sh
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,  name: Linux_x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: Linux_arm64 }
+          - { os: macos-13,        target: x86_64-apple-darwin,        name: Darwin_x86_64 }
+          - { os: macos-14,        target: aarch64-apple-darwin,       name: Darwin_arm64 }
+          - { os: windows-latest,  target: x86_64-pc-windows-msvc,     name: Windows_x86_64 }
+          - { os: windows-11-arm,  target: aarch64-pc-windows-msvc,    name: Windows_arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # Native runner per arch (incl. GitHub's free ubuntu-*-arm for public
+      # repos) → build for the host target; binary lands in target/release/
+      # where the cargo-deb/rpm assets in Cargo.toml expect it.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        shell: bash
+        env:
+          EDOOKIT_VERSION: ${{ github.ref_name }}
+          EDOOKIT_BUILD_DATE: ${{ github.event.head_commit.timestamp }}
+        run: cargo build --release --locked
+
+      # Linux only: DEB + RPM (systemd unit, conffile, chromium dep, bundled
+      # PDFium). fetch-pdfium drops the .so the packages bundle.
+      - name: Linux packages (deb/rpm)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          ./scripts/fetch-pdfium.sh
+          cargo install cargo-deb cargo-generate-rpm
+          cargo deb --no-build
+          cargo generate-rpm
+
+      - name: Package
+        shell: bash
+        run: |
+          # Pinned + checksum-verified fetch; a failure must fail the release,
+          # not ship a binary without its PDFium dependency.
+          ./scripts/fetch-pdfium.sh
+          ver="${GITHUB_REF_NAME#v}"
+          stage="edookit-mcp_${ver}_${{ matrix.name }}"
+          mkdir -p "$stage" out
+          bin=edookit-mcp; [ "${{ runner.os }}" = "Windows" ] && bin=edookit-mcp.exe
+          cp "target/release/$bin" "$stage/"
+          cp README.md LICENSE .env.example "$stage/" 2>/dev/null || true
+          # Bundle the matching PDFium library next to the binary. fetch-pdfium
+          # normalizes every platform to third_party/pdfium/lib/; fail loudly if
+          # it is absent rather than shipping an unrenderable build.
+          case "${{ runner.os }}" in
+            macOS)   lib=third_party/pdfium/lib/libpdfium.dylib ;;
+            Linux)   lib=third_party/pdfium/lib/libpdfium.so ;;
+            Windows) lib=third_party/pdfium/lib/pdfium.dll ;;
+          esac
+          if [ ! -f "$lib" ]; then
+            echo "Package: PDFium library '$lib' missing after fetch — aborting." >&2
+            exit 1
+          fi
+          cp "$lib" "$stage/"
+          # Archive the staged CONTENTS (no top-level dir) so Homebrew extracts cleanly.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            (cd "$stage" && 7z a "../out/${stage}.zip" ./* >/dev/null)
+          else
+            tar czf "out/${stage}.tar.gz" -C "$stage" .
+          fi
+          # Linux: also ship the deb/rpm.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cp target/debian/*.deb out/ 2>/dev/null || true
+            cp target/generate-rpm/*.rpm out/ 2>/dev/null || true
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edookit-mcp_${{ matrix.name }}
+          path: out/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    # Only this job needs write access — it creates/updates the GitHub Release.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - name: Collect artifacts + checksums
+        run: |
+          mkdir -p out
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} out/ \;
+          (cd out && sha256sum * > checksums.txt)
+          ls -l out
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
+
+  # Push a Homebrew formula to dsaiko/homebrew-tap — only if the tap token is
+  # set (otherwise skipped, exactly like GoReleaser's --skip=homebrew).
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - name: Push Homebrew formula
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_GITHUB_TOKEN not set — skipping Homebrew (binary release still published)."
+            exit 0
+          fi
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          arm="$(find artifacts -name "*Darwin_arm64.tar.gz" | head -1)"
+          intel="$(find artifacts -name "*Darwin_x86_64.tar.gz" | head -1)"
+          arm_sha="$(sha256sum "$arm" | cut -d' ' -f1)"
+          intel_sha="$(sha256sum "$intel" | cut -d' ' -f1)"
+          base="https://github.com/dsaiko/edookit-mcp-rs/releases/download/${GITHUB_REF_NAME}"
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/dsaiko/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/edookit-mcp.rb <<RUBY
+          class EdookitMcp < Formula
+            desc "Unofficial MCP connector for Edookit (Czech school information system) — Rust port"
+            homepage "https://github.com/dsaiko/edookit-mcp-rs"
+            version "${ver}"
+            license "MIT"
+
+            on_arm do
+              url "${base}/edookit-mcp_${ver}_Darwin_arm64.tar.gz"
+              sha256 "${arm_sha}"
+            end
+            on_intel do
+              url "${base}/edookit-mcp_${ver}_Darwin_x86_64.tar.gz"
+              sha256 "${intel_sha}"
+            end
+
+            def install
+              # Keep the binary and its bundled libpdfium together so the
+              # exe-dir PDFium resolution works; symlink the binary onto PATH.
+              libexec.install Dir["*"]
+              bin.install_symlink libexec/"edookit-mcp"
+            end
+
+            def caveats
+              <<~EOS
+                edookit-mcp drives a real Chromium/Chrome instance once per ~10h to log
+                into Plus4U, so install a Chromium-family browser. Configure via
+                EDOOKIT_URL / EDOOKIT_USER / EDOOKIT_PASS. PDF attachment rasterization
+                uses the bundled libpdfium installed next to the binary.
+              EOS
+            end
+
+            test do
+              assert_match "required env var", shell_output("#{bin}/edookit-mcp 2>&1", 1)
+            end
+          end
+          RUBY
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/edookit-mcp.rb
+          git commit -m "edookit-mcp ${ver}" || { echo "formula unchanged"; exit 0; }
+          git push

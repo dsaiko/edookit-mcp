@@ -31,6 +31,12 @@ const DEFAULT_USER_AGENT: &str = "edookit-mcp/0.1 (+https://github.com/dsaiko/ed
 const SCHEME_HTTP: &str = "http";
 const SCHEME_HTTPS: &str = "https";
 
+/// Bytes of a streamed download buffered up front to classify it (real
+/// attachment vs. stale-session login page / `authenticated:false` envelope).
+/// Both artifacts are far smaller than this, so the window never truncates a
+/// classification decision.
+const DOWNLOAD_SNIFF_CAP: usize = 64 * 1024;
+
 /// Errors returned by the client's `get_*` methods. The
 /// [`AttachmentTooLarge`](ClientError::AttachmentTooLarge) variant is a
 /// sentinel matched by the inline-view tool; everything else carries a message.
@@ -60,22 +66,23 @@ impl From<anyhow::Error> for ClientError {
 /// A login callback that replaces the default chromiumoxide-driven OIDC flow.
 /// Production leaves this `None`; tests inject a fake so `ensure_logged_in`'s
 /// retry/invalidation paths can run without bringing up a real browser.
-pub type LoginFn =
-    Arc<dyn Fn() -> futures::future::BoxFuture<'static, anyhow::Result<Vec<LoginCookie>>> + Send + Sync>;
+pub type LoginFn = Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, anyhow::Result<Vec<LoginCookie>>> + Send + Sync,
+>;
 
 /// A cookie captured from the browser at login (or returned by a test
 /// [`LoginFn`]). Only name/value are used when seeding the jar — for the
 /// same-origin requests this client makes, host-only scoping is equivalent to
 /// the captured domain/path, and persistence flattens to name/value anyway
 /// (matching Go's jar, which exposes nothing else).
+/// A cookie captured from a successful login. The jar is keyed by name/value
+/// only (see the cookie-jar divergence in the README): the browser flow already
+/// filters cookies to the target host, so the per-cookie domain/path/secure
+/// attributes the Go port carried are not needed to replay the session.
 #[derive(Debug, Clone)]
 pub struct LoginCookie {
     pub name: String,
     pub value: String,
-    pub domain: String,
-    pub path: String,
-    pub secure: bool,
-    pub http_only: bool,
 }
 
 impl LoginCookie {
@@ -83,10 +90,6 @@ impl LoginCookie {
         LoginCookie {
             name: name.into(),
             value: value.into(),
-            domain: String::new(),
-            path: String::new(),
-            secure: false,
-            http_only: false,
         }
     }
 }
@@ -125,7 +128,11 @@ pub struct Config {
 
 impl Config {
     /// A minimal config with the required credentials and all-default knobs.
-    pub fn new(base_url: impl Into<String>, username: impl Into<String>, password: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
         Config {
             base_url: base_url.into(),
             username: username.into(),
@@ -178,10 +185,7 @@ impl Client {
         if cfg.login_timeout.is_zero() {
             cfg.login_timeout = Duration::from_secs(90);
         }
-        let tz = cfg
-            .timezone
-            .clone()
-            .unwrap_or_else(default_timezone);
+        let tz = cfg.timezone.clone().unwrap_or_else(default_timezone);
 
         let base_url = parse_base_url(&cfg.base_url, cfg.allow_insecure_http)?;
 
@@ -309,45 +313,22 @@ impl Client {
         }
     }
 
-    /// Fetches `path` as a parsed HTML document. Reserved for the rare
-    /// server-rendered page; use [`get_json`](Self::get_json) for the SPA's
-    /// XHR endpoints.
-    pub async fn get_doc(&self, path: &str) -> Result<scraper::Html, ClientError> {
-        let mut allow_retry = true;
-        loop {
-            self.ensure_logged_in().await?;
-            self.preflight_same_origin(path)?;
-
-            let req = self.new_request(path, false)?;
-            let resp = self.send_retrying(req).await?;
-
-            if !same_origin(resp.url(), &self.base_url) {
-                if !allow_retry {
-                    return Err(ClientError::msg("session expired and re-login failed"));
-                }
-                self.invalidate_session().await;
-                allow_retry = false;
-                continue;
-            }
-            let status = resp.status().as_u16();
-            if status >= 400 {
-                return Err(ClientError::msg(format!("GET {path}: HTTP {status}")));
-            }
-            let text = resp
-                .text()
-                .await
-                .map_err(|e| ClientError::msg(format!("read body from {path}: {e}")))?;
-            return Ok(scraper::Html::parse_document(&text));
-        }
-    }
-
     /// Streams the body of `GET <path>` into `dst`, returning the byte count.
     /// Used for binary downloads where we don't want to buffer the whole file.
-    /// `path` may be relative or an absolute (same-origin) URL.
+    /// `path` may be relative or an absolute (same-origin) URL. Writes at most
+    /// `limit` bytes; a larger body yields [`ClientError::AttachmentTooLarge`]
+    /// (a guard against a runaway or hostile response filling the disk).
+    ///
+    /// Diverges from the Go original (which rejected text/html and
+    /// application/json outright): a bounded prefix is sniffed and run through
+    /// [`classify_download_body`] — the same logic `get_bytes` uses — so genuine
+    /// `.html`/`.json` attachments stream to disk while a stale-session login
+    /// page or `authenticated:false` envelope still triggers re-login.
     pub async fn get_to<W: std::io::Write>(
         &self,
         path: &str,
         dst: &mut W,
+        limit: u64,
     ) -> Result<u64, ClientError> {
         let mut allow_retry = true;
         loop {
@@ -371,34 +352,62 @@ impl Client {
                 return Err(ClientError::msg(format!("GET {path}: HTTP {status}")));
             }
 
-            // Non-file response on a download endpoint: text/html is almost
-            // certainly the login page (stale cookies, no off-origin redirect)
-            // → invalidate + retry. application/json is a deterministic API
-            // error envelope → propagate (a retry would just hit it again).
             let ct = content_type_lower(&resp);
-            if ct.starts_with("text/html") {
-                if !allow_retry {
-                    return Err(ClientError::msg(format!(
-                        "GET {path}: server returned text/html (likely login page) — re-login failed"
-                    )));
+            let mut stream = resp.bytes_stream();
+
+            // Buffer a bounded prefix so we can distinguish a real attachment
+            // from a stale-session artifact without reading the whole (possibly
+            // huge) body into memory. The auth envelope and login page both fit
+            // easily within the sniff window.
+            let mut sniff: Vec<u8> = Vec::new();
+            let mut stream_drained = false;
+            while sniff.len() < DOWNLOAD_SNIFF_CAP {
+                match stream.next().await {
+                    Some(chunk) => {
+                        let chunk =
+                            chunk.map_err(|e| ClientError::msg(format!("GET {path}: {e}")))?;
+                        sniff.extend_from_slice(&chunk);
+                    }
+                    None => {
+                        stream_drained = true;
+                        break;
+                    }
                 }
-                self.invalidate_session().await;
-                allow_retry = false;
-                continue;
-            }
-            if ct.starts_with("application/json") {
-                return Err(ClientError::msg(format!(
-                    "GET {path}: server returned application/json on a binary download endpoint (likely an API error envelope, not a file)"
-                )));
             }
 
-            let mut stream = resp.bytes_stream();
-            let mut written: u64 = 0;
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| ClientError::msg(format!("GET {path}: {e}")))?;
-                dst.write_all(&chunk)
-                    .map_err(|e| ClientError::msg(format!("write to dst: {e}")))?;
-                written += chunk.len() as u64;
+            match classify_download_body(&ct, &sniff, allow_retry) {
+                DownloadDisposition::Reauth => {
+                    self.invalidate_session().await;
+                    allow_retry = false;
+                    continue;
+                }
+                DownloadDisposition::Fail => {
+                    return Err(ClientError::msg(format!(
+                        "GET {path}: stale session (authenticated=false) and re-login failed"
+                    )));
+                }
+                DownloadDisposition::Accept => {}
+            }
+
+            // Commit the sniffed prefix, then stream the remainder — enforcing
+            // the byte cap throughout.
+            if sniff.len() as u64 > limit {
+                return Err(ClientError::AttachmentTooLarge);
+            }
+            dst.write_all(&sniff)
+                .map_err(|e| ClientError::msg(format!("write to dst: {e}")))?;
+            let mut written = sniff.len() as u64;
+
+            if !stream_drained {
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| ClientError::msg(format!("GET {path}: {e}")))?;
+                    written += chunk.len() as u64;
+                    if written > limit {
+                        return Err(ClientError::AttachmentTooLarge);
+                    }
+                    dst.write_all(&chunk)
+                        .map_err(|e| ClientError::msg(format!("write to dst: {e}")))?;
+                }
             }
             return Ok(written);
         }
@@ -407,7 +416,11 @@ impl Client {
     /// Fetches `GET <path>` fully into memory (up to `limit` bytes) and returns
     /// the body with its `Content-Type`. Returns
     /// [`ClientError::AttachmentTooLarge`] if the body would exceed `limit`.
-    pub async fn get_bytes(&self, path: &str, limit: u64) -> Result<(Vec<u8>, String), ClientError> {
+    pub async fn get_bytes(
+        &self,
+        path: &str,
+        limit: u64,
+    ) -> Result<(Vec<u8>, String), ClientError> {
         let mut allow_retry = true;
         loop {
             self.ensure_logged_in().await?;
@@ -439,7 +452,8 @@ impl Client {
             let mut stream = resp.bytes_stream();
             let mut buf: Vec<u8> = Vec::new();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| ClientError::msg(format!("read body from {path}: {e}")))?;
+                let chunk =
+                    chunk.map_err(|e| ClientError::msg(format!("read body from {path}: {e}")))?;
                 buf.extend_from_slice(&chunk);
                 if buf.len() as u64 > limit {
                     return Err(ClientError::AttachmentTooLarge);
@@ -469,7 +483,9 @@ impl Client {
             Ok((cookies, age)) if age < self.cfg.cookie_max_age => {
                 let n = cookies.len();
                 self.jar.set_name_values(&self.base_url, &cookies);
-                tracing::info!("loaded {n} cached cookies (age {age:?}); will verify on first call");
+                tracing::info!(
+                    "loaded {n} cached cookies (age {age:?}); will verify on first call"
+                );
             }
             Ok((_, age)) => {
                 tracing::info!(
@@ -563,11 +579,16 @@ impl Client {
             // Mark as XHR so the server returns JSON rather than the SPA loader.
             builder = builder
                 .header(ACCEPT, HeaderValue::from_static("application/json"))
-                .header("X-Requested-With", HeaderValue::from_static("XMLHttpRequest"));
+                .header(
+                    "X-Requested-With",
+                    HeaderValue::from_static("XMLHttpRequest"),
+                );
         } else {
             builder = builder.header(
                 ACCEPT,
-                HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+                HeaderValue::from_static(
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                ),
             );
         }
         builder
@@ -619,7 +640,9 @@ impl Client {
                 }
             }
         }
-        Err(ClientError::msg(format!("after {attempts} attempt(s): {last_err}")))
+        Err(ClientError::msg(format!(
+            "after {attempts} attempt(s): {last_err}"
+        )))
     }
 }
 
@@ -657,7 +680,9 @@ fn parse_auth_envelope(body: &[u8]) -> Option<bool> {
     struct Env {
         authenticated: Option<bool>,
     }
-    serde_json::from_slice::<Env>(body).ok().and_then(|e| e.authenticated)
+    serde_json::from_slice::<Env>(body)
+        .ok()
+        .and_then(|e| e.authenticated)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -708,7 +733,9 @@ fn parse_base_url(raw: &str, allow_insecure_http: bool) -> anyhow::Result<Url> {
         anyhow!("BaseURL {raw:?} must use http or https scheme (e.g. https://your-school-login.edookit.net): {e}")
     })?;
     if u.scheme() != SCHEME_HTTP && u.scheme() != SCHEME_HTTPS {
-        bail!("BaseURL {raw:?} must use http or https scheme (e.g. https://your-school-login.edookit.net)");
+        bail!(
+            "BaseURL {raw:?} must use http or https scheme (e.g. https://your-school-login.edookit.net)"
+        );
     }
     if u.host().is_none() || u.host_str().is_none_or(|h| h.is_empty()) {
         bail!("BaseURL {raw:?} has no host");
@@ -754,7 +781,8 @@ impl Jar {
     }
 
     fn reset(&self) {
-        self.inner.store(Arc::new(Mutex::new(cookie_store::new_store())));
+        self.inner
+            .store(Arc::new(Mutex::new(cookie_store::new_store())));
     }
 
     fn has_cookies_for(&self, url: &Url) -> bool {
@@ -792,7 +820,12 @@ impl Jar {
     }
 }
 
-fn insert_name_value(store: &mut cookie_store::CookieStoreImpl, base: &Url, name: &str, value: &str) {
+fn insert_name_value(
+    store: &mut cookie_store::CookieStoreImpl,
+    base: &Url,
+    name: &str,
+    value: &str,
+) {
     let raw = cookie_store::RawCookie::new(name.to_string(), value.to_string());
     let _ = store.insert_raw(&raw, base);
 }

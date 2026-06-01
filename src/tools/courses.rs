@@ -80,7 +80,11 @@ pub async fn list_courses(cli: &Client, opts: CoursesOptions) -> anyhow::Result<
 /// whole listing — `buffer_unordered` runs at most N at once on this task, so
 /// no spawning / `Arc` is needed.
 async fn fill_all_rosters(cli: &Client, pgroup: &str, courses: &mut [Course]) {
-    let ids: Vec<(usize, String)> = courses.iter().enumerate().map(|(i, c)| (i, c.course_id.clone())).collect();
+    let ids: Vec<(usize, String)> = courses
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, c.course_id.clone()))
+        .collect();
     let results: Vec<(usize, anyhow::Result<Vec<Student>>)> = stream::iter(ids)
         .map(|(i, id)| async move { (i, course_students(cli, pgroup, &id).await) })
         .buffer_unordered(MAX_COURSE_STUDENT_FETCH)
@@ -90,7 +94,11 @@ async fn fill_all_rosters(cli: &Client, pgroup: &str, courses: &mut [Course]) {
         match res {
             Ok(students) => courses[i].students = students,
             Err(e) => {
-                tracing::warn!("roster for course {} ({}) failed: {e}", courses[i].course_id, courses[i].name);
+                tracing::warn!(
+                    "roster for course {} ({}) failed: {e}",
+                    courses[i].course_id,
+                    courses[i].name
+                );
                 courses[i].error = e.to_string();
             }
         }
@@ -104,8 +112,11 @@ async fn fetch_course_list(cli: &Client) -> anyhow::Result<(Vec<Course>, String)
         .get_json(EVAL_GRID_PATH)
         .await
         .map_err(|e| anyhow!("load evaluation-grid: {e}"))?;
-    let node = find_named_node(&page, "class_course")
-        .ok_or_else(|| anyhow!("course selector not found on evaluation-grid (Edookit page shape may have changed)"))?;
+    let node = find_named_node(&page, "class_course").ok_or_else(|| {
+        anyhow!(
+            "course selector not found on evaluation-grid (Edookit page shape may have changed)"
+        )
+    })?;
     parse_course_options(node)
 }
 
@@ -123,7 +134,9 @@ fn parse_course_options(node: &Value) -> anyhow::Result<(Vec<Course>, String)> {
 
     let mut courses = Vec::new();
     for o in opts {
-        let Some(d) = o.get("d").and_then(Value::as_array) else { continue };
+        let Some(d) = o.get("d").and_then(Value::as_array) else {
+            continue;
+        };
         if d.len() < 2 {
             continue;
         }
@@ -147,7 +160,11 @@ fn parse_course_options(node: &Value) -> anyhow::Result<(Vec<Course>, String)> {
 fn course_options_for_view<'a>(views: &'a [Value], preferred: &str) -> (Vec<&'a Value>, String) {
     let mut first: Option<(Vec<&'a Value>, String)> = None;
     for v in views {
-        let opts: Vec<&Value> = v.get("c").and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default();
+        let opts: Vec<&Value> = v
+            .get("c")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().collect())
+            .unwrap_or_default();
         let id = v
             .get("d")
             .and_then(Value::as_array)
@@ -166,7 +183,11 @@ fn course_options_for_view<'a>(views: &'a [Value], preferred: &str) -> (Vec<&'a 
 }
 
 /// Loads one course's roster from the evaluation grid data.
-async fn course_students(cli: &Client, pgroup: &str, course_id: &str) -> anyhow::Result<Vec<Student>> {
+async fn course_students(
+    cli: &Client,
+    pgroup: &str,
+    course_id: &str,
+) -> anyhow::Result<Vec<Student>> {
     let q = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("pgroup_id", pgroup)
         .append_pair("course_id", course_id)
@@ -190,7 +211,9 @@ async fn course_students(cli: &Client, pgroup: &str, course_id: &str) -> anyhow:
 
     let mut students = Vec::with_capacity(rows.len());
     for row in rows {
-        let Some(cells) = row.as_array() else { continue };
+        let Some(cells) = row.as_array() else {
+            continue;
+        };
         if cells.len() < 3 {
             continue;
         }
@@ -200,7 +223,11 @@ async fn course_students(cli: &Client, pgroup: &str, course_id: &str) -> anyhow:
         if name.is_empty() {
             continue; // header / aggregate row carries no student name
         }
-        students.push(Student { study_id: id.to_string(), name, class });
+        students.push(Student {
+            study_id: id.to_string(),
+            name,
+            class,
+        });
     }
     Ok(students)
 }
@@ -218,7 +245,14 @@ fn parse_student_cell(cell_html: &str) -> (String, String) {
     let class = span
         .select(&SMALL_SEL)
         .next()
-        .map(|s| s.text().collect::<String>().trim().trim_matches(['(', ')']).trim().to_string())
+        .map(|s| {
+            s.text()
+                .collect::<String>()
+                .trim()
+                .trim_matches(['(', ')'])
+                .trim()
+                .to_string()
+        })
         .unwrap_or_default();
     // Name = span text excluding the <small> class suffix.
     let name = collapse_whitespace(&text_excluding(span, "small"));
@@ -283,7 +317,10 @@ mod tests {
         assert_eq!(courses[0].name, "AUT - 4SA");
         assert!(!courses[0].split_group);
         assert_eq!(courses[1].name, "AUT 1 - 4SA");
-        assert!(courses[1].split_group, "indented label is a split half-group");
+        assert!(
+            courses[1].split_group,
+            "indented label is a split half-group"
+        );
     }
 
     #[test]

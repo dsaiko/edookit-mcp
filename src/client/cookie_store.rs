@@ -60,7 +60,10 @@ fn now_unix() -> i64 {
 /// On macOS that resolves to `~/Library/Caches/edookit-mcp/cookies.json`.
 pub fn default_cookie_cache_path() -> anyhow::Result<PathBuf> {
     let cache = dirs::cache_dir().ok_or_else(|| anyhow!("user cache dir: not available"))?;
-    Ok(cache.join("edookit-mcp").join("cookies.json"))
+    // Deliberately a separate dir from the Go build's `edookit-mcp/` so the two
+    // binaries don't fight over one cookies.json (different on-disk format) when
+    // run side by side for comparison.
+    Ok(cache.join("edookit-mcp-rs").join("cookies.json"))
 }
 
 /// Reads cached cookies from `path` and returns them with their age. Returns a
@@ -93,8 +96,8 @@ pub fn load_cookies(path: &Path, base_url: &str) -> anyhow::Result<(Vec<StoredCo
     let _ = &meta;
 
     let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let cf: CookieFile = serde_json::from_slice(&data)
-        .map_err(|e| anyhow!("parse {}: {}", path.display(), e))?;
+    let cf: CookieFile =
+        serde_json::from_slice(&data).map_err(|e| anyhow!("parse {}: {}", path.display(), e))?;
 
     if cf.base_url != base_url {
         bail!("cached cookies are for {}, not {}", cf.base_url, base_url);
@@ -185,8 +188,14 @@ mod tests {
     fn save_load_roundtrip_preserves_name_value() {
         let (_g, path) = tmp_path();
         let cookies = vec![
-            StoredCookie { name: "X-EdooAuthToken".into(), value: "tok123".into() },
-            StoredCookie { name: "X-Auth-Id".into(), value: "id456".into() },
+            StoredCookie {
+                name: "X-EdooAuthToken".into(),
+                value: "tok123".into(),
+            },
+            StoredCookie {
+                name: "X-Auth-Id".into(),
+                value: "id456".into(),
+            },
         ];
         save_cookies(&path, BASE, cookies).unwrap();
         let (loaded, age) = load_cookies(&path, BASE).unwrap();
@@ -200,14 +209,24 @@ mod tests {
     fn load_missing_file_is_not_found() {
         let (_g, path) = tmp_path();
         let err = load_cookies(&path, BASE).unwrap_err();
-        let io = err.downcast_ref::<std::io::Error>().expect("io error preserved");
+        let io = err
+            .downcast_ref::<std::io::Error>()
+            .expect("io error preserved");
         assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
     fn base_url_mismatch_rejected() {
         let (_g, path) = tmp_path();
-        save_cookies(&path, BASE, vec![StoredCookie { name: "a".into(), value: "b".into() }]).unwrap();
+        save_cookies(
+            &path,
+            BASE,
+            vec![StoredCookie {
+                name: "a".into(),
+                value: "b".into(),
+            }],
+        )
+        .unwrap();
         let err = load_cookies(&path, "https://other.edookit.net").unwrap_err();
         assert!(err.to_string().contains("cached cookies are for"));
     }
@@ -216,7 +235,10 @@ mod tests {
     fn empty_cookie_list_rejected() {
         let (_g, path) = tmp_path();
         create_dir_secure(path.parent().unwrap()).unwrap();
-        let json = format!(r#"{{"captured_at_unix":{},"base_url":"{BASE}","cookies":[]}}"#, now_unix());
+        let json = format!(
+            r#"{{"captured_at_unix":{},"base_url":"{BASE}","cookies":[]}}"#,
+            now_unix()
+        );
         std::fs::write(&path, json).unwrap();
         let err = load_cookies(&path, BASE).unwrap_err();
         assert!(err.to_string().contains("empty"));
@@ -252,7 +274,15 @@ mod tests {
     fn saved_file_is_0600() {
         use std::os::unix::fs::PermissionsExt;
         let (_g, path) = tmp_path();
-        save_cookies(&path, BASE, vec![StoredCookie { name: "a".into(), value: "b".into() }]).unwrap();
+        save_cookies(
+            &path,
+            BASE,
+            vec![StoredCookie {
+                name: "a".into(),
+                value: "b".into(),
+            }],
+        )
+        .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "session cookies must be owner-only");
     }
