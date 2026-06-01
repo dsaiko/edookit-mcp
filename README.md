@@ -4,7 +4,7 @@ Neoficiální MCP konektor pro Edookit — umožňuje AI asistentům (Claude, Ch
 Cursor, VS Code Copilot a dalším MCP-kompatibilním klientům) číst zprávy z
 žákovské knížky.
 
-> **Rust port.** Toto je přepis [`edookit-mcp`](../edookit-mcp) (původně v Go) do
+> **Rust port.** Toto je přepis [`edookit-mcp`](https://github.com/dsaiko/edookit-mcp) (původně v Go) do
 > Rustu, vytvořený pro **srovnání obou implementací**. Chování, sada nástrojů i
 > bezpečnostní model jsou stejné jako u Go verze. Upřímné srovnání Go vs Rust je
 > na konci tohoto souboru. **Neoficiální projekt — nemá nic společného s Edookit
