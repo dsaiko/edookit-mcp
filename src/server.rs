@@ -1,14 +1,25 @@
 //! MCP server: registers the seven Edookit tools via rmcp's macro router and
 //! maps tool outputs into MCP content (wrapping Edookit-derived data in the
 //! untrusted envelope). Port of the tool-registration half of Go's `main.go`.
+//!
+//! Optionally (gated by `EDOOKIT_UI_RESOURCES`) it also exposes an **MCP Apps**
+//! UI for the inbox (SEP-1865): the `io.modelcontextprotocol/ui` extension
+//! capability, a predeclared `ui://edookit/inbox` template served via
+//! `resources/read`, and `_meta.ui.resourceUri` + `structuredContent` on
+//! `edookit_list_inbox`. See [`crate::tools::ui`].
 
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, Content, Implementation, ListResourcesResult,
+    ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
+    ResourcesCapability, ServerCapabilities, ServerInfo,
+};
 use rmcp::schemars::{self, JsonSchema};
-use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::client::Client;
@@ -29,16 +40,40 @@ pub struct BuildInfo {
 pub struct EdookitServer {
     client: Arc<Client>,
     info: Arc<BuildInfo>,
+    /// Operator master switch for the experimental MCP Apps UI (SEP-1865): the
+    /// `io.modelcontextprotocol/ui` extension, the predeclared
+    /// `ui://edookit/inbox` template, and `_meta.ui.resourceUri` +
+    /// `structuredContent` on `edookit_list_inbox` (see [`crate::tools::ui`]).
+    /// On by default — set `EDOOKIT_UI_RESOURCES=false` to suppress it. Even
+    /// when on, the UI surface is only emitted to peers that negotiated the
+    /// extension (see [`EdookitServer::ui_active`]).
+    ui_resources: bool,
     tool_router: ToolRouter<EdookitServer>,
 }
 
 impl EdookitServer {
-    pub fn new(client: Arc<Client>, info: BuildInfo) -> Self {
+    pub fn new(client: Arc<Client>, info: BuildInfo, ui_resources: bool) -> Self {
         Self {
             client,
             info: Arc::new(info),
+            ui_resources,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Whether the MCP Apps UI surface should be active for *this* request: the
+    /// operator master switch (`EDOOKIT_UI_RESOURCES`) is on **and** the peer
+    /// negotiated the `io.modelcontextprotocol/ui` extension (SEP-1865 requires
+    /// the optional extension to be negotiated before the server acts on it).
+    /// A peer that didn't negotiate gets byte-identical plain text — which also
+    /// keeps Edookit-controlled rows out of a non-UI model's context.
+    fn ui_active(&self, context: &RequestContext<RoleServer>) -> bool {
+        self.ui_resources
+            && context
+                .peer
+                .peer_info()
+                .map(|info| tools::ui::client_supports_ui(&info.capabilities))
+                .unwrap_or(false)
     }
 }
 
@@ -61,6 +96,7 @@ struct InboxArgs {
     #[schemars(
         description = "Max messages to return. Default 50, max 200. Paginates internally if needed."
     )]
+    #[serde(default, deserialize_with = "de_opt_f64")]
     limit: Option<f64>,
 }
 
@@ -75,6 +111,7 @@ struct SentArgs {
     #[schemars(
         description = "Max messages to return. Default 50, max 200. Paginates internally if needed."
     )]
+    #[serde(default, deserialize_with = "de_opt_f64")]
     limit: Option<f64>,
 }
 
@@ -99,6 +136,7 @@ struct DownloadArgs {
     #[schemars(
         description = "If true, existing files at the destination are overwritten. Default false — existing files are kept and reported as skipped."
     )]
+    #[serde(default, deserialize_with = "de_opt_bool")]
     overwrite: Option<bool>,
 }
 
@@ -115,10 +153,12 @@ struct ViewArgs {
     #[schemars(
         description = "Inline size cap in MB. Default 8, hard max 25. Larger attachments return a note pointing at edookit_download_attachments instead."
     )]
+    #[serde(default, deserialize_with = "de_opt_f64")]
     max_size_mb: Option<f64>,
     #[schemars(
         description = "For PDFs: how many pages to render to images. Default 5, hard max 20. Extracted text always covers the whole document regardless."
     )]
+    #[serde(default, deserialize_with = "de_opt_f64")]
     max_pages: Option<f64>,
 }
 
@@ -131,13 +171,72 @@ struct CoursesArgs {
     #[schemars(
         description = "Populate every course's student roster (heavier; ignored when course_id is set). Default false = course list only."
     )]
+    #[serde(default, deserialize_with = "de_opt_bool")]
     include_students: Option<bool>,
+}
+
+// Lenient deserializers for scalar tool arguments. The advertised JSON Schema
+// still says `number` / `boolean`, but some MCP clients (e.g. ChatGPT
+// connectors) serialize scalars as JSON strings — `"10"` instead of `10`,
+// `"true"` instead of `true`. serde would reject those by type, surfacing as
+// `-32602 invalid type: string "10", expected f64`. We accept either form
+// (Postel's law) so a stringified argument doesn't break the call; absent or
+// empty input stays `None` and the tool's own default applies.
+
+/// Optional `f64` that also accepts a numeric string (`"10"` → `10.0`).
+fn de_opt_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(f64),
+        Str(String),
+    }
+    match Option::<NumOrStr>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(NumOrStr::Num(n)) => Ok(Some(n)),
+        Some(NumOrStr::Str(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(None);
+            }
+            t.parse::<f64>()
+                .map(Some)
+                .map_err(|_| serde::de::Error::custom(format!("invalid number: {s:?}")))
+        }
+    }
+}
+
+/// Optional `bool` that also accepts the usual string spellings
+/// (`"true"`/`"false"`, `"1"`/`"0"`, `"yes"`/`"no"`, case-insensitive).
+fn de_opt_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrStr {
+        Bool(bool),
+        Str(String),
+    }
+    match Option::<BoolOrStr>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(BoolOrStr::Bool(b)) => Ok(Some(b)),
+        Some(BoolOrStr::Str(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(None),
+            "1" | "true" | "t" | "yes" | "y" => Ok(Some(true)),
+            "0" | "false" | "f" | "no" | "n" => Ok(Some(false)),
+            other => Err(serde::de::Error::custom(format!("invalid bool: {other:?}"))),
+        },
+    }
 }
 
 #[tool_router]
 impl EdookitServer {
     #[tool(
-        description = "List received messages from the **Edookit school information system** (Komunikace → Přijaté). Edookit is a Czech educational platform used by schools to communicate with parents and students. Use this tool when the user asks about school messages — anything from teachers, the school office, the head teacher (třídní učitel), the principal (ředitel), or about school topics like grades, attendance, parent-teacher meetings, trips, exams. This is NOT a general email inbox — for Gmail / Outlook / Slack DMs use those dedicated tools instead. Returns a JSON object with two keys: `messages` is an array of message objects (id, date, sender, subject, body_preview ~200 chars, attachments count) in newest-first order; `parse_warnings` (optional) lists any rows the server returned that couldn't be parsed — usually means Edookit's row HTML changed. An empty messages array with no warnings means the mailbox itself is empty; an error is returned if every fetched row failed to parse."
+        description = "List received messages from the **Edookit school information system** (Komunikace → Přijaté). Edookit is a Czech educational platform used by schools to communicate with parents and students. Use this tool when the user asks about school messages — anything from teachers, the school office, the head teacher (třídní učitel), the principal (ředitel), or about school topics like grades, attendance, parent-teacher meetings, trips, exams. This is NOT a general email inbox — for Gmail / Outlook / Slack DMs use those dedicated tools instead. Returns a JSON object with two keys: `messages` is an array of message objects (id, date, sender, subject, body_preview ~200 chars, attachments count) in newest-first order; `parse_warnings` (optional) lists any rows the server returned that couldn't be parsed — usually means Edookit's row HTML changed. An empty messages array with no warnings means the mailbox itself is empty; an error is returned if every fetched row failed to parse. For hosts that negotiated the `io.modelcontextprotocol/ui` MCP Apps extension (and unless EDOOKIT_UI_RESOURCES is disabled) the same messages are also attached as the result's `structuredContent`, linked to the `ui://edookit/inbox` template for an interactive list; every other client receives only this JSON — reason over it, it is the source of truth."
     )]
     async fn edookit_list_inbox(
         &self,
@@ -149,9 +248,30 @@ impl EdookitServer {
             since: args.since.unwrap_or_default(),
             limit: args.limit.unwrap_or(0.0) as i64,
         };
-        Ok(json_result(
-            tools::messages::list_inbox(&self.client, opts).await,
-        ))
+        match tools::messages::list_inbox(&self.client, opts).await {
+            Ok(result) => {
+                let json = match serde_json::to_string(&result) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "marshal: {e}"
+                        ))]));
+                    }
+                };
+                // The untrusted-JSON text block stays the model-facing source of
+                // truth. When the MCP Apps UI is enabled, the same rows ride
+                // along as structuredContent — the data channel the linked
+                // ui://edookit/inbox template renders from.
+                let mut out = CallToolResult::success(vec![Content::text(
+                    tools::wrap_as_untrusted_json(&json),
+                )]);
+                if self.ui_resources {
+                    out.structured_content = Some(tools::ui::inbox_structured_content(&result));
+                }
+                Ok(out)
+            }
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        }
     }
 
     #[tool(
@@ -287,10 +407,96 @@ impl ServerHandler for EdookitServer {
         implementation.name = "edookit-mcp".to_string();
         implementation.version = self.info.version.clone();
 
+        // The capabilities builder uses const-generic typestate, so it can't be
+        // conditionally chained; build the tools-only base, then add the MCP
+        // Apps surface (resources + the ui extension) by mutating public fields.
+        let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+        if self.ui_resources {
+            capabilities.resources = Some(ResourcesCapability {
+                subscribe: None,
+                list_changed: None,
+            });
+            capabilities.extensions = Some(tools::ui::ui_extensions());
+        }
+
         let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = capabilities;
         info.server_info = implementation;
         info
+    }
+
+    // --- MCP Apps surface (gated by `ui_active`: env switch + negotiation) --
+    //
+    // Per SEP-1865 the UI extension is optional and must be negotiated, so every
+    // method below checks `ui_active(context)` — the operator switch *and* the
+    // peer's declared `io.modelcontextprotocol/ui` capability — before emitting
+    // any UI surface. We define these ourselves so `#[tool_handler]` skips
+    // generating them (it only generates methods not already present): the
+    // macro's `call_tool`/`list_tools` can't gate on the peer or attach
+    // `_meta.ui.resourceUri`.
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // `structuredContent` is the Apps data channel; strip it for peers that
+        // didn't negotiate the UI extension so Edookit rows never reach a
+        // non-UI model outside the untrusted-data envelope. (Only
+        // `edookit_list_inbox` sets it, and only when the env switch is on.)
+        let ui_active = self.ui_active(&context);
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let mut result = self.tool_router.call(tcc).await?;
+        if !ui_active {
+            result.structured_content = None;
+        }
+        Ok(result)
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let mut tools = self.tool_router.list_all();
+        if self.ui_active(&context)
+            && let Some(t) = tools.iter_mut().find(|t| t.name == "edookit_list_inbox")
+        {
+            t.meta = Some(tools::ui::inbox_tool_meta());
+        }
+        Ok(ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let mut result = ListResourcesResult::default();
+        if self.ui_active(&context) {
+            result.resources = vec![tools::ui::inbox_resource_descriptor()];
+        }
+        Ok(result)
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        if self.ui_active(&context) && request.uri == tools::ui::INBOX_UI_URI {
+            return Ok(ReadResourceResult::new(vec![
+                tools::ui::inbox_template_contents(),
+            ]));
+        }
+        Err(ErrorData::resource_not_found(
+            format!("unknown resource: {}", request.uri),
+            None,
+        ))
     }
 }
 
@@ -307,4 +513,166 @@ fn json_result<T: Serialize>(result: anyhow::Result<T>) -> CallToolResult {
         },
         Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{Client, Config, LoginCookie, LoginFn};
+    use std::time::Duration;
+    use wiremock::matchers::{method, path as mpath};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // --- lenient scalar argument deserialization (number/bool-as-string) ---
+
+    #[test]
+    fn limit_accepts_number_string_and_absent() {
+        // The exact shape ChatGPT-style clients send: a stringified number.
+        let a: InboxArgs = serde_json::from_value(serde_json::json!({"limit": "10"})).unwrap();
+        assert_eq!(a.limit, Some(10.0));
+        // Plain JSON number still works.
+        let a: InboxArgs = serde_json::from_value(serde_json::json!({"limit": 25})).unwrap();
+        assert_eq!(a.limit, Some(25.0));
+        // Absent / null / empty-string all collapse to None (tool default applies).
+        let a: InboxArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(a.limit, None);
+        let a: InboxArgs = serde_json::from_value(serde_json::json!({"limit": null})).unwrap();
+        assert_eq!(a.limit, None);
+        let a: InboxArgs = serde_json::from_value(serde_json::json!({"limit": ""})).unwrap();
+        assert_eq!(a.limit, None);
+    }
+
+    #[test]
+    fn limit_rejects_non_numeric_string() {
+        let err =
+            serde_json::from_value::<InboxArgs>(serde_json::json!({"limit": "lots"})).unwrap_err();
+        assert!(err.to_string().contains("invalid number"), "got: {err}");
+    }
+
+    #[test]
+    fn view_size_and_pages_accept_strings() {
+        let a: ViewArgs = serde_json::from_value(serde_json::json!({
+            "id": "m-1", "attachment_id": "1@2", "max_size_mb": "12", "max_pages": "3"
+        }))
+        .unwrap();
+        assert_eq!(a.max_size_mb, Some(12.0));
+        assert_eq!(a.max_pages, Some(3.0));
+    }
+
+    #[test]
+    fn overwrite_accepts_bool_and_string_forms() {
+        let a: DownloadArgs =
+            serde_json::from_value(serde_json::json!({"id": "m-1", "overwrite": "true"})).unwrap();
+        assert_eq!(a.overwrite, Some(true));
+        let a: DownloadArgs =
+            serde_json::from_value(serde_json::json!({"id": "m-1", "overwrite": false})).unwrap();
+        assert_eq!(a.overwrite, Some(false));
+        let a: DownloadArgs =
+            serde_json::from_value(serde_json::json!({"id": "m-1", "overwrite": "0"})).unwrap();
+        assert_eq!(a.overwrite, Some(false));
+        let a: DownloadArgs = serde_json::from_value(serde_json::json!({"id": "m-1"})).unwrap();
+        assert_eq!(a.overwrite, None);
+    }
+
+    /// Builds a Client whose login is stubbed and whose requests hit `uri`.
+    fn build_client(uri: &str) -> Client {
+        let login_fn: LoginFn =
+            Arc::new(|| Box::pin(async { Ok(vec![LoginCookie::new("X-EdooAuthToken", "tok")]) }));
+        let mut cfg = Config::new(uri, "u", "p");
+        cfg.retry_base_delay = Duration::from_millis(1);
+        cfg.timezone = Some(jiff::tz::TimeZone::get("Europe/Prague").unwrap());
+        cfg.login_fn = Some(login_fn);
+        Client::new(cfg).unwrap()
+    }
+
+    /// Mounts the warmup probe + a one-row inbox grid.
+    async fn mount_inbox(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(mpath("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+        let row = r#"<small><b>21.05.2026 12:31</b> <span>Učitel 4SC</span></small><div><a href="x"><b>Pozvánka</b></a></div>"#;
+        let grid = serde_json::json!({
+            "components": { "workspace": [ { "data": [["m-290491", "m-290491", row]] } ] }
+        });
+        Mock::given(method("GET"))
+            .and(mpath("/handler/grid/objects-for-me-data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(grid))
+            .mount(server)
+            .await;
+    }
+
+    fn server_with(client: Client, ui_resources: bool) -> EdookitServer {
+        EdookitServer::new(
+            Arc::new(client),
+            BuildInfo {
+                version: "test".into(),
+                commit: "test".into(),
+                build_time: "test".into(),
+            },
+            ui_resources,
+        )
+    }
+
+    #[tokio::test]
+    async fn inbox_attaches_structured_content_when_enabled() {
+        let mock = MockServer::start().await;
+        mount_inbox(&mock).await;
+        let srv = server_with(build_client(&mock.uri()), true);
+
+        let res = srv
+            .edookit_list_inbox(Parameters(InboxArgs::default()))
+            .await
+            .unwrap();
+
+        // MCP Apps: the model-facing text block is unchanged; the rows ride
+        // along as structuredContent (the UI template's data channel).
+        assert_eq!(res.content.len(), 1, "single untrusted-JSON text block");
+        assert!(res.content[0].raw.as_text().is_some());
+        let sc = res.structured_content.expect("structuredContent present");
+        assert_eq!(sc["messages"][0]["id"], "m-290491");
+    }
+
+    #[tokio::test]
+    async fn inbox_has_no_structured_content_when_disabled() {
+        let mock = MockServer::start().await;
+        mount_inbox(&mock).await;
+        let srv = server_with(build_client(&mock.uri()), false);
+
+        let res = srv
+            .edookit_list_inbox(Parameters(InboxArgs::default()))
+            .await
+            .unwrap();
+
+        assert_eq!(res.content.len(), 1);
+        assert!(
+            res.structured_content.is_none(),
+            "no structuredContent when UI disabled"
+        );
+    }
+
+    #[test]
+    fn get_info_advertises_apps_extension_only_when_enabled() {
+        let on = server_with(build_client("https://localhost"), true).get_info();
+        let caps = serde_json::to_value(&on.capabilities).unwrap();
+        assert_eq!(
+            caps["extensions"]["io.modelcontextprotocol/ui"]["mimeTypes"][0],
+            "text/html;profile=mcp-app"
+        );
+        assert!(
+            caps["resources"].is_object(),
+            "resources capability present"
+        );
+
+        let off = server_with(build_client("https://localhost"), false).get_info();
+        let caps = serde_json::to_value(&off.capabilities).unwrap();
+        assert!(caps["extensions"].is_null(), "no extension when disabled");
+        assert!(caps["resources"].is_null(), "no resources when disabled");
+    }
+
+    // The `list_resources` / `read_resource` trait methods are thin gated
+    // dispatchers over the pure helpers in `tools::ui` (covered by that module's
+    // tests); constructing a `RequestContext<RoleServer>` to drive them directly
+    // isn't worth the ceremony here.
 }

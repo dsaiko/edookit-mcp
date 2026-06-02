@@ -45,6 +45,11 @@ struct Cli {
     /// When unset, runs as a local stdio MCP server. Falls back to EDOOKIT_HTTP_ADDR.
     #[arg(long, value_name = "ADDR")]
     http: Option<String>,
+    /// (dev) Render the experimental MCP Apps inbox template (with a built-in
+    /// mock host feeding sample data) to stdout and exit — no login. Pipe to a
+    /// file and open in a browser: `edookit-mcp --preview-ui > /tmp/inbox.html`.
+    #[arg(long)]
+    preview_ui: bool,
 }
 
 #[tokio::main]
@@ -62,6 +67,10 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     // One-shot runners that don't need the full Edookit client.
+    if cli.preview_ui {
+        print!("{}", tools::ui::render_preview_html());
+        return Ok(());
+    }
     if cli.clear_cookies {
         return run_clear_cookies();
     }
@@ -96,6 +105,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .filter(|s| !s.is_empty())
     });
 
+    // Experimental: expose the MCP Apps inbox UI (on by default; set
+    // EDOOKIT_UI_RESOURCES=false to suppress it).
+    let ui_resources = getenv_bool("EDOOKIT_UI_RESOURCES", true)?;
+
     let server = EdookitServer::new(
         Arc::new(cli_client),
         BuildInfo {
@@ -103,6 +116,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             commit: COMMIT.to_string(),
             build_time: BUILD_DATE.to_string(),
         },
+        ui_resources,
     );
 
     if let Some(addr) = http_addr {
