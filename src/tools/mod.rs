@@ -9,6 +9,7 @@ mod htmlutil;
 pub mod message;
 pub mod messages;
 mod pdfrender;
+pub mod ui;
 pub mod untrusted;
 pub mod view;
 

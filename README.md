@@ -263,7 +263,7 @@ jar atomically (clearing path-scoped cookies a name-based clear would miss).
 | `src/server.rs` | rmcp tool registration (the 7 tools) + MCP `ServerHandler` |
 | `src/http.rs` | Streamable HTTP transport + axum integration + `validate_public_url` / `guard_bind_address` |
 | `src/client/` | reqwest session client, swappable cookie jar, retry/origin, cookie cache, chromiumoxide login |
-| `src/tools/` | one module per tool + HTML/date utils + untrusted-data envelope + PDFium worker |
+| `src/tools/` | one module per tool + HTML/date utils + untrusted-data envelope + PDFium worker + experimental MCP-UI inbox widget (`ui.rs`) |
 | `src/oauth/` | built-in OAuth 2.1 AS (jwt HS256, server, middleware, ratelimit, login template) |
 | `packaging/` | systemd unit + env template + Debian maintainer scripts |
 | `.github/workflows/` | `ci.yml` (fmt/clippy/test/audit) + `release.yml` (cross-platform + deb/rpm) |
@@ -328,6 +328,36 @@ documented here rather than engineered away:
   + pixel dimensions) on a dedicated blocking thread under a mutex. The
   WASM-sandbox property is the one place Go's stack is genuinely safer; see the
   comparison section. Accepted for the native-render performance and simplicity.
+
+### Experimental: MCP-UI inbox widget
+
+Every tool otherwise returns only the two universally-supported MCP content
+types — `text` (JSON wrapped in the untrusted envelope) and `image` (inline
+attachment view). As an opt-in experiment, setting **`EDOOKIT_UI_RESOURCES=true`**
+makes `edookit_list_inbox` *additionally* append an embedded
+[MCP-UI](https://mcpui.com) resource — a `text/html` widget identified by the
+`ui://edookit/inbox` URI ([`src/tools/ui.rs`](src/tools/ui.rs)). MCP-UI–capable
+clients render it as a clickable inbox; clicking a row posts an MCP-UI `tool`
+action asking the host to call `edookit_get_message` for that id (click → detail).
+
+Design constraints, all deliberate:
+
+- **Purely additive.** The untrusted-JSON text block is still emitted first and
+  remains the source of truth; clients that don't understand `ui://` ignore the
+  extra block. Off by default so the public HTTP endpoint's clients are
+  unaffected unless an operator opts in.
+- **No new capability / no resource handlers.** The HTML travels *inline* in the
+  tool result's `content` array (the MCP-UI embedded-resource convention), so
+  there's no `resources/list`+`read` round-trip and the server stays
+  `tools`-only.
+- **Untrusted-data discipline preserved.** The widget HTML-escapes every
+  third-party field (sender/subject/preview) and renders only list *metadata*,
+  passing back an opaque `id`. The message **body** is never injected into the
+  widget DOM — the detail comes back through `edookit_get_message`'s normal
+  untrusted-text path. (See the escaping/XSS unit tests in `ui.rs`.)
+- **Known cost.** On clients that forward all content blocks to the model, the
+  extra HTML also lands in the model's context. A production version would gate
+  the block on a detected client UI capability rather than a static env var.
 
 ### Distribution and packaging
 

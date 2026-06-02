@@ -29,14 +29,20 @@ pub struct BuildInfo {
 pub struct EdookitServer {
     client: Arc<Client>,
     info: Arc<BuildInfo>,
+    /// When true, `edookit_list_inbox` also appends an experimental MCP-UI
+    /// widget resource (see [`crate::tools::ui`]). Off by default — gated by
+    /// `EDOOKIT_UI_RESOURCES` so the public endpoint's clients keep getting
+    /// plain text/JSON unless an operator opts in.
+    ui_resources: bool,
     tool_router: ToolRouter<EdookitServer>,
 }
 
 impl EdookitServer {
-    pub fn new(client: Arc<Client>, info: BuildInfo) -> Self {
+    pub fn new(client: Arc<Client>, info: BuildInfo, ui_resources: bool) -> Self {
         Self {
             client,
             info: Arc::new(info),
+            ui_resources,
             tool_router: Self::tool_router(),
         }
     }
@@ -137,7 +143,7 @@ struct CoursesArgs {
 #[tool_router]
 impl EdookitServer {
     #[tool(
-        description = "List received messages from the **Edookit school information system** (Komunikace → Přijaté). Edookit is a Czech educational platform used by schools to communicate with parents and students. Use this tool when the user asks about school messages — anything from teachers, the school office, the head teacher (třídní učitel), the principal (ředitel), or about school topics like grades, attendance, parent-teacher meetings, trips, exams. This is NOT a general email inbox — for Gmail / Outlook / Slack DMs use those dedicated tools instead. Returns a JSON object with two keys: `messages` is an array of message objects (id, date, sender, subject, body_preview ~200 chars, attachments count) in newest-first order; `parse_warnings` (optional) lists any rows the server returned that couldn't be parsed — usually means Edookit's row HTML changed. An empty messages array with no warnings means the mailbox itself is empty; an error is returned if every fetched row failed to parse."
+        description = "List received messages from the **Edookit school information system** (Komunikace → Přijaté). Edookit is a Czech educational platform used by schools to communicate with parents and students. Use this tool when the user asks about school messages — anything from teachers, the school office, the head teacher (třídní učitel), the principal (ředitel), or about school topics like grades, attendance, parent-teacher meetings, trips, exams. This is NOT a general email inbox — for Gmail / Outlook / Slack DMs use those dedicated tools instead. Returns a JSON object with two keys: `messages` is an array of message objects (id, date, sender, subject, body_preview ~200 chars, attachments count) in newest-first order; `parse_warnings` (optional) lists any rows the server returned that couldn't be parsed — usually means Edookit's row HTML changed. An empty messages array with no warnings means the mailbox itself is empty; an error is returned if every fetched row failed to parse. When the server is run with EDOOKIT_UI_RESOURCES enabled, the result also carries an extra `ui://edookit/inbox` (text/html) resource block for MCP-UI–capable clients to render an interactive list — ignore it for reasoning; the JSON above is the source of truth."
     )]
     async fn edookit_list_inbox(
         &self,
@@ -149,8 +155,10 @@ impl EdookitServer {
             since: args.since.unwrap_or_default(),
             limit: args.limit.unwrap_or(0.0) as i64,
         };
-        Ok(json_result(
+        let ui = self.ui_resources;
+        Ok(json_result_with_ui(
             tools::messages::list_inbox(&self.client, opts).await,
+            |r| ui.then(|| tools::ui::inbox_resource(r)),
         ))
     }
 
@@ -298,13 +306,125 @@ impl ServerHandler for EdookitServer {
 /// returns it as a text content block. A serialize failure or the tool's own
 /// error becomes a tool-level error result (matching Go's `NewToolResultError`).
 fn json_result<T: Serialize>(result: anyhow::Result<T>) -> CallToolResult {
+    json_result_with_ui(result, |_| None)
+}
+
+/// Like [`json_result`] but lets the caller append extra content blocks (e.g. an
+/// MCP-UI widget resource) derived from the successful value. The untrusted-JSON
+/// text block always comes first and stays the canonical, model-facing output;
+/// any UI block is purely additive, so clients that don't render it fall back to
+/// the JSON. `ui` is only consulted on success and may return `None` to add
+/// nothing.
+fn json_result_with_ui<T: Serialize>(
+    result: anyhow::Result<T>,
+    ui: impl FnOnce(&T) -> Option<Content>,
+) -> CallToolResult {
     match result {
         Ok(value) => match serde_json::to_string(&value) {
             Ok(json) => {
-                CallToolResult::success(vec![Content::text(tools::wrap_as_untrusted_json(&json))])
+                let mut content = vec![Content::text(tools::wrap_as_untrusted_json(&json))];
+                content.extend(ui(&value));
+                CallToolResult::success(content)
             }
             Err(e) => CallToolResult::error(vec![Content::text(format!("marshal: {e}"))]),
         },
         Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{Client, Config, LoginCookie, LoginFn};
+    use std::time::Duration;
+    use wiremock::matchers::{method, path as mpath};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Builds a Client whose login is stubbed and whose requests hit `uri`.
+    fn build_client(uri: &str) -> Client {
+        let login_fn: LoginFn =
+            Arc::new(|| Box::pin(async { Ok(vec![LoginCookie::new("X-EdooAuthToken", "tok")]) }));
+        let mut cfg = Config::new(uri, "u", "p");
+        cfg.retry_base_delay = Duration::from_millis(1);
+        cfg.timezone = Some(jiff::tz::TimeZone::get("Europe/Prague").unwrap());
+        cfg.login_fn = Some(login_fn);
+        Client::new(cfg).unwrap()
+    }
+
+    /// Mounts the warmup probe + a one-row inbox grid.
+    async fn mount_inbox(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(mpath("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+        let row = r#"<small><b>21.05.2026 12:31</b> <span>Učitel 4SC</span></small><div><a href="x"><b>Pozvánka</b></a></div>"#;
+        let grid = serde_json::json!({
+            "components": { "workspace": [ { "data": [["m-290491", "m-290491", row]] } ] }
+        });
+        Mock::given(method("GET"))
+            .and(mpath("/handler/grid/objects-for-me-data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(grid))
+            .mount(server)
+            .await;
+    }
+
+    fn server_with(client: Client, ui_resources: bool) -> EdookitServer {
+        EdookitServer::new(
+            Arc::new(client),
+            BuildInfo {
+                version: "test".into(),
+                commit: "test".into(),
+                build_time: "test".into(),
+            },
+            ui_resources,
+        )
+    }
+
+    #[tokio::test]
+    async fn inbox_appends_ui_resource_when_enabled() {
+        let mock = MockServer::start().await;
+        mount_inbox(&mock).await;
+        let srv = server_with(build_client(&mock.uri()), true);
+
+        let res = srv
+            .edookit_list_inbox(Parameters(InboxArgs::default()))
+            .await
+            .unwrap();
+
+        assert_eq!(res.content.len(), 2, "untrusted-JSON text + UI resource");
+        assert!(
+            res.content[0].raw.as_text().is_some(),
+            "first block is text"
+        );
+        let resource = res.content[1]
+            .raw
+            .as_resource()
+            .expect("second block is an embedded resource");
+        match &resource.resource {
+            rmcp::model::ResourceContents::TextResourceContents { uri, .. } => {
+                assert_eq!(uri, tools::ui::INBOX_UI_URI);
+            }
+            _ => panic!("expected text/html resource"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inbox_is_text_only_when_disabled() {
+        let mock = MockServer::start().await;
+        mount_inbox(&mock).await;
+        let srv = server_with(build_client(&mock.uri()), false);
+
+        let res = srv
+            .edookit_list_inbox(Parameters(InboxArgs::default()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.content.len(),
+            1,
+            "JSON text block only — no UI resource"
+        );
+        assert!(res.content[0].raw.as_text().is_some());
     }
 }
