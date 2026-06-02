@@ -353,11 +353,18 @@ Concretely, when enabled:
 
 Design constraints, all deliberate:
 
-- **Additive; JSON stays the source of truth.** The untrusted-JSON `text` block
-  is unchanged and model-facing; the UI is layered on via metadata + a separate
-  data channel, so a host that ignores the extension behaves exactly as before.
-  On by default; `EDOOKIT_UI_RESOURCES=false` removes the extension capability,
-  the resource, the tool `_meta`, and the `structuredContent`.
+- **Negotiated, not just enabled.** Per SEP-1865 the extension is optional and
+  must be negotiated, so `EDOOKIT_UI_RESOURCES` is only the operator *master
+  switch*. The server acts on the UI surface — attaching `_meta.ui.resourceUri`,
+  serving the `ui://` resource, emitting `structuredContent` — **only for a peer
+  that declared `capabilities.extensions["io.modelcontextprotocol/ui"]` with
+  `text/html;profile=mcp-app`**. Any other client gets byte-identical plain text.
+- **Untrusted-data boundary preserved.** Because `structuredContent` carries the
+  same third-party rows *outside* the `BEGIN/END_UNTRUSTED_EDOOKIT_DATA` fence,
+  it is withheld from non-negotiating peers — so a teacher-controlled subject /
+  preview can't reach a non-UI model as an unfenced prompt-injection payload. A
+  peer that opts into the UI extension receives it and renders it in a sandboxed
+  iframe; the enveloped `text` block remains the model-facing source of truth.
 - **Predeclared static template.** Per SEP-1865 the HTML is a fixed resource the
   host can review before rendering — no per-call HTML — and the data arrives
   separately as `structuredContent`.
@@ -367,10 +374,9 @@ Design constraints, all deliberate:
   click only passes back an opaque message `id`; the message **body** is never
   put in the DOM (the detail comes back through `edookit_get_message`'s normal
   untrusted-text path). See the XSS / protocol unit tests in `ui.rs`.
-- **Known caveat.** `structuredContent` carries the same third-party rows
-  un-enveloped (the enveloped `text` block remains the primary guard), and some
-  hosts only render MCP Apps in first-party (`1p`) inference mode — a gateway /
-  Bedrock / Vertex / Foundry (`3p`) deployment may fall back to text regardless.
+- **Known caveat.** Some hosts only render MCP Apps in first-party (`1p`)
+  inference mode — a gateway / Bedrock / Vertex / Foundry (`3p`) deployment may
+  fall back to text regardless, even after negotiating the extension.
 - `--preview-ui` renders the template plus a built-in mock host (handshake +
   sample `tool-result`) so you can eyeball the rendered list in a plain browser.
 

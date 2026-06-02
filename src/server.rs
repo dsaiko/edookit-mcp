@@ -13,9 +13,9 @@ use std::sync::Arc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, Implementation, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, ResourcesCapability,
-    ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResult, Content, Implementation, ListResourcesResult,
+    ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
+    ResourcesCapability, ServerCapabilities, ServerInfo,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::RequestContext;
@@ -40,11 +40,13 @@ pub struct BuildInfo {
 pub struct EdookitServer {
     client: Arc<Client>,
     info: Arc<BuildInfo>,
-    /// When true, the server exposes the experimental MCP Apps UI (SEP-1865):
-    /// the `io.modelcontextprotocol/ui` extension, the predeclared
+    /// Operator master switch for the experimental MCP Apps UI (SEP-1865): the
+    /// `io.modelcontextprotocol/ui` extension, the predeclared
     /// `ui://edookit/inbox` template, and `_meta.ui.resourceUri` +
     /// `structuredContent` on `edookit_list_inbox` (see [`crate::tools::ui`]).
-    /// On by default — set `EDOOKIT_UI_RESOURCES=false` to suppress it.
+    /// On by default — set `EDOOKIT_UI_RESOURCES=false` to suppress it. Even
+    /// when on, the UI surface is only emitted to peers that negotiated the
+    /// extension (see [`EdookitServer::ui_active`]).
     ui_resources: bool,
     tool_router: ToolRouter<EdookitServer>,
 }
@@ -57,6 +59,21 @@ impl EdookitServer {
             ui_resources,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Whether the MCP Apps UI surface should be active for *this* request: the
+    /// operator master switch (`EDOOKIT_UI_RESOURCES`) is on **and** the peer
+    /// negotiated the `io.modelcontextprotocol/ui` extension (SEP-1865 requires
+    /// the optional extension to be negotiated before the server acts on it).
+    /// A peer that didn't negotiate gets byte-identical plain text — which also
+    /// keeps Edookit-controlled rows out of a non-UI model's context.
+    fn ui_active(&self, context: &RequestContext<RoleServer>) -> bool {
+        self.ui_resources
+            && context
+                .peer
+                .peer_info()
+                .map(|info| tools::ui::client_supports_ui(&info.capabilities))
+                .unwrap_or(false)
     }
 }
 
@@ -219,7 +236,7 @@ where
 #[tool_router]
 impl EdookitServer {
     #[tool(
-        description = "List received messages from the **Edookit school information system** (Komunikace → Přijaté). Edookit is a Czech educational platform used by schools to communicate with parents and students. Use this tool when the user asks about school messages — anything from teachers, the school office, the head teacher (třídní učitel), the principal (ředitel), or about school topics like grades, attendance, parent-teacher meetings, trips, exams. This is NOT a general email inbox — for Gmail / Outlook / Slack DMs use those dedicated tools instead. Returns a JSON object with two keys: `messages` is an array of message objects (id, date, sender, subject, body_preview ~200 chars, attachments count) in newest-first order; `parse_warnings` (optional) lists any rows the server returned that couldn't be parsed — usually means Edookit's row HTML changed. An empty messages array with no warnings means the mailbox itself is empty; an error is returned if every fetched row failed to parse. Unless EDOOKIT_UI_RESOURCES is disabled, the same messages are also attached as the result's `structuredContent` and linked to the `ui://edookit/inbox` MCP Apps template for capable hosts to render an interactive list — reason over the JSON above; it is the source of truth."
+        description = "List received messages from the **Edookit school information system** (Komunikace → Přijaté). Edookit is a Czech educational platform used by schools to communicate with parents and students. Use this tool when the user asks about school messages — anything from teachers, the school office, the head teacher (třídní učitel), the principal (ředitel), or about school topics like grades, attendance, parent-teacher meetings, trips, exams. This is NOT a general email inbox — for Gmail / Outlook / Slack DMs use those dedicated tools instead. Returns a JSON object with two keys: `messages` is an array of message objects (id, date, sender, subject, body_preview ~200 chars, attachments count) in newest-first order; `parse_warnings` (optional) lists any rows the server returned that couldn't be parsed — usually means Edookit's row HTML changed. An empty messages array with no warnings means the mailbox itself is empty; an error is returned if every fetched row failed to parse. For hosts that negotiated the `io.modelcontextprotocol/ui` MCP Apps extension (and unless EDOOKIT_UI_RESOURCES is disabled) the same messages are also attached as the result's `structuredContent`, linked to the `ui://edookit/inbox` template for an interactive list; every other client receives only this JSON — reason over it, it is the source of truth."
     )]
     async fn edookit_list_inbox(
         &self,
@@ -408,20 +425,41 @@ impl ServerHandler for EdookitServer {
         info
     }
 
-    // --- MCP Apps surface (gated by `ui_resources`) ------------------------
+    // --- MCP Apps surface (gated by `ui_active`: env switch + negotiation) --
     //
-    // We define `list_tools` ourselves so `#[tool_handler]` skips generating it
-    // (it only generates methods that aren't already present): the macro's
-    // version can't attach `_meta.ui.resourceUri` to a tool. `list_resources` /
-    // `read_resource` publish the predeclared `ui://edookit/inbox` template.
+    // Per SEP-1865 the UI extension is optional and must be negotiated, so every
+    // method below checks `ui_active(context)` — the operator switch *and* the
+    // peer's declared `io.modelcontextprotocol/ui` capability — before emitting
+    // any UI surface. We define these ourselves so `#[tool_handler]` skips
+    // generating them (it only generates methods not already present): the
+    // macro's `call_tool`/`list_tools` can't gate on the peer or attach
+    // `_meta.ui.resourceUri`.
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // `structuredContent` is the Apps data channel; strip it for peers that
+        // didn't negotiate the UI extension so Edookit rows never reach a
+        // non-UI model outside the untrusted-data envelope. (Only
+        // `edookit_list_inbox` sets it, and only when the env switch is on.)
+        let ui_active = self.ui_active(&context);
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let mut result = self.tool_router.call(tcc).await?;
+        if !ui_active {
+            result.structured_content = None;
+        }
+        Ok(result)
+    }
 
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let mut tools = self.tool_router.list_all();
-        if self.ui_resources
+        if self.ui_active(&context)
             && let Some(t) = tools.iter_mut().find(|t| t.name == "edookit_list_inbox")
         {
             t.meta = Some(tools::ui::inbox_tool_meta());
@@ -436,10 +474,10 @@ impl ServerHandler for EdookitServer {
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
         let mut result = ListResourcesResult::default();
-        if self.ui_resources {
+        if self.ui_active(&context) {
             result.resources = vec![tools::ui::inbox_resource_descriptor()];
         }
         Ok(result)
@@ -448,9 +486,9 @@ impl ServerHandler for EdookitServer {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
-        if self.ui_resources && request.uri == tools::ui::INBOX_UI_URI {
+        if self.ui_active(&context) && request.uri == tools::ui::INBOX_UI_URI {
             return Ok(ReadResourceResult::new(vec![
                 tools::ui::inbox_template_contents(),
             ]));

@@ -16,9 +16,12 @@
 //!     data via `ui/notifications/tool-result`, and a row click issues a
 //!     `tools/call` for `edookit_get_message` (click → detail).
 //!
-//! All of this is gated by `EDOOKIT_UI_RESOURCES` (see [`crate::server`]); the
-//! plain text/JSON output is unaffected and stays the model-facing source of
-//! truth.
+//! All of this is gated twice (see [`crate::server::EdookitServer::ui_active`]):
+//! by the `EDOOKIT_UI_RESOURCES` operator switch **and** by the peer having
+//! negotiated the `io.modelcontextprotocol/ui` extension ([`client_supports_ui`])
+//! — SEP-1865 requires the optional extension to be negotiated before the
+//! server acts on it. Any other client gets the plain text/JSON output
+//! unchanged; it stays the model-facing source of truth.
 //!
 //! ## Security
 //!
@@ -32,7 +35,8 @@
 use std::collections::BTreeMap;
 
 use rmcp::model::{
-    AnnotateAble, ExtensionCapabilities, Meta, RawResource, Resource, ResourceContents,
+    AnnotateAble, ClientCapabilities, ExtensionCapabilities, Meta, RawResource, Resource,
+    ResourceContents,
 };
 
 use super::messages::ListResult;
@@ -186,6 +190,22 @@ pub fn inbox_tool_meta() -> Meta {
     Meta(obj.as_object().expect("object literal").clone())
 }
 
+/// Whether the *client* negotiated the MCP Apps UI extension with a mimeType we
+/// emit. Per SEP-1865 the extension is optional and must be explicitly
+/// negotiated, so the server only acts on the UI surface (tool `_meta`, the
+/// `ui://` resource, the `structuredContent` data channel) when the client
+/// advertised `io.modelcontextprotocol/ui` with `text/html;profile=mcp-app` in
+/// its `mimeTypes`. Clients that didn't get byte-identical plain text — which
+/// also keeps third-party rows from reaching a non-UI model un-enveloped.
+pub fn client_supports_ui(caps: &ClientCapabilities) -> bool {
+    caps.extensions
+        .as_ref()
+        .and_then(|ext| ext.get(UI_EXTENSION))
+        .and_then(|settings| settings.get("mimeTypes"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|types| types.iter().any(|t| t.as_str() == Some(UI_MIME)))
+}
+
 /// The server-side extension capability advertised at `initialize`.
 pub fn ui_extensions() -> ExtensionCapabilities {
     let settings = serde_json::json!({ "mimeTypes": [UI_MIME] });
@@ -310,6 +330,26 @@ mod tests {
         let entry = ext.get(UI_EXTENSION).expect("ui extension present");
         let v = serde_json::to_value(entry).unwrap();
         assert_eq!(v["mimeTypes"][0], "text/html;profile=mcp-app");
+    }
+
+    #[test]
+    fn client_support_requires_negotiated_extension_with_mime() {
+        let caps =
+            |v: serde_json::Value| -> ClientCapabilities { serde_json::from_value(v).unwrap() };
+        // Negotiated with our profile → supported.
+        assert!(client_supports_ui(&caps(serde_json::json!({
+            "extensions": { "io.modelcontextprotocol/ui": { "mimeTypes": ["text/html;profile=mcp-app"] } }
+        }))));
+        // No extensions at all → not supported (the default plain-text client).
+        assert!(!client_supports_ui(&caps(serde_json::json!({}))));
+        // Extension present but without our mimeType → not supported.
+        assert!(!client_supports_ui(&caps(serde_json::json!({
+            "extensions": { "io.modelcontextprotocol/ui": { "mimeTypes": ["text/plain"] } }
+        }))));
+        // Extension present but empty (no mimeTypes) → not supported.
+        assert!(!client_supports_ui(&caps(serde_json::json!({
+            "extensions": { "io.modelcontextprotocol/ui": {} }
+        }))));
     }
 
     #[test]
