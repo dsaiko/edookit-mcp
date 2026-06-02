@@ -67,6 +67,7 @@ struct InboxArgs {
     #[schemars(
         description = "Max messages to return. Default 50, max 200. Paginates internally if needed."
     )]
+    #[serde(default, deserialize_with = "de_opt_f64")]
     limit: Option<f64>,
 }
 
@@ -81,6 +82,7 @@ struct SentArgs {
     #[schemars(
         description = "Max messages to return. Default 50, max 200. Paginates internally if needed."
     )]
+    #[serde(default, deserialize_with = "de_opt_f64")]
     limit: Option<f64>,
 }
 
@@ -105,6 +107,7 @@ struct DownloadArgs {
     #[schemars(
         description = "If true, existing files at the destination are overwritten. Default false — existing files are kept and reported as skipped."
     )]
+    #[serde(default, deserialize_with = "de_opt_bool")]
     overwrite: Option<bool>,
 }
 
@@ -121,10 +124,12 @@ struct ViewArgs {
     #[schemars(
         description = "Inline size cap in MB. Default 8, hard max 25. Larger attachments return a note pointing at edookit_download_attachments instead."
     )]
+    #[serde(default, deserialize_with = "de_opt_f64")]
     max_size_mb: Option<f64>,
     #[schemars(
         description = "For PDFs: how many pages to render to images. Default 5, hard max 20. Extracted text always covers the whole document regardless."
     )]
+    #[serde(default, deserialize_with = "de_opt_f64")]
     max_pages: Option<f64>,
 }
 
@@ -137,7 +142,66 @@ struct CoursesArgs {
     #[schemars(
         description = "Populate every course's student roster (heavier; ignored when course_id is set). Default false = course list only."
     )]
+    #[serde(default, deserialize_with = "de_opt_bool")]
     include_students: Option<bool>,
+}
+
+// Lenient deserializers for scalar tool arguments. The advertised JSON Schema
+// still says `number` / `boolean`, but some MCP clients (e.g. ChatGPT
+// connectors) serialize scalars as JSON strings — `"10"` instead of `10`,
+// `"true"` instead of `true`. serde would reject those by type, surfacing as
+// `-32602 invalid type: string "10", expected f64`. We accept either form
+// (Postel's law) so a stringified argument doesn't break the call; absent or
+// empty input stays `None` and the tool's own default applies.
+
+/// Optional `f64` that also accepts a numeric string (`"10"` → `10.0`).
+fn de_opt_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(f64),
+        Str(String),
+    }
+    match Option::<NumOrStr>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(NumOrStr::Num(n)) => Ok(Some(n)),
+        Some(NumOrStr::Str(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(None);
+            }
+            t.parse::<f64>()
+                .map(Some)
+                .map_err(|_| serde::de::Error::custom(format!("invalid number: {s:?}")))
+        }
+    }
+}
+
+/// Optional `bool` that also accepts the usual string spellings
+/// (`"true"`/`"false"`, `"1"`/`"0"`, `"yes"`/`"no"`, case-insensitive).
+fn de_opt_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrStr {
+        Bool(bool),
+        Str(String),
+    }
+    match Option::<BoolOrStr>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(BoolOrStr::Bool(b)) => Ok(Some(b)),
+        Some(BoolOrStr::Str(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(None),
+            "1" | "true" | "t" | "yes" | "y" => Ok(Some(true)),
+            "0" | "false" | "f" | "no" | "n" => Ok(Some(false)),
+            other => Err(serde::de::Error::custom(format!("invalid bool: {other:?}"))),
+        },
+    }
 }
 
 #[tool_router]
@@ -339,6 +403,57 @@ mod tests {
     use std::time::Duration;
     use wiremock::matchers::{method, path as mpath};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // --- lenient scalar argument deserialization (number/bool-as-string) ---
+
+    #[test]
+    fn limit_accepts_number_string_and_absent() {
+        // The exact shape ChatGPT-style clients send: a stringified number.
+        let a: InboxArgs = serde_json::from_value(serde_json::json!({"limit": "10"})).unwrap();
+        assert_eq!(a.limit, Some(10.0));
+        // Plain JSON number still works.
+        let a: InboxArgs = serde_json::from_value(serde_json::json!({"limit": 25})).unwrap();
+        assert_eq!(a.limit, Some(25.0));
+        // Absent / null / empty-string all collapse to None (tool default applies).
+        let a: InboxArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(a.limit, None);
+        let a: InboxArgs = serde_json::from_value(serde_json::json!({"limit": null})).unwrap();
+        assert_eq!(a.limit, None);
+        let a: InboxArgs = serde_json::from_value(serde_json::json!({"limit": ""})).unwrap();
+        assert_eq!(a.limit, None);
+    }
+
+    #[test]
+    fn limit_rejects_non_numeric_string() {
+        let err =
+            serde_json::from_value::<InboxArgs>(serde_json::json!({"limit": "lots"})).unwrap_err();
+        assert!(err.to_string().contains("invalid number"), "got: {err}");
+    }
+
+    #[test]
+    fn view_size_and_pages_accept_strings() {
+        let a: ViewArgs = serde_json::from_value(serde_json::json!({
+            "id": "m-1", "attachment_id": "1@2", "max_size_mb": "12", "max_pages": "3"
+        }))
+        .unwrap();
+        assert_eq!(a.max_size_mb, Some(12.0));
+        assert_eq!(a.max_pages, Some(3.0));
+    }
+
+    #[test]
+    fn overwrite_accepts_bool_and_string_forms() {
+        let a: DownloadArgs =
+            serde_json::from_value(serde_json::json!({"id": "m-1", "overwrite": "true"})).unwrap();
+        assert_eq!(a.overwrite, Some(true));
+        let a: DownloadArgs =
+            serde_json::from_value(serde_json::json!({"id": "m-1", "overwrite": false})).unwrap();
+        assert_eq!(a.overwrite, Some(false));
+        let a: DownloadArgs =
+            serde_json::from_value(serde_json::json!({"id": "m-1", "overwrite": "0"})).unwrap();
+        assert_eq!(a.overwrite, Some(false));
+        let a: DownloadArgs = serde_json::from_value(serde_json::json!({"id": "m-1"})).unwrap();
+        assert_eq!(a.overwrite, None);
+    }
 
     /// Builds a Client whose login is stubbed and whose requests hit `uri`.
     fn build_client(uri: &str) -> Client {
