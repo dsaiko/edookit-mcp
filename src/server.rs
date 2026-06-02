@@ -1,14 +1,25 @@
 //! MCP server: registers the seven Edookit tools via rmcp's macro router and
 //! maps tool outputs into MCP content (wrapping Edookit-derived data in the
 //! untrusted envelope). Port of the tool-registration half of Go's `main.go`.
+//!
+//! Optionally (gated by `EDOOKIT_UI_RESOURCES`) it also exposes an **MCP Apps**
+//! UI for the inbox (SEP-1865): the `io.modelcontextprotocol/ui` extension
+//! capability, a predeclared `ui://edookit/inbox` template served via
+//! `resources/read`, and `_meta.ui.resourceUri` + `structuredContent` on
+//! `edookit_list_inbox`. See [`crate::tools::ui`].
 
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, Content, Implementation, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, ResourcesCapability,
+    ServerCapabilities, ServerInfo,
+};
 use rmcp::schemars::{self, JsonSchema};
-use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::client::Client;
@@ -29,10 +40,11 @@ pub struct BuildInfo {
 pub struct EdookitServer {
     client: Arc<Client>,
     info: Arc<BuildInfo>,
-    /// When true, `edookit_list_inbox` also appends an experimental MCP-UI
-    /// widget resource (see [`crate::tools::ui`]). On by default — set
-    /// `EDOOKIT_UI_RESOURCES=false` to suppress it (e.g. to spare clients that
-    /// forward every content block to the model the extra HTML).
+    /// When true, the server exposes the experimental MCP Apps UI (SEP-1865):
+    /// the `io.modelcontextprotocol/ui` extension, the predeclared
+    /// `ui://edookit/inbox` template, and `_meta.ui.resourceUri` +
+    /// `structuredContent` on `edookit_list_inbox` (see [`crate::tools::ui`]).
+    /// On by default — set `EDOOKIT_UI_RESOURCES=false` to suppress it.
     ui_resources: bool,
     tool_router: ToolRouter<EdookitServer>,
 }
@@ -207,7 +219,7 @@ where
 #[tool_router]
 impl EdookitServer {
     #[tool(
-        description = "List received messages from the **Edookit school information system** (Komunikace → Přijaté). Edookit is a Czech educational platform used by schools to communicate with parents and students. Use this tool when the user asks about school messages — anything from teachers, the school office, the head teacher (třídní učitel), the principal (ředitel), or about school topics like grades, attendance, parent-teacher meetings, trips, exams. This is NOT a general email inbox — for Gmail / Outlook / Slack DMs use those dedicated tools instead. Returns a JSON object with two keys: `messages` is an array of message objects (id, date, sender, subject, body_preview ~200 chars, attachments count) in newest-first order; `parse_warnings` (optional) lists any rows the server returned that couldn't be parsed — usually means Edookit's row HTML changed. An empty messages array with no warnings means the mailbox itself is empty; an error is returned if every fetched row failed to parse. Unless EDOOKIT_UI_RESOURCES is disabled, the result also carries an extra `ui://edookit/inbox` (text/html) resource block for MCP-UI–capable clients to render an interactive list — ignore it for reasoning; the JSON above is the source of truth."
+        description = "List received messages from the **Edookit school information system** (Komunikace → Přijaté). Edookit is a Czech educational platform used by schools to communicate with parents and students. Use this tool when the user asks about school messages — anything from teachers, the school office, the head teacher (třídní učitel), the principal (ředitel), or about school topics like grades, attendance, parent-teacher meetings, trips, exams. This is NOT a general email inbox — for Gmail / Outlook / Slack DMs use those dedicated tools instead. Returns a JSON object with two keys: `messages` is an array of message objects (id, date, sender, subject, body_preview ~200 chars, attachments count) in newest-first order; `parse_warnings` (optional) lists any rows the server returned that couldn't be parsed — usually means Edookit's row HTML changed. An empty messages array with no warnings means the mailbox itself is empty; an error is returned if every fetched row failed to parse. Unless EDOOKIT_UI_RESOURCES is disabled, the same messages are also attached as the result's `structuredContent` and linked to the `ui://edookit/inbox` MCP Apps template for capable hosts to render an interactive list — reason over the JSON above; it is the source of truth."
     )]
     async fn edookit_list_inbox(
         &self,
@@ -219,11 +231,30 @@ impl EdookitServer {
             since: args.since.unwrap_or_default(),
             limit: args.limit.unwrap_or(0.0) as i64,
         };
-        let ui = self.ui_resources;
-        Ok(json_result_with_ui(
-            tools::messages::list_inbox(&self.client, opts).await,
-            |r| ui.then(|| tools::ui::inbox_resource(r)),
-        ))
+        match tools::messages::list_inbox(&self.client, opts).await {
+            Ok(result) => {
+                let json = match serde_json::to_string(&result) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "marshal: {e}"
+                        ))]));
+                    }
+                };
+                // The untrusted-JSON text block stays the model-facing source of
+                // truth. When the MCP Apps UI is enabled, the same rows ride
+                // along as structuredContent — the data channel the linked
+                // ui://edookit/inbox template renders from.
+                let mut out = CallToolResult::success(vec![Content::text(
+                    tools::wrap_as_untrusted_json(&json),
+                )]);
+                if self.ui_resources {
+                    out.structured_content = Some(tools::ui::inbox_structured_content(&result));
+                }
+                Ok(out)
+            }
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        }
     }
 
     #[tool(
@@ -359,10 +390,75 @@ impl ServerHandler for EdookitServer {
         implementation.name = "edookit-mcp".to_string();
         implementation.version = self.info.version.clone();
 
+        // The capabilities builder uses const-generic typestate, so it can't be
+        // conditionally chained; build the tools-only base, then add the MCP
+        // Apps surface (resources + the ui extension) by mutating public fields.
+        let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+        if self.ui_resources {
+            capabilities.resources = Some(ResourcesCapability {
+                subscribe: None,
+                list_changed: None,
+            });
+            capabilities.extensions = Some(tools::ui::ui_extensions());
+        }
+
         let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = capabilities;
         info.server_info = implementation;
         info
+    }
+
+    // --- MCP Apps surface (gated by `ui_resources`) ------------------------
+    //
+    // We define `list_tools` ourselves so `#[tool_handler]` skips generating it
+    // (it only generates methods that aren't already present): the macro's
+    // version can't attach `_meta.ui.resourceUri` to a tool. `list_resources` /
+    // `read_resource` publish the predeclared `ui://edookit/inbox` template.
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let mut tools = self.tool_router.list_all();
+        if self.ui_resources
+            && let Some(t) = tools.iter_mut().find(|t| t.name == "edookit_list_inbox")
+        {
+            t.meta = Some(tools::ui::inbox_tool_meta());
+        }
+        Ok(ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let mut result = ListResourcesResult::default();
+        if self.ui_resources {
+            result.resources = vec![tools::ui::inbox_resource_descriptor()];
+        }
+        Ok(result)
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        if self.ui_resources && request.uri == tools::ui::INBOX_UI_URI {
+            return Ok(ReadResourceResult::new(vec![
+                tools::ui::inbox_template_contents(),
+            ]));
+        }
+        Err(ErrorData::resource_not_found(
+            format!("unknown resource: {}", request.uri),
+            None,
+        ))
     }
 }
 
@@ -370,25 +466,10 @@ impl ServerHandler for EdookitServer {
 /// returns it as a text content block. A serialize failure or the tool's own
 /// error becomes a tool-level error result (matching Go's `NewToolResultError`).
 fn json_result<T: Serialize>(result: anyhow::Result<T>) -> CallToolResult {
-    json_result_with_ui(result, |_| None)
-}
-
-/// Like [`json_result`] but lets the caller append extra content blocks (e.g. an
-/// MCP-UI widget resource) derived from the successful value. The untrusted-JSON
-/// text block always comes first and stays the canonical, model-facing output;
-/// any UI block is purely additive, so clients that don't render it fall back to
-/// the JSON. `ui` is only consulted on success and may return `None` to add
-/// nothing.
-fn json_result_with_ui<T: Serialize>(
-    result: anyhow::Result<T>,
-    ui: impl FnOnce(&T) -> Option<Content>,
-) -> CallToolResult {
     match result {
         Ok(value) => match serde_json::to_string(&value) {
             Ok(json) => {
-                let mut content = vec![Content::text(tools::wrap_as_untrusted_json(&json))];
-                content.extend(ui(&value));
-                CallToolResult::success(content)
+                CallToolResult::success(vec![Content::text(tools::wrap_as_untrusted_json(&json))])
             }
             Err(e) => CallToolResult::error(vec![Content::text(format!("marshal: {e}"))]),
         },
@@ -497,7 +578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbox_appends_ui_resource_when_enabled() {
+    async fn inbox_attaches_structured_content_when_enabled() {
         let mock = MockServer::start().await;
         mount_inbox(&mock).await;
         let srv = server_with(build_client(&mock.uri()), true);
@@ -507,25 +588,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(res.content.len(), 2, "untrusted-JSON text + UI resource");
-        assert!(
-            res.content[0].raw.as_text().is_some(),
-            "first block is text"
-        );
-        let resource = res.content[1]
-            .raw
-            .as_resource()
-            .expect("second block is an embedded resource");
-        match &resource.resource {
-            rmcp::model::ResourceContents::TextResourceContents { uri, .. } => {
-                assert_eq!(uri, tools::ui::INBOX_UI_URI);
-            }
-            _ => panic!("expected text/html resource"),
-        }
+        // MCP Apps: the model-facing text block is unchanged; the rows ride
+        // along as structuredContent (the UI template's data channel).
+        assert_eq!(res.content.len(), 1, "single untrusted-JSON text block");
+        assert!(res.content[0].raw.as_text().is_some());
+        let sc = res.structured_content.expect("structuredContent present");
+        assert_eq!(sc["messages"][0]["id"], "m-290491");
     }
 
     #[tokio::test]
-    async fn inbox_is_text_only_when_disabled() {
+    async fn inbox_has_no_structured_content_when_disabled() {
         let mock = MockServer::start().await;
         mount_inbox(&mock).await;
         let srv = server_with(build_client(&mock.uri()), false);
@@ -535,11 +607,34 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            res.content.len(),
-            1,
-            "JSON text block only — no UI resource"
+        assert_eq!(res.content.len(), 1);
+        assert!(
+            res.structured_content.is_none(),
+            "no structuredContent when UI disabled"
         );
-        assert!(res.content[0].raw.as_text().is_some());
     }
+
+    #[test]
+    fn get_info_advertises_apps_extension_only_when_enabled() {
+        let on = server_with(build_client("https://localhost"), true).get_info();
+        let caps = serde_json::to_value(&on.capabilities).unwrap();
+        assert_eq!(
+            caps["extensions"]["io.modelcontextprotocol/ui"]["mimeTypes"][0],
+            "text/html;profile=mcp-app"
+        );
+        assert!(
+            caps["resources"].is_object(),
+            "resources capability present"
+        );
+
+        let off = server_with(build_client("https://localhost"), false).get_info();
+        let caps = serde_json::to_value(&off.capabilities).unwrap();
+        assert!(caps["extensions"].is_null(), "no extension when disabled");
+        assert!(caps["resources"].is_null(), "no resources when disabled");
+    }
+
+    // The `list_resources` / `read_resource` trait methods are thin gated
+    // dispatchers over the pure helpers in `tools::ui` (covered by that module's
+    // tests); constructing a `RequestContext<RoleServer>` to drive them directly
+    // isn't worth the ceremony here.
 }

@@ -45,9 +45,9 @@ struct Cli {
     /// When unset, runs as a local stdio MCP server. Falls back to EDOOKIT_HTTP_ADDR.
     #[arg(long, value_name = "ADDR")]
     http: Option<String>,
-    /// (dev) Render the experimental MCP-UI inbox widget from sample data to
-    /// stdout and exit — no login. Pipe to a file and open in a browser to
-    /// eyeball the layout: `edookit-mcp --preview-ui > /tmp/inbox.html`.
+    /// (dev) Render the experimental MCP Apps inbox template (with a built-in
+    /// mock host feeding sample data) to stdout and exit — no login. Pipe to a
+    /// file and open in a browser: `edookit-mcp --preview-ui > /tmp/inbox.html`.
     #[arg(long)]
     preview_ui: bool,
 }
@@ -68,7 +68,7 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     // One-shot runners that don't need the full Edookit client.
     if cli.preview_ui {
-        print!("{}", tools::ui::render_inbox_html(&sample_inbox()));
+        print!("{}", tools::ui::render_preview_html());
         return Ok(());
     }
     if cli.clear_cookies {
@@ -105,8 +105,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .filter(|s| !s.is_empty())
     });
 
-    // Experimental: also emit the MCP-UI inbox widget resource (on by default;
-    // set EDOOKIT_UI_RESOURCES=false to suppress it).
+    // Experimental: expose the MCP Apps inbox UI (on by default; set
+    // EDOOKIT_UI_RESOURCES=false to suppress it).
     let ui_resources = getenv_bool("EDOOKIT_UI_RESOURCES", true)?;
 
     let server = EdookitServer::new(
@@ -210,48 +210,6 @@ fn parse_env_bool(v: &str) -> Option<bool> {
 }
 
 // --- dev one-shot runners ---
-
-/// Representative inbox rows for `--preview-ui` (includes a hostile-looking
-/// subject so the escaping is visible in the rendered output).
-fn sample_inbox() -> tools::messages::ListResult {
-    use tools::messages::Message;
-    let mk = |id: &str, sender: &str, subject: &str, preview: &str, att: i64| Message {
-        id: id.to_string(),
-        number: 0,
-        date: "2026-05-21T12:31:00+02:00".to_string(),
-        sender: sender.to_string(),
-        status: String::new(),
-        subject: subject.to_string(),
-        body_preview: preview.to_string(),
-        attachments: att,
-    };
-    tools::messages::ListResult {
-        messages: vec![
-            mk(
-                "m-290491",
-                "Nováková Eva (učitel 4SC)",
-                "Pozvánka na třídní schůzky",
-                "Dobrý den, zveme Vás na třídní schůzky ve čtvrtek 28. 5. od 17:00…",
-                2,
-            ),
-            mk(
-                "m-290488",
-                "Ředitelství školy",
-                "Uzavření školy — státní svátek",
-                "Upozorňujeme, že v pondělí bude škola z důvodu státního svátku uzavřena.",
-                0,
-            ),
-            mk(
-                "m-290470",
-                "<script>alert('xss')</script>",
-                "Subject \"with\" <b>markup</b>",
-                "Tato řádka ukazuje, že obsah od třetí strany je bezpečně escapovaný.",
-                1,
-            ),
-        ],
-        parse_warnings: Vec::new(),
-    }
-}
 
 fn run_clear_cookies() -> anyhow::Result<()> {
     match cookie_cache_path()? {

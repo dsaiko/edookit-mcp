@@ -1,63 +1,50 @@
-//! Experimental MCP-UI widget for the inbox listing.
+//! MCP Apps UI for the inbox listing (SEP-1865, extension
+//! `io.modelcontextprotocol/ui`).
 //!
-//! This is *additive* to the normal text/JSON tool output: `edookit_list_inbox`
-//! still returns the untrusted-JSON text block (the model reasons over that),
-//! and — when the operator opts in via `EDOOKIT_UI_RESOURCES` — also appends an
-//! embedded `ui://` resource holding a small HTML widget. MCP-UI–capable
-//! clients render that widget in a sandboxed iframe; clients that don't grok
-//! `ui://` ignore it and fall back to the JSON.
+//! This implements the **MCP Apps** model (the standardized successor to the
+//! community MCP-UI), *not* the older inline-embedded-resource approach:
 //!
-//! ## Convention
+//!   * The UI is a **predeclared, static** HTML template served via
+//!     `resources/read` at [`INBOX_UI_URI`] with mimeType [`UI_MIME`]. It
+//!     contains no per-call data.
+//!   * `edookit_list_inbox` links to it by carrying `_meta.ui.resourceUri`
+//!     ([`inbox_tool_meta`]) on its tool definition, and delivers the inbox rows
+//!     as the tool result's `structuredContent`.
+//!   * The host renders the template in a sandboxed iframe; the template and the
+//!     host speak the **MCP JSON-RPC base protocol over `postMessage`**
+//!     ([`PROTOCOL_JS`]): the view sends `ui/initialize`, the host pushes the
+//!     data via `ui/notifications/tool-result`, and a row click issues a
+//!     `tools/call` for `edookit_get_message` (click → detail).
 //!
-//! We follow the MCP-UI embedded-resource convention (mcp-ui.com): a
-//! `text/html` resource carried inline in the tool result's `content` array,
-//! identified by a `ui://` URI. No `resources/list`+`resources/read` round-trip
-//! and no server capability change is needed — the HTML travels with the
-//! result. On click, the widget posts an MCP-UI `tool` action to the host
-//! asking it to call [`edookit_get_message`] for the clicked id, which renders
-//! the message detail. (Hosts that only support the `prompt` action need a
-//! one-line change in [`CLICK_HANDLER`].)
+//! All of this is gated by `EDOOKIT_UI_RESOURCES` (see [`crate::server`]); the
+//! plain text/JSON output is unaffected and stays the model-facing source of
+//! truth.
 //!
 //! ## Security
 //!
-//! Every Edookit-derived field is third-party-controlled (see
-//! [`super::untrusted`]). The widget therefore:
-//!   * HTML-escapes **every** interpolated field via [`esc`] — a malicious
-//!     subject/sender cannot break out into markup or attributes; and
-//!   * renders only the *list metadata* already in hand and passes an opaque
-//!     `id` back to the host. The message **body** is never injected into the
-//!     widget DOM — the detail comes back through the normal untrusted-text
-//!     path of `edookit_get_message`.
+//! Edookit-derived fields are third-party-controlled (see [`super::untrusted`]).
+//! The template renders rows **client-side using DOM APIs (`textContent` /
+//! `createElement`)** — never `innerHTML` — so a hostile subject/sender cannot
+//! become markup; XSS-safety holds by construction rather than by escaping. The
+//! template is static and predeclared, so the host can review it before
+//! rendering, and a row click only ever passes back an opaque message `id`.
 
-use rmcp::model::{Content, ResourceContents};
+use std::collections::BTreeMap;
 
-use super::messages::{ListResult, Message};
+use rmcp::model::{
+    AnnotateAble, ExtensionCapabilities, Meta, RawResource, Resource, ResourceContents,
+};
 
-/// MCP-UI resource URI for the inbox widget.
+use super::messages::ListResult;
+
+/// MCP Apps resource URI for the inbox template.
 pub const INBOX_UI_URI: &str = "ui://edookit/inbox";
 
-/// JS run inside the widget iframe. Wires every `[data-id]` row to an MCP-UI
-/// `tool` action that asks the host to call `edookit_get_message` for that id —
-/// i.e. "click a row → show its detail". Kept dependency-free so it runs in a
-/// bare sandboxed iframe.
-const CLICK_HANDLER: &str = r#"
-function openMessage(id){
-  if(!id) return;
-  // MCP-UI host message: request a tool call. Hosts that only support the
-  // 'prompt' action can swap this for {type:'prompt',payload:{prompt:...}}.
-  window.parent.postMessage(
-    {type:'tool',payload:{toolName:'edookit_get_message',params:{id:id}}},'*');
-}
-document.addEventListener('click',function(e){
-  var row=e.target.closest('[data-id]');
-  if(row) openMessage(row.getAttribute('data-id'));
-});
-document.addEventListener('keydown',function(e){
-  if(e.key!=='Enter'&&e.key!==' ') return;
-  var row=e.target.closest('[data-id]');
-  if(row){e.preventDefault();openMessage(row.getAttribute('data-id'));}
-});
-"#;
+/// MCP Apps HTML profile mimeType (SEP-1865 MVP).
+pub const UI_MIME: &str = "text/html;profile=mcp-app";
+
+/// The MCP Apps extension identifier negotiated at `initialize`.
+pub const UI_EXTENSION: &str = "io.modelcontextprotocol/ui";
 
 const STYLE: &str = r#"
 *{box-sizing:border-box}
@@ -78,85 +65,181 @@ li:focus{box-shadow:inset 2px 0 0 #2563eb}
 .empty{padding:24px 16px;color:#888;text-align:center}
 "#;
 
-/// HTML-escapes a string for safe interpolation into both element text and
-/// double-quoted attribute values.
-fn esc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
+/// The MCP Apps iframe ↔ host bridge. Dependency-free: speaks the MCP JSON-RPC
+/// base protocol over `postMessage`, renders rows from the `tool-result`
+/// notification's `structuredContent`, and issues a `tools/call` on click. All
+/// third-party text reaches the DOM only via `textContent`.
+const PROTOCOL_JS: &str = r#"
+(function(){
+  var PROTOCOL='2025-06-18';
+  var initId=null, nextId=1, ready=false;
+  function post(m){ try{ (window.parent||window).postMessage(m,'*'); }catch(e){} }
+  function req(method,params){ var id=nextId++; post({jsonrpc:'2.0',id:id,method:method,params:params||{}}); return id; }
+  function note(method,params){ post({jsonrpc:'2.0',method:method,params:params||{}}); }
+
+  function openMessage(id){ if(id) req('tools/call',{name:'edookit_get_message',arguments:{id:String(id)}}); }
+
+  function render(data){
+    data = data || {};
+    var msgs = Array.isArray(data.messages) ? data.messages : [];
+    var root = document.getElementById('root');
+    while(root.firstChild) root.removeChild(root.firstChild);
+
+    var h = document.createElement('h1');
+    h.textContent = 'Přijaté zprávy (' + msgs.length + ')';
+    root.appendChild(h);
+
+    if(!msgs.length){
+      var e = document.createElement('div'); e.className='empty';
+      e.textContent='Žádné zprávy.'; root.appendChild(e); return;
     }
-    out
-}
+    var ul = document.createElement('ul');
+    msgs.forEach(function(m){
+      var li = document.createElement('li');
+      li.tabIndex = 0; li.setAttribute('role','button');
 
-/// Renders one inbox row as a clickable `<li>`. `data-id` carries the opaque
-/// message id the click handler hands to `edookit_get_message`.
-fn render_row(m: &Message) -> String {
-    let clip = if m.attachments > 0 {
-        format!(r#"<span class="clip">📎 {}</span>"#, m.attachments)
-    } else {
-        String::new()
-    };
-    let preview = if m.body_preview.is_empty() {
-        String::new()
-    } else {
-        format!(r#"<div class="preview">{}</div>"#, esc(&m.body_preview))
-    };
-    format!(
-        r#"<li tabindex="0" role="button" data-id="{id}">
-  <div class="top"><span class="sender">{sender}</span><span class="date">{date}</span></div>
-  <div class="subject">{subject}{clip}</div>
-  {preview}
-</li>"#,
-        id = esc(&m.id),
-        sender = esc(&m.sender),
-        date = esc(&m.date),
-        subject = esc(&m.subject),
-        clip = clip,
-        preview = preview,
-    )
-}
+      var top = document.createElement('div'); top.className='top';
+      var s = document.createElement('span'); s.className='sender';
+      s.textContent = m.sender || m.status || '';
+      var d = document.createElement('span'); d.className='date';
+      d.textContent = m.date || '';
+      top.appendChild(s); top.appendChild(d); li.appendChild(top);
 
-/// Renders the full inbox widget HTML for a [`ListResult`]. Pure function of
-/// the parsed list — no network, no message bodies.
-pub fn render_inbox_html(result: &ListResult) -> String {
-    let body = if result.messages.is_empty() {
-        r#"<div class="empty">Žádné zprávy.</div>"#.to_string()
-    } else {
-        let rows: String = result.messages.iter().map(render_row).collect();
-        format!("<ul>{rows}</ul>")
-    };
+      var subj = document.createElement('div'); subj.className='subject';
+      subj.textContent = m.subject || '(bez předmětu)';
+      if(m.attachments > 0){
+        var c = document.createElement('span'); c.className='clip';
+        c.textContent = ' 📎 ' + m.attachments; subj.appendChild(c);
+      }
+      li.appendChild(subj);
+
+      if(m.body_preview){
+        var p = document.createElement('div'); p.className='preview';
+        p.textContent = m.body_preview; li.appendChild(p);
+      }
+      li.addEventListener('click', function(){ openMessage(m.id); });
+      li.addEventListener('keydown', function(ev){
+        if(ev.key==='Enter'||ev.key===' '){ ev.preventDefault(); openMessage(m.id); }
+      });
+      ul.appendChild(li);
+    });
+    root.appendChild(ul);
+  }
+
+  window.addEventListener('message', function(ev){
+    var msg = ev.data;
+    if(!msg || msg.jsonrpc !== '2.0') return;
+    if(msg.id != null && msg.id === initId && msg.result){
+      if(!ready){ ready = true; note('ui/notifications/initialized',{}); }
+      return;
+    }
+    if(msg.method === 'ui/notifications/tool-result'){
+      render(msg.params && msg.params.structuredContent);
+    }
+  });
+
+  initId = req('ui/initialize', {
+    capabilities:{}, clientInfo:{name:'edookit-inbox', version:'1'},
+    protocolVersion:PROTOCOL, appCapabilities:{availableDisplayModes:['inline']}
+  });
+})();
+"#;
+
+/// Assembles the static template document. Pure constant — no per-call data.
+fn inbox_template_html() -> String {
     format!(
         r#"<!doctype html>
 <html lang="cs"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>{style}</style></head>
-<body>
-<h1>Přijaté zprávy ({count})</h1>
-{body}
-<script>{script}</script>
-</body></html>"#,
+<body><div id="root"></div><script>{script}</script></body></html>"#,
         style = STYLE,
-        count = result.messages.len(),
-        body = body,
-        script = CLICK_HANDLER,
+        script = PROTOCOL_JS,
     )
 }
 
-/// Builds the MCP-UI embedded-resource content block for the inbox widget.
-pub fn inbox_resource(result: &ListResult) -> Content {
-    Content::resource(ResourceContents::TextResourceContents {
+/// Resource descriptor for `resources/list`.
+pub fn inbox_resource_descriptor() -> Resource {
+    let mut raw = RawResource::new(INBOX_UI_URI, "Edookit – přijaté zprávy");
+    raw.mime_type = Some(UI_MIME.to_string());
+    raw.description =
+        Some("Interactive inbox list (MCP Apps UI); click a row to open the message.".to_string());
+    raw.no_annotation()
+}
+
+/// Resource contents for `resources/read` of [`INBOX_UI_URI`].
+pub fn inbox_template_contents() -> ResourceContents {
+    ResourceContents::TextResourceContents {
         uri: INBOX_UI_URI.to_string(),
-        mime_type: Some("text/html".to_string()),
-        text: render_inbox_html(result),
+        mime_type: Some(UI_MIME.to_string()),
+        text: inbox_template_html(),
         meta: None,
-    })
+    }
+}
+
+/// `_meta` linking `edookit_list_inbox` to its UI template — the nested
+/// `_meta.ui.resourceUri` form (the flat `ui/resourceUri` is deprecated).
+pub fn inbox_tool_meta() -> Meta {
+    let obj = serde_json::json!({
+        "ui": { "resourceUri": INBOX_UI_URI, "visibility": ["model", "app"] }
+    });
+    Meta(obj.as_object().expect("object literal").clone())
+}
+
+/// The server-side extension capability advertised at `initialize`.
+pub fn ui_extensions() -> ExtensionCapabilities {
+    let settings = serde_json::json!({ "mimeTypes": [UI_MIME] });
+    let mut map: ExtensionCapabilities = BTreeMap::new();
+    map.insert(
+        UI_EXTENSION.to_string(),
+        settings.as_object().expect("object literal").clone(),
+    );
+    map
+}
+
+/// The inbox data delivered to the view as the tool result's
+/// `structuredContent`. The view renders rows from `.messages`.
+pub fn inbox_structured_content(result: &ListResult) -> serde_json::Value {
+    serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({ "messages": [] }))
+}
+
+/// Wraps the template with a tiny dev mock host (handshake + sample
+/// `tool-result`) so `--preview-ui` renders a populated list in a plain
+/// browser, with no MCP host. The mock is **never** part of the served
+/// resource — only this preview output.
+pub fn render_preview_html() -> String {
+    // Sample data, including a hostile-looking subject/sender, to demonstrate
+    // that client-side textContent rendering neutralizes third-party markup.
+    let sample = serde_json::json!({
+        "messages": [
+            {"id":"m-290491","date":"2026-05-21T12:31:00+02:00","sender":"Nováková Eva (učitel 4SC)",
+             "subject":"Pozvánka na třídní schůzky","body_preview":"Dobrý den, zveme Vás na třídní schůzky ve čtvrtek 28. 5. od 17:00…","attachments":2},
+            {"id":"m-290488","date":"2026-05-20T08:05:00+02:00","sender":"Ředitelství školy",
+             "subject":"Uzavření školy — státní svátek","body_preview":"V pondělí bude škola uzavřena.","attachments":0},
+            {"id":"m-290470","date":"2026-05-19T15:40:00+02:00","sender":"<script>alert('xss')</script>",
+             "subject":"Subject \"with\" <b>markup</b>","body_preview":"Obsah od třetí strany je vykreslen jako text.","attachments":1}
+        ]
+    });
+    let mock = format!(
+        r#"<script>
+// DEV-ONLY mock host (not part of the served ui:// resource).
+(function(){{
+  var DATA = {sample};
+  window.addEventListener('message', function(ev){{
+    var m = ev.data; if(!m || m.jsonrpc !== '2.0') return;
+    if(m.method === 'ui/initialize'){{
+      window.postMessage({{jsonrpc:'2.0',id:m.id,result:{{protocolVersion:'2025-06-18',hostInfo:{{name:'preview',version:'1'}},hostCapabilities:{{}}}}}},'*');
+    }} else if(m.method === 'ui/notifications/initialized'){{
+      window.postMessage({{jsonrpc:'2.0',method:'ui/notifications/tool-result',params:{{structuredContent:DATA}}}},'*');
+    }} else if(m.method === 'tools/call'){{
+      console.log('[preview] tools/call', JSON.stringify(m.params));
+    }}
+  }});
+}})();
+</script>"#,
+        sample = sample,
+    );
+    inbox_template_html().replace("</body>", &format!("{mock}</body>"))
 }
 
 #[cfg(test)]
@@ -164,108 +247,85 @@ mod tests {
     use super::*;
     use crate::tools::messages::Message;
 
-    fn msg(id: &str, sender: &str, subject: &str) -> Message {
-        Message {
-            id: id.to_string(),
-            sender: sender.to_string(),
-            subject: subject.to_string(),
-            date: "2026-05-21T12:31:00+02:00".to_string(),
-            ..Default::default()
-        }
+    #[test]
+    fn resource_descriptor_uri_and_mime() {
+        let r = inbox_resource_descriptor();
+        assert_eq!(r.raw.uri, INBOX_UI_URI);
+        assert_eq!(r.raw.mime_type.as_deref(), Some(UI_MIME));
     }
 
     #[test]
-    fn renders_uri_and_html_mime() {
-        let r = ListResult {
-            messages: vec![msg("m-1", "Učitel", "Ahoj")],
-            ..Default::default()
-        };
-        let content = inbox_resource(&r);
-        let res = content.raw.as_resource().expect("resource variant");
-        match &res.resource {
-            ResourceContents::TextResourceContents { uri, mime_type, .. } => {
+    fn template_contents_carry_mcp_app_profile() {
+        match inbox_template_contents() {
+            ResourceContents::TextResourceContents {
+                uri,
+                mime_type,
+                text,
+                ..
+            } => {
                 assert_eq!(uri, INBOX_UI_URI);
-                assert_eq!(mime_type.as_deref(), Some("text/html"));
+                assert_eq!(mime_type.as_deref(), Some("text/html;profile=mcp-app"));
+                assert!(text.contains("<!doctype html>"));
             }
             _ => panic!("expected text resource"),
         }
     }
 
     #[test]
-    fn serializes_to_mcp_ui_embedded_resource_shape() {
-        // Lock the on-the-wire JSON: MCP-UI clients look for a content block of
-        // {type:"resource", resource:{uri, mimeType, text}}.
-        let r = ListResult {
-            messages: vec![msg("m-1", "S", "Subj")],
-            ..Default::default()
-        };
-        let v = serde_json::to_value(inbox_resource(&r)).unwrap();
-        assert_eq!(v["type"], "resource");
-        assert_eq!(v["resource"]["uri"], INBOX_UI_URI);
-        assert_eq!(v["resource"]["mimeType"], "text/html");
-        assert!(
-            v["resource"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("<!doctype html>")
-        );
-    }
-
-    #[test]
-    fn click_wires_get_message_with_id() {
-        let r = ListResult {
-            messages: vec![msg("m-290491", "S", "Subj")],
-            ..Default::default()
-        };
-        let html = render_inbox_html(&r);
+    fn template_speaks_mcp_apps_jsonrpc_protocol() {
+        let html = inbox_template_html();
+        // Lifecycle + the click → detail call must all be present.
+        assert!(html.contains("ui/initialize"));
+        assert!(html.contains("ui/notifications/initialized"));
+        assert!(html.contains("ui/notifications/tool-result"));
+        assert!(html.contains("tools/call"));
         assert!(html.contains("edookit_get_message"));
-        assert!(html.contains(r#"data-id="m-290491""#));
+        // structuredContent is the data channel.
+        assert!(html.contains("structuredContent"));
     }
 
     #[test]
-    fn escapes_malicious_subject_and_sender() {
-        // A teacher-controlled subject/sender must not break out into markup or
-        // attributes — this is the whole security premise of the widget.
-        let r = ListResult {
-            messages: vec![msg(
-                "m-1",
-                r#""><img src=x onerror=alert(1)>"#,
-                "<script>alert('xss')</script>",
-            )],
+    fn template_is_xss_safe_by_construction() {
+        // It must render via textContent, never innerHTML — that's the whole
+        // security premise now that data is injected client-side at runtime.
+        let html = inbox_template_html();
+        assert!(html.contains("textContent"));
+        assert!(
+            !html.contains("innerHTML"),
+            "template must not use innerHTML with runtime data"
+        );
+    }
+
+    #[test]
+    fn tool_meta_links_resource_uri_nested() {
+        let meta = inbox_tool_meta();
+        let v = serde_json::to_value(&meta).unwrap();
+        assert_eq!(v["ui"]["resourceUri"], INBOX_UI_URI);
+        assert_eq!(v["ui"]["visibility"][0], "model");
+    }
+
+    #[test]
+    fn extensions_advertise_ui_with_mime() {
+        let ext = ui_extensions();
+        let entry = ext.get(UI_EXTENSION).expect("ui extension present");
+        let v = serde_json::to_value(entry).unwrap();
+        assert_eq!(v["mimeTypes"][0], "text/html;profile=mcp-app");
+    }
+
+    #[test]
+    fn structured_content_serializes_messages() {
+        let result = ListResult {
+            messages: vec![Message {
+                id: "m-1".into(),
+                subject: "Ahoj".into(),
+                sender: "Učitel".into(),
+                date: "2026-05-21T12:31:00+02:00".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
-        let html = render_inbox_html(&r);
-        assert!(
-            !html.contains("<script>alert"),
-            "raw <script> leaked into the widget"
-        );
-        assert!(
-            !html.contains("<img src=x onerror"),
-            "raw <img> leaked into the widget"
-        );
-        assert!(html.contains("&lt;script&gt;"), "subject not escaped");
-        assert!(
-            html.contains("&quot;&gt;&lt;img"),
-            "sender attribute payload not escaped"
-        );
-    }
-
-    #[test]
-    fn empty_inbox_has_no_rows() {
-        let html = render_inbox_html(&ListResult::default());
-        assert!(html.contains("Žádné zprávy"));
-        assert!(!html.contains("<li"));
-        assert!(html.contains("Přijaté zprávy (0)"));
-    }
-
-    #[test]
-    fn attachment_badge_only_when_present() {
-        let mut m = msg("m-1", "S", "Subj");
-        m.attachments = 3;
-        let html = render_inbox_html(&ListResult {
-            messages: vec![m],
-            ..Default::default()
-        });
-        assert!(html.contains("📎 3"));
+        let v = inbox_structured_content(&result);
+        assert_eq!(v["messages"][0]["id"], "m-1");
+        assert_eq!(v["messages"][0]["subject"], "Ahoj");
     }
 }

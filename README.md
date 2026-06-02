@@ -263,7 +263,7 @@ jar atomically (clearing path-scoped cookies a name-based clear would miss).
 | `src/server.rs` | rmcp tool registration (the 7 tools) + MCP `ServerHandler` |
 | `src/http.rs` | Streamable HTTP transport + axum integration + `validate_public_url` / `guard_bind_address` |
 | `src/client/` | reqwest session client, swappable cookie jar, retry/origin, cookie cache, chromiumoxide login |
-| `src/tools/` | one module per tool + HTML/date utils + untrusted-data envelope + PDFium worker + experimental MCP-UI inbox widget (`ui.rs`) |
+| `src/tools/` | one module per tool + HTML/date utils + untrusted-data envelope + PDFium worker + experimental MCP Apps inbox UI (`ui.rs`) |
 | `src/oauth/` | built-in OAuth 2.1 AS (jwt HS256, server, middleware, ratelimit, login template) |
 | `packaging/` | systemd unit + env template + Debian maintainer scripts |
 | `.github/workflows/` | `ci.yml` (fmt/clippy/test/audit) + `release.yml` (cross-platform + deb/rpm) |
@@ -329,35 +329,50 @@ documented here rather than engineered away:
   WASM-sandbox property is the one place Go's stack is genuinely safer; see the
   comparison section. Accepted for the native-render performance and simplicity.
 
-### Experimental: MCP-UI inbox widget
+### Experimental: MCP Apps inbox UI
 
 Every tool otherwise returns only the two universally-supported MCP content
 types — `text` (JSON wrapped in the untrusted envelope) and `image` (inline
-attachment view). As an experiment, `edookit_list_inbox` *additionally* appends an embedded
-[MCP-UI](https://mcpui.com) resource — a `text/html` widget identified by the
-`ui://edookit/inbox` URI ([`src/tools/ui.rs`](src/tools/ui.rs)). MCP-UI–capable
-clients render it as a clickable inbox; clicking a row posts an MCP-UI `tool`
-action asking the host to call `edookit_get_message` for that id (click → detail).
-It is **on by default**; set **`EDOOKIT_UI_RESOURCES=false`** to suppress it.
+attachment view). As an experiment, the server also implements the **MCP Apps**
+extension ([SEP-1865](https://modelcontextprotocol.io/community/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp),
+the standardized successor to the community MCP-UI) for the inbox
+([`src/tools/ui.rs`](src/tools/ui.rs)). It is **on by default**; set
+**`EDOOKIT_UI_RESOURCES=false`** to suppress it.
+
+Concretely, when enabled:
+
+- The server negotiates the **`io.modelcontextprotocol/ui`** extension capability
+  and declares a predeclared, static UI template resource at `ui://edookit/inbox`
+  with mimeType **`text/html;profile=mcp-app`**, served via `resources/read`.
+- `edookit_list_inbox` links to that template via **`_meta.ui.resourceUri`** on
+  its tool definition and delivers the rows as the result's **`structuredContent`**.
+- The host renders the template in a sandboxed iframe; template and host speak the
+  **MCP JSON-RPC base protocol over `postMessage`** — the view sends
+  `ui/initialize`, the host pushes data via `ui/notifications/tool-result`, and a
+  row click issues a `tools/call` for `edookit_get_message` (**click → detail**).
 
 Design constraints, all deliberate:
 
-- **Purely additive.** The untrusted-JSON text block is still emitted first and
-  remains the source of truth; clients that don't understand `ui://` ignore the
-  extra block. On by default; `EDOOKIT_UI_RESOURCES=false` suppresses it (e.g.
-  to spare clients that forward every content block to the model the extra HTML).
-- **No new capability / no resource handlers.** The HTML travels *inline* in the
-  tool result's `content` array (the MCP-UI embedded-resource convention), so
-  there's no `resources/list`+`read` round-trip and the server stays
-  `tools`-only.
-- **Untrusted-data discipline preserved.** The widget HTML-escapes every
-  third-party field (sender/subject/preview) and renders only list *metadata*,
-  passing back an opaque `id`. The message **body** is never injected into the
-  widget DOM — the detail comes back through `edookit_get_message`'s normal
-  untrusted-text path. (See the escaping/XSS unit tests in `ui.rs`.)
-- **Known cost.** On clients that forward all content blocks to the model, the
-  extra HTML also lands in the model's context. A production version would gate
-  the block on a detected client UI capability rather than a static env var.
+- **Additive; JSON stays the source of truth.** The untrusted-JSON `text` block
+  is unchanged and model-facing; the UI is layered on via metadata + a separate
+  data channel, so a host that ignores the extension behaves exactly as before.
+  On by default; `EDOOKIT_UI_RESOURCES=false` removes the extension capability,
+  the resource, the tool `_meta`, and the `structuredContent`.
+- **Predeclared static template.** Per SEP-1865 the HTML is a fixed resource the
+  host can review before rendering — no per-call HTML — and the data arrives
+  separately as `structuredContent`.
+- **XSS-safe by construction.** Because data is injected client-side at runtime,
+  the template renders rows with DOM APIs (`textContent`/`createElement`),
+  **never `innerHTML`** — a hostile subject/sender cannot become markup. A row
+  click only passes back an opaque message `id`; the message **body** is never
+  put in the DOM (the detail comes back through `edookit_get_message`'s normal
+  untrusted-text path). See the XSS / protocol unit tests in `ui.rs`.
+- **Known caveat.** `structuredContent` carries the same third-party rows
+  un-enveloped (the enveloped `text` block remains the primary guard), and some
+  hosts only render MCP Apps in first-party (`1p`) inference mode — a gateway /
+  Bedrock / Vertex / Foundry (`3p`) deployment may fall back to text regardless.
+- `--preview-ui` renders the template plus a built-in mock host (handshake +
+  sample `tool-result`) so you can eyeball the rendered list in a plain browser.
 
 ### Distribution and packaging
 
