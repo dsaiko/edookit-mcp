@@ -105,8 +105,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .filter(|s| !s.is_empty())
     });
 
-    // Experimental: also emit the MCP-UI inbox widget resource (off by default).
-    let ui_resources = getenv_bool("EDOOKIT_UI_RESOURCES", false)?;
+    // Experimental: also emit the MCP-UI inbox widget resource (on by default;
+    // set EDOOKIT_UI_RESOURCES=false to suppress it).
+    let ui_resources = getenv_bool("EDOOKIT_UI_RESOURCES", true)?;
 
     let server = EdookitServer::new(
         Arc::new(cli_client),

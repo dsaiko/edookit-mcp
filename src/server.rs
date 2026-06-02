@@ -30,9 +30,9 @@ pub struct EdookitServer {
     client: Arc<Client>,
     info: Arc<BuildInfo>,
     /// When true, `edookit_list_inbox` also appends an experimental MCP-UI
-    /// widget resource (see [`crate::tools::ui`]). Off by default — gated by
-    /// `EDOOKIT_UI_RESOURCES` so the public endpoint's clients keep getting
-    /// plain text/JSON unless an operator opts in.
+    /// widget resource (see [`crate::tools::ui`]). On by default — set
+    /// `EDOOKIT_UI_RESOURCES=false` to suppress it (e.g. to spare clients that
+    /// forward every content block to the model the extra HTML).
     ui_resources: bool,
     tool_router: ToolRouter<EdookitServer>,
 }
@@ -143,7 +143,7 @@ struct CoursesArgs {
 #[tool_router]
 impl EdookitServer {
     #[tool(
-        description = "List received messages from the **Edookit school information system** (Komunikace → Přijaté). Edookit is a Czech educational platform used by schools to communicate with parents and students. Use this tool when the user asks about school messages — anything from teachers, the school office, the head teacher (třídní učitel), the principal (ředitel), or about school topics like grades, attendance, parent-teacher meetings, trips, exams. This is NOT a general email inbox — for Gmail / Outlook / Slack DMs use those dedicated tools instead. Returns a JSON object with two keys: `messages` is an array of message objects (id, date, sender, subject, body_preview ~200 chars, attachments count) in newest-first order; `parse_warnings` (optional) lists any rows the server returned that couldn't be parsed — usually means Edookit's row HTML changed. An empty messages array with no warnings means the mailbox itself is empty; an error is returned if every fetched row failed to parse. When the server is run with EDOOKIT_UI_RESOURCES enabled, the result also carries an extra `ui://edookit/inbox` (text/html) resource block for MCP-UI–capable clients to render an interactive list — ignore it for reasoning; the JSON above is the source of truth."
+        description = "List received messages from the **Edookit school information system** (Komunikace → Přijaté). Edookit is a Czech educational platform used by schools to communicate with parents and students. Use this tool when the user asks about school messages — anything from teachers, the school office, the head teacher (třídní učitel), the principal (ředitel), or about school topics like grades, attendance, parent-teacher meetings, trips, exams. This is NOT a general email inbox — for Gmail / Outlook / Slack DMs use those dedicated tools instead. Returns a JSON object with two keys: `messages` is an array of message objects (id, date, sender, subject, body_preview ~200 chars, attachments count) in newest-first order; `parse_warnings` (optional) lists any rows the server returned that couldn't be parsed — usually means Edookit's row HTML changed. An empty messages array with no warnings means the mailbox itself is empty; an error is returned if every fetched row failed to parse. Unless EDOOKIT_UI_RESOURCES is disabled, the result also carries an extra `ui://edookit/inbox` (text/html) resource block for MCP-UI–capable clients to render an interactive list — ignore it for reasoning; the JSON above is the source of truth."
     )]
     async fn edookit_list_inbox(
         &self,

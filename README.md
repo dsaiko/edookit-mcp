@@ -333,19 +333,19 @@ documented here rather than engineered away:
 
 Every tool otherwise returns only the two universally-supported MCP content
 types — `text` (JSON wrapped in the untrusted envelope) and `image` (inline
-attachment view). As an opt-in experiment, setting **`EDOOKIT_UI_RESOURCES=true`**
-makes `edookit_list_inbox` *additionally* append an embedded
+attachment view). As an experiment, `edookit_list_inbox` *additionally* appends an embedded
 [MCP-UI](https://mcpui.com) resource — a `text/html` widget identified by the
 `ui://edookit/inbox` URI ([`src/tools/ui.rs`](src/tools/ui.rs)). MCP-UI–capable
 clients render it as a clickable inbox; clicking a row posts an MCP-UI `tool`
 action asking the host to call `edookit_get_message` for that id (click → detail).
+It is **on by default**; set **`EDOOKIT_UI_RESOURCES=false`** to suppress it.
 
 Design constraints, all deliberate:
 
 - **Purely additive.** The untrusted-JSON text block is still emitted first and
   remains the source of truth; clients that don't understand `ui://` ignore the
-  extra block. Off by default so the public HTTP endpoint's clients are
-  unaffected unless an operator opts in.
+  extra block. On by default; `EDOOKIT_UI_RESOURCES=false` suppresses it (e.g.
+  to spare clients that forward every content block to the model the extra HTML).
 - **No new capability / no resource handlers.** The HTML travels *inline* in the
   tool result's `content` array (the MCP-UI embedded-resource convention), so
   there's no `resources/list`+`read` round-trip and the server stays
