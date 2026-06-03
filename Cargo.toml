@@ -81,7 +81,13 @@ assets = [
     { source = "target/release/edookit-mcp", dest = "/usr/bin/edookit-mcp", mode = "755" },
     { source = "third_party/pdfium/lib/libpdfium.so", dest = "/usr/lib/edookit-mcp/libpdfium.so", mode = "644" },
     { source = "packaging/edookit-mcp.service", dest = "/usr/lib/systemd/system/edookit-mcp.service", mode = "644" },
-    { source = "packaging/edookit-mcp.env.example", dest = "/etc/edookit-mcp/edookit-mcp.env", mode = "640", config = true },
+    # `config = "noreplace"` → `%config(noreplace)`: keep the operator's edited
+    # env on upgrade (write the package's version as .rpmnew). Plain `config =
+    # true` is `%config` REPLACE-mode, which silently overwrites the env with the
+    # placeholder template whenever the packaged template's bytes change — that
+    # wiped EDOOKIT_USER/secrets (saving the real env as .rpmsave) during the
+    # 0.2.0→0.2.1 upgrade and crash-looped the service.
+    { source = "packaging/edookit-mcp.env.example", dest = "/etc/edookit-mcp/edookit-mcp.env", mode = "640", config = "noreplace" },
 ]
 # RPM scriptlets mirror the deb maintainer scripts, but RPM passes an install
 # count in $1 rather than dpkg's "configure"/"remove" verbs: %pre/%post see the
