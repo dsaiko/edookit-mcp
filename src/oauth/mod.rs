@@ -8,6 +8,7 @@ mod login;
 pub mod middleware;
 pub mod ratelimit;
 pub mod server;
+mod state_store;
 
 pub use server::{Config, Server};
 
@@ -48,6 +49,18 @@ mod flow_tests {
             PASSWORD.to_string(),
             b"0123456789012345678901234567890123".to_vec(),
         );
+        Arc::new(Server::with_clock(cfg, clock).unwrap())
+    }
+
+    fn test_server_with_state(path: std::path::PathBuf) -> Arc<Server> {
+        let clock: Clock = Arc::new(|| 1_000_000);
+        let mut cfg = Config::new(
+            "https://mcp.example".to_string(),
+            "https://mcp.example/mcp".to_string(),
+            PASSWORD.to_string(),
+            b"0123456789012345678901234567890123".to_vec(),
+        );
+        cfg.state_path = Some(path);
         Arc::new(Server::with_clock(cfg, clock).unwrap())
     }
 
@@ -200,6 +213,114 @@ mod flow_tests {
         .await;
         assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
         assert!(body_string(replay).await.contains("invalid_grant"));
+    }
+
+    // Regression for the "ChatGPT needs reconnect → unknown client_id after a
+    // server restart" report: with a configured state file, DCR registrations
+    // and refresh tokens must survive a fresh process.
+    #[tokio::test]
+    async fn oauth_state_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth-state.json");
+
+        // --- server #1: register + code exchange → refresh token ---
+        let (client_id, refresh) = {
+            let srv = test_server_with_state(path.clone());
+            let client_id = register_client(&srv).await;
+
+            let verifier = "a".repeat(43);
+            let challenge = B64URL.encode(Sha256::digest(verifier.as_bytes()));
+            let authz = post_form(
+                &srv,
+                "/oauth/authorize",
+                form(&[
+                    ("response_type", "code"),
+                    ("client_id", &client_id),
+                    ("redirect_uri", "https://client.example/cb"),
+                    ("scope", "offline_access"),
+                    ("state", "xyz"),
+                    ("code_challenge", &challenge),
+                    ("code_challenge_method", "S256"),
+                    ("username", "dusan"),
+                    ("password", PASSWORD),
+                ]),
+            )
+            .await;
+            assert_eq!(authz.status(), StatusCode::FOUND);
+            let loc = authz
+                .headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let code = url::Url::parse(&loc)
+                .unwrap()
+                .query_pairs()
+                .find(|(k, _)| k == "code")
+                .unwrap()
+                .1
+                .into_owned();
+
+            let tok = post_form(
+                &srv,
+                "/oauth/token",
+                form(&[
+                    ("grant_type", "authorization_code"),
+                    ("code", &code),
+                    ("redirect_uri", "https://client.example/cb"),
+                    ("client_id", &client_id),
+                    ("code_verifier", &verifier),
+                ]),
+            )
+            .await;
+            assert_eq!(tok.status(), StatusCode::OK);
+            let j: serde_json::Value = serde_json::from_str(&body_string(tok).await).unwrap();
+            (client_id, j["refresh_token"].as_str().unwrap().to_string())
+        };
+        assert!(path.exists(), "state file written on register/token");
+
+        // --- server #2: fresh process, same state file (simulated restart) ---
+        let srv2 = test_server_with_state(path.clone());
+
+        // The cached client_id is still known → refresh grant succeeds.
+        let r = post_form(
+            &srv2,
+            "/oauth/token",
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", &client_id),
+            ]),
+        )
+        .await;
+        assert_eq!(
+            r.status(),
+            StatusCode::OK,
+            "refresh token must survive a restart"
+        );
+        let rj: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert!(rj["access_token"].is_string());
+
+        // And /authorize no longer 400s with unknown client_id for that id.
+        let authz2 = post_form(
+            &srv2,
+            "/oauth/authorize",
+            form(&[
+                ("response_type", "code"),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://client.example/cb"),
+                ("code_challenge", &"a".repeat(43)),
+                ("code_challenge_method", "S256"),
+                ("password", PASSWORD),
+            ]),
+        )
+        .await;
+        assert_eq!(
+            authz2.status(),
+            StatusCode::FOUND,
+            "client registration must survive a restart (no unknown client_id)"
+        );
     }
 
     #[tokio::test]
