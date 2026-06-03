@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use std::convert::Infallible;
@@ -74,6 +75,9 @@ pub struct Config {
     pub access_ttl: i64,
     pub refresh_ttl: i64,
     pub code_ttl: i64,
+    /// Where DCR registrations + refresh records are persisted across restarts.
+    /// `None` keeps the legacy in-memory-only behavior (lost on restart).
+    pub state_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -92,6 +96,7 @@ impl Config {
             access_ttl: 24 * 3600,
             refresh_ttl: 30 * 24 * 3600,
             code_ttl: 60,
+            state_path: None,
         }
     }
 }
@@ -119,6 +124,7 @@ struct AuthCode {
     expires_at: i64,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct RefreshRecord {
     client_id: String,
     sub: String,
@@ -127,6 +133,7 @@ struct RefreshRecord {
     generation: i32,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct RefreshTombstone {
     client_id: String,
     expires_at: i64,
@@ -138,6 +145,104 @@ struct ServerState {
     codes: HashMap<String, AuthCode>,
     refresh: HashMap<String, RefreshRecord>,
     used_refresh: HashMap<String, RefreshTombstone>,
+    /// Set whenever a persisted map (clients/refresh/used_refresh) changes, so
+    /// [`Server::save_state`] only writes the file when there's something new
+    /// (the public `/token` endpoint would otherwise write on every junk call).
+    dirty: bool,
+}
+
+/// On-disk snapshot of the long-lived OAuth state. `codes` are deliberately not
+/// persisted — they are single-use and expire in seconds, so an in-flight
+/// authorize during a restart simply retries. `ClientReg` carries `&'static
+/// str` fields that can't round-trip through serde, so it is projected to/from
+/// [`PersistedClient`]; the constant fields are refilled on load.
+#[derive(Default, Serialize, Deserialize)]
+struct PersistedState {
+    clients: Vec<PersistedClient>,
+    refresh: HashMap<String, RefreshRecord>,
+    used_refresh: HashMap<String, RefreshTombstone>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedClient {
+    client_id: String,
+    #[serde(default)]
+    client_name: String,
+    redirect_uris: Vec<String>,
+    issued_at: i64,
+}
+
+impl PersistedClient {
+    fn from_reg(r: &ClientReg) -> Self {
+        Self {
+            client_id: r.client_id.clone(),
+            client_name: r.client_name.clone(),
+            redirect_uris: r.redirect_uris.clone(),
+            issued_at: r.issued_at,
+        }
+    }
+
+    /// Rebuilds a full `ClientReg`, refilling the constant fields every DCR
+    /// registration sets identically (see `register`).
+    fn into_reg(self) -> ClientReg {
+        ClientReg {
+            client_id: self.client_id,
+            client_name: self.client_name,
+            redirect_uris: self.redirect_uris,
+            issued_at: self.issued_at,
+            token_endpoint_auth_method: "none",
+            grant_types: vec![GRANT_AUTHORIZATION_CODE, GRANT_REFRESH_TOKEN],
+            response_types: vec![RESPONSE_TYPE_CODE],
+        }
+    }
+}
+
+/// Loads persisted state from `path` into a fresh `ServerState`, dropping any
+/// already-expired refresh records/tombstones. A missing file is a normal first
+/// run; a corrupt/unreadable one logs and starts empty rather than failing
+/// startup. `None` path → in-memory-only (legacy behavior).
+fn load_initial_state(path: Option<&Path>, now: i64) -> ServerState {
+    let Some(path) = path else {
+        return ServerState::default();
+    };
+    match super::state_store::load::<PersistedState>(path) {
+        Ok(p) => {
+            let mut st = ServerState::default();
+            for c in p.clients {
+                st.clients.insert(c.client_id.clone(), c.into_reg());
+            }
+            st.refresh = p
+                .refresh
+                .into_iter()
+                .filter(|(_, r)| now <= r.expires_at)
+                .collect();
+            st.used_refresh = p
+                .used_refresh
+                .into_iter()
+                .filter(|(_, t)| now <= t.expires_at)
+                .collect();
+            tracing::info!(
+                "oauth: restored {} client(s), {} refresh token(s) from {}",
+                st.clients.len(),
+                st.refresh.len(),
+                path.display()
+            );
+            st
+        }
+        Err(e) => {
+            let not_found = e
+                .downcast_ref::<std::io::Error>()
+                .map(|io| io.kind() == std::io::ErrorKind::NotFound)
+                .unwrap_or(false);
+            if !not_found {
+                tracing::warn!(
+                    "oauth: could not load state from {} ({e}); starting empty",
+                    path.display()
+                );
+            }
+            ServerState::default()
+        }
+    }
 }
 
 pub struct Server {
@@ -170,6 +275,9 @@ impl Server {
                 cfg.jwt_secret.len()
             ));
         }
+        // Restore persisted DCR registrations + refresh tokens (if configured)
+        // so a restart/upgrade doesn't invalidate connected clients.
+        let initial = load_initial_state(cfg.state_path.as_deref(), clock());
         Ok(Self {
             throttle: Throttle::new(
                 LOGIN_FAILURE_WINDOW,
@@ -182,8 +290,34 @@ impl Server {
             mcp_rate: SubLimiter::new(MCP_RATE_PER_SEC, MCP_BURST, SUB_BUCKET_TTL, clock.clone()),
             cfg,
             clock,
-            state: Mutex::new(ServerState::default()),
+            state: Mutex::new(initial),
         })
+    }
+
+    /// Serializes the current persisted maps to disk (0600, atomic), but only
+    /// when something changed since the last write (`dirty`). Called after the
+    /// `register`/`token` handlers and `gc`. Best-effort: a write failure logs
+    /// and re-marks dirty so a later mutation retries.
+    fn save_state(&self) {
+        let Some(path) = self.cfg.state_path.as_deref() else {
+            return;
+        };
+        let snapshot = {
+            let mut st = self.state.lock();
+            if !st.dirty {
+                return;
+            }
+            st.dirty = false;
+            PersistedState {
+                clients: st.clients.values().map(PersistedClient::from_reg).collect(),
+                refresh: st.refresh.clone(),
+                used_refresh: st.used_refresh.clone(),
+            }
+        };
+        if let Err(e) = super::state_store::save(path, &snapshot) {
+            tracing::warn!("oauth: failed to persist state to {} ({e})", path.display());
+            self.state.lock().dirty = true;
+        }
     }
 
     fn now(&self) -> i64 {
@@ -233,9 +367,16 @@ impl Server {
         {
             let mut st = self.state.lock();
             st.codes.retain(|_, c| now <= c.expires_at);
+            let before = (st.refresh.len(), st.used_refresh.len());
             st.refresh.retain(|_, r| now <= r.expires_at);
             st.used_refresh.retain(|_, t| now <= t.expires_at);
+            // Persisted maps shrank → rewrite so the file doesn't accumulate
+            // expired entries (codes aren't persisted).
+            if (st.refresh.len(), st.used_refresh.len()) != before {
+                st.dirty = true;
+            }
         }
+        self.save_state();
         self.throttle.gc();
         self.dcr_throttle.gc();
         self.mcp_rate.gc();
@@ -424,7 +565,9 @@ async fn register(
             evict_oldest_client(&mut st);
         }
         st.clients.insert(reg.client_id.clone(), reg.clone());
+        st.dirty = true;
     }
+    srv.save_state();
     tracing::info!(
         "oauth: registered client {} (name={:?})",
         reg.client_id,
@@ -629,7 +772,7 @@ struct TokenRaw {
 }
 
 async fn token(State(srv): State<Arc<Server>>, Form(raw): Form<TokenRaw>) -> Response {
-    match raw.grant_type.as_str() {
+    let resp = match raw.grant_type.as_str() {
         GRANT_AUTHORIZATION_CODE => srv.token_auth_code(&raw),
         GRANT_REFRESH_TOKEN => srv.token_refresh(&raw),
         other => write_json_error(
@@ -639,7 +782,12 @@ async fn token(State(srv): State<Arc<Server>>, Form(raw): Form<TokenRaw>) -> Res
                 "grant_type {other:?} is not supported (use authorization_code or refresh_token)"
             ),
         ),
-    }
+    };
+    // Persist any new/rotated refresh records or replay-revocations. No-op
+    // (skips the write) unless a handler set `dirty`, so junk grant_type spam
+    // doesn't churn the disk.
+    srv.save_state();
+    resp
 }
 
 impl Server {
@@ -782,6 +930,7 @@ impl Server {
                 },
             );
             trim_active_refresh(&mut st, &rt);
+            st.dirty = true;
             resp["refresh_token"] = json!(rt);
         }
         write_json(StatusCode::OK, resp)
@@ -804,6 +953,7 @@ impl Server {
             // client (never trust the request's client_id here).
             let victim = tomb.client_id.clone();
             invalidate_client_refresh(&mut st, &victim);
+            st.dirty = true;
             tracing::warn!(
                 "oauth: refresh-token REPLAY for client={victim:?} — invalidated all RTs for that client"
             );
@@ -919,6 +1069,7 @@ impl Server {
             },
         );
         trim_active_refresh(&mut st, &new_rt);
+        st.dirty = true;
 
         write_json(
             StatusCode::OK,

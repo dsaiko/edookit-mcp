@@ -117,7 +117,29 @@ fn build_auth_server() -> anyhow::Result<AuthServer> {
         secret.into_bytes(),
     );
     cfg.login_username = std::env::var("EDOOKIT_AUTH_USERNAME").unwrap_or_default();
+    cfg.state_path = oauth_state_path();
     AuthServer::new(cfg).map_err(|e| anyhow!("oauth: {e}"))
+}
+
+/// Resolves where the OAuth AS persists DCR registrations + refresh tokens so a
+/// restart doesn't force every client to re-register. `EDOOKIT_OAUTH_STATE`
+/// overrides; empty/`"none"` disables persistence (legacy in-memory-only);
+/// otherwise defaults under the user data dir. The server deployment sets the
+/// env to a path under its systemd `StateDirectory`.
+fn oauth_state_path() -> Option<std::path::PathBuf> {
+    match std::env::var("EDOOKIT_OAUTH_STATE") {
+        Ok(v) if v.eq_ignore_ascii_case("none") => None,
+        Ok(v) if !v.is_empty() => Some(std::path::PathBuf::from(v)),
+        _ => match dirs::data_dir() {
+            Some(d) => Some(d.join("edookit-mcp-rs").join("oauth-state.json")),
+            None => {
+                tracing::warn!(
+                    "cannot determine data dir for OAuth state; client registrations will not survive restart (set EDOOKIT_OAUTH_STATE)"
+                );
+                None
+            }
+        },
+    }
 }
 
 /// Returns the trimmed canonical PublicURL or an error if it isn't a bare https

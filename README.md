@@ -328,6 +328,15 @@ documented here rather than engineered away:
   + pixel dimensions) on a dedicated blocking thread under a mutex. The
   WASM-sandbox property is the one place Go's stack is genuinely safer; see the
   comparison section. Accepted for the native-render performance and simplicity.
+- **OAuth state is persisted to disk (refresh tokens included).** So a restart /
+  upgrade doesn't invalidate connected clients (otherwise the in-memory DCR store
+  is lost and clients hit `unknown client_id` until re-added), the AS persists its
+  client registrations + refresh records to `EDOOKIT_OAUTH_STATE` (default under
+  the user data dir; the server points it at its systemd `StateDirectory`). The
+  file holds refresh tokens — bearer-equivalent for minting access tokens — so it
+  is written atomically `0600`, owner-only, the same posture as the cookie cache
+  and the JWT-secret env file. Set `EDOOKIT_OAUTH_STATE=none` to opt back into
+  in-memory-only. Auth codes are never persisted (single-use, seconds-long TTL).
 
 ### Experimental: MCP Apps inbox UI
 
