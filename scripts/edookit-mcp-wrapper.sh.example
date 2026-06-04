@@ -32,4 +32,4 @@ export EDOOKIT_PASS=$(security find-generic-password -a "$USER" -s edookit-mcp -
 
 # Path to the edookit-mcp binary (e.g. `make build` → target/release/edookit-mcp,
 # or the `make install` location ~/.cargo/bin/edookit-mcp).
-exec /absolute/path/to/edookit-mcp-rs/target/release/edookit-mcp "$@"
+exec /absolute/path/to/edookit-mcp/target/release/edookit-mcp "$@"

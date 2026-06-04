@@ -60,10 +60,7 @@ fn now_unix() -> i64 {
 /// On macOS that resolves to `~/Library/Caches/edookit-mcp/cookies.json`.
 pub fn default_cookie_cache_path() -> anyhow::Result<PathBuf> {
     let cache = dirs::cache_dir().ok_or_else(|| anyhow!("user cache dir: not available"))?;
-    // Deliberately a separate dir from the Go build's `edookit-mcp/` so the two
-    // binaries don't fight over one cookies.json (different on-disk format) when
-    // run side by side for comparison.
-    Ok(cache.join("edookit-mcp-rs").join("cookies.json"))
+    Ok(cache.join("edookit-mcp").join("cookies.json"))
 }
 
 /// Reads cached cookies from `path` and returns them with their age. Returns a
