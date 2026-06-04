@@ -1,14 +1,13 @@
-# edookit-mcp-rs
+# edookit-mcp
 
 Neoficiální MCP konektor pro Edookit — umožňuje AI asistentům (Claude, ChatGPT,
 Cursor, VS Code Copilot a dalším MCP-kompatibilním klientům) číst zprávy z
 žákovské knížky.
 
-> **Rust port.** Toto je přepis [`edookit-mcp`](https://github.com/dsaiko/edookit-mcp) (původně v Go) do
-> Rustu, vytvořený pro **srovnání obou implementací**. Chování, sada nástrojů i
-> bezpečnostní model jsou stejné jako u Go verze. Upřímné srovnání Go vs Rust je
-> na konci tohoto souboru. **Neoficiální projekt — nemá nic společného s Edookit
-> s.r.o.**
+> Napsáno v **Rustu**. Projekt původně vznikl jako přepis starší **Go**
+> implementace, která už byla vyřazena; upřímné srovnání Go vs Rust z té doby
+> je na konci tohoto souboru zachované jako historický zápis. **Neoficiální
+> projekt — nemá nic společného s Edookit s.r.o.**
 
 ---
 
@@ -46,24 +45,24 @@ souvislým textem.
 **Homebrew (macOS / Linux) — nejjednodušší:**
 
 ```bash
-brew install dsaiko/tap/edookit-mcp-rs
+brew install dsaiko/tap/edookit-mcp
 ```
 
-Nainstaluje se příkaz `edookit-mcp-rs` (i s přibalenou knihovnou PDFium). Tap
+Nainstaluje se příkaz `edookit-mcp` (i s přibalenou knihovnou PDFium). Tap
 [`dsaiko/homebrew-tap`](https://github.com/dsaiko/homebrew-tap) hostí i Go verzi
 jako `edookit-mcp` — obě mohou být nainstalované zároveň.
 
 **Ze zdrojáků:**
 
 ```bash
-git clone git@github.com:dsaiko/edookit-mcp-rs.git
-cd edookit-mcp-rs
+git clone git@github.com:dsaiko/edookit-mcp.git
+cd edookit-mcp
 make build          # stáhne přibalený PDFium a sestaví bin do target/release/
 ```
 
 `make build` je jazykově neutrální — nemusíte řešit `cargo`. Binárku najdete v
 `target/release/edookit-mcp`. (Předkompilované binárky pro každý release jsou na
-[GitHub Releases](https://github.com/dsaiko/edookit-mcp-rs/releases) — archiv
+[GitHub Releases](https://github.com/dsaiko/edookit-mcp/releases) — archiv
 obsahuje binárku i přibalenou knihovnu PDFium.)
 
 > **PDFium:** rasterizace PDF příloh používá nativní knihovnu PDFium, kterou
@@ -95,7 +94,7 @@ make test-messages      # vytiskne pár posledních zpráv ze schránky
 ```
 
 Cookies se uloží do uživatelské cache (na macOS
-`~/Library/Caches/edookit-mcp-rs/cookies.json`) a další spuštění už Chrome
+`~/Library/Caches/edookit-mcp/cookies.json`) a další spuštění už Chrome
 neotevírá (~10 h). Vynucené nové přihlášení: `make clear-cookies`. Debug s
 viditelným prohlížečem: `EDOOKIT_HEADLESS_LOGIN=false`.
 
@@ -108,7 +107,7 @@ viditelným prohlížečem: `EDOOKIT_HEADLESS_LOGIN=false`.
 {
   "mcpServers": {
     "edookit": {
-      "command": "/absolutní/cesta/k/edookit-mcp-rs/target/release/edookit-mcp",
+      "command": "/absolutní/cesta/k/edookit-mcp/target/release/edookit-mcp",
       "env": {
         "EDOOKIT_URL": "https://your-school-login.edookit.net",
         "EDOOKIT_USER": "vase.jmeno@example.cz",
@@ -119,7 +118,7 @@ viditelným prohlížečem: `EDOOKIT_HEADLESS_LOGIN=false`.
 }
 ```
 
-Při instalaci přes Homebrew je `command` jen `"edookit-mcp-rs"` (je na PATH);
+Při instalaci přes Homebrew je `command` jen `"edookit-mcp"` (je na PATH);
 absolutní cesta k `target/release/edookit-mcp` platí pro build ze zdrojáků.
 
 Liší se hlavně **kam ji vložit**: Claude Code `~/.claude.json`; Claude Desktop

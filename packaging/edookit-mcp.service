@@ -1,6 +1,6 @@
 [Unit]
 Description=edookit-mcp — Streamable HTTP MCP server for Edookit
-Documentation=https://github.com/dsaiko/edookit-mcp-rs
+Documentation=https://github.com/dsaiko/edookit-mcp
 After=network-online.target
 Wants=network-online.target
 

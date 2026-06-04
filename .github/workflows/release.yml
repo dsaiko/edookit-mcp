@@ -179,16 +179,13 @@ jobs:
           intel="$(find artifacts -name "*Darwin_x86_64.tar.gz" | head -1)"
           arm_sha="$(sha256sum "$arm" | cut -d' ' -f1)"
           intel_sha="$(sha256sum "$intel" | cut -d' ' -f1)"
-          base="https://github.com/dsaiko/edookit-mcp-rs/releases/download/${GITHUB_REF_NAME}"
+          base="https://github.com/dsaiko/edookit-mcp/releases/download/${GITHUB_REF_NAME}"
           git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/dsaiko/homebrew-tap.git" tap
           mkdir -p tap/Formula
-          # Distinct formula name + command so the Rust port coexists with the
-          # Go build's `edookit-mcp` formula in the same tap (do NOT reuse
-          # edookit-mcp.rb — that is the Go project's formula).
-          cat > tap/Formula/edookit-mcp-rs.rb <<RUBY
-          class EdookitMcpRs < Formula
-            desc "Unofficial MCP connector for Edookit (Czech school information system) — Rust port"
-            homepage "https://github.com/dsaiko/edookit-mcp-rs"
+          cat > tap/Formula/edookit-mcp.rb <<RUBY
+          class EdookitMcp < Formula
+            desc "Unofficial MCP connector for Edookit (Czech school information system)"
+            homepage "https://github.com/dsaiko/edookit-mcp"
             version "${ver}"
             license "MIT"
 
@@ -203,15 +200,13 @@ jobs:
 
             def install
               # Keep the binary and its bundled libpdfium together so the exe-dir
-              # PDFium resolution works; symlink onto PATH as edookit-mcp-rs so it
-              # can coexist with the Go build's edookit-mcp from the same tap.
+              # PDFium resolution works; symlink the binary onto PATH.
               libexec.install Dir["*"]
-              bin.install_symlink libexec/"edookit-mcp" => "edookit-mcp-rs"
+              bin.install_symlink libexec/"edookit-mcp" => "edookit-mcp"
             end
 
             def caveats
               <<~EOS
-                Installs as edookit-mcp-rs (the Go build installs as edookit-mcp).
                 Drives a real Chromium/Chrome instance once per ~10h to log into Plus4U,
                 so install a Chromium-family browser. Configure via
                 EDOOKIT_URL / EDOOKIT_USER / EDOOKIT_PASS. PDF attachment rasterization
@@ -220,13 +215,13 @@ jobs:
             end
 
             test do
-              assert_match "required env var", shell_output("#{bin}/edookit-mcp-rs 2>&1", 1)
+              assert_match "required env var", shell_output("#{bin}/edookit-mcp 2>&1", 1)
             end
           end
           RUBY
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/edookit-mcp-rs.rb
-          git commit -m "edookit-mcp-rs ${ver}" || { echo "formula unchanged"; exit 0; }
+          git add Formula/edookit-mcp.rb
+          git commit -m "edookit-mcp ${ver}" || { echo "formula unchanged"; exit 0; }
           git push

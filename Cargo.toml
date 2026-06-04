@@ -6,8 +6,8 @@ edition = "2024"
 # (`if let … && let …`), which landed in 1.88.
 rust-version = "1.88"
 license = "MIT"
-description = "Unofficial MCP connector for Edookit (Czech school information system) — Rust port"
-repository = "https://github.com/dsaiko/edookit-mcp-rs"
+description = "Unofficial MCP connector for Edookit (Czech school information system)"
+repository = "https://github.com/dsaiko/edookit-mcp"
 readme = "README.md"
 
 [dependencies]
