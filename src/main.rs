@@ -1,6 +1,5 @@
 mod client;
 mod http;
-mod oauth;
 mod server;
 mod tools;
 

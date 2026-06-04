@@ -13,7 +13,6 @@ readme = "README.md"
 [dependencies]
 anyhow = "1.0.102"
 arc-swap = "1.9.1"
-askama = "0.16.0"
 axum = "0.8.9"
 base64 = "0.22.1"
 chromiumoxide = "0.9.1"
@@ -22,8 +21,6 @@ cookie_store = { version = "0.22.1", features = ["public_suffix"] }
 dirs = "6.0.0"
 ego-tree = "0.11.0"
 futures = "0.3.32"
-getrandom = "0.4.2"
-hmac = "0.13.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif"] }
 jiff = { version = "0.2.28", features = ["tzdb-bundle-always"] }
 mime_guess = "2.0.5"
@@ -36,7 +33,6 @@ rmcp = { version = "1.7.0", features = ["server", "macros", "transport-io", "tra
 scraper = "0.27.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-sha2 = "0.11.0"
 subtle = "2.6.1"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
@@ -106,26 +102,26 @@ if ! getent passwd edookit-mcp >/dev/null 2>&1; then
         --comment "edookit-mcp service" edookit-mcp
 fi
 '''
-# %post — reload units, then on upgrade restart only if the OAuth env vars are
+# %post — reload units, then on upgrade restart only if the HTTP bearer token is
 # present (else the binary refuses to start and would loop); on fresh install
 # print the setup hint.
 post_install_script = '''
 systemctl daemon-reload >/dev/null 2>&1 || true
 if [ "$1" -ge 2 ]; then
     ENV=/etc/edookit-mcp/edookit-mcp.env
-    if ( set +u; . "$ENV" 2>/dev/null; [ -n "$EDOOKIT_PUBLIC_URL" ] && [ -n "$EDOOKIT_AUTH_PASSWORD" ] && [ -n "$EDOOKIT_JWT_SECRET" ] ); then
+    if ( set +u; . "$ENV" 2>/dev/null; [ -n "$EDOOKIT_API_TOKEN" ] ); then
         systemctl try-restart edookit-mcp.service >/dev/null 2>&1 || true
     else
-        echo "edookit-mcp: NOT restarting — set EDOOKIT_PUBLIC_URL / EDOOKIT_AUTH_PASSWORD / EDOOKIT_JWT_SECRET in $ENV, then: sudo systemctl restart edookit-mcp" >&2
+        echo "edookit-mcp: NOT restarting — set EDOOKIT_API_TOKEN in $ENV, then: sudo systemctl restart edookit-mcp" >&2
     fi
 fi
 if [ "$1" -eq 1 ]; then
     cat <<'EOF'
 edookit-mcp installed. Next:
-  1) Generate a JWT secret:  openssl rand -base64 48
-  2) sudo $EDITOR /etc/edookit-mcp/edookit-mcp.env   (EDOOKIT_URL/USER/PASS + the three OAuth vars)
+  1) Generate an API token:  openssl rand -base64 24
+  2) sudo $EDITOR /etc/edookit-mcp/edookit-mcp.env   (EDOOKIT_URL/USER/PASS + EDOOKIT_API_TOKEN)
   3) sudo systemctl enable --now edookit-mcp
-Listens on 127.0.0.1:9000/mcp behind the built-in OAuth AS — put a TLS reverse proxy in front.
+Listens on 127.0.0.1:9000/mcp behind a static bearer token — put a TLS reverse proxy in front.
 EOF
 fi
 '''

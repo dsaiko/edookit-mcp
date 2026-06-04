@@ -13,7 +13,9 @@ ExecStart=/usr/bin/edookit-mcp --http 127.0.0.1:9000
 Restart=on-failure
 RestartSec=5s
 
-# State (cookie cache) + cache dirs, owned by the service user.
+# Per-user dirs owned by the service user: StateDirectory (/var/lib/edookit-mcp)
+# is the service user's HOME, where headless chromium writes its profile;
+# CacheDirectory (/var/cache/edookit-mcp) holds the session cookie cache.
 StateDirectory=edookit-mcp
 CacheDirectory=edookit-mcp
 
