@@ -134,21 +134,24 @@ Liší se hlavně **kam ji vložit**: Claude Code `~/.claude.json`; Claude Deskt
 ### Vzdálené nasazení (Streamable HTTP)
 
 Pro běžné lokální použití zůstává **stdio** výchozí. Pro vystavení jako
-**vzdálený konektor přes HTTP** (typicky za TLS reverse-proxy, např. pro ChatGPT)
-spusťte s `--http <addr>`. Autentizaci řeší **vestavěný OAuth 2.1 Authorization
-Server** (Dynamic Client Registration, PKCE S256, HMAC-SHA256 JWT), takže externí
-auth gateway není potřeba — stačí TLS terminátor:
+**vzdálený konektor přes HTTP** spusťte s `--http <addr>`. `/mcp` je chráněné
+**jedním statickým bearer tokenem** (`EDOOKIT_API_TOKEN`, constant-time
+porovnání) — žádný vestavěný OAuth/identity layer; autentizaci/identitu, pokud
+ji potřebuješ, řeš vlastní vrstvou (reverse proxy, VPN). Vždy běž za TLS
+terminátorem a bind drž na loopbacku:
 
 ```bash
-EDOOKIT_PUBLIC_URL=https://edookit.mcp.example \
-EDOOKIT_AUTH_PASSWORD=… EDOOKIT_JWT_SECRET="$(openssl rand -base64 48)" \
+EDOOKIT_API_TOKEN="$(openssl rand -base64 24)" \
 edookit-mcp --http 127.0.0.1:9000
+# klient pak posílá:  Authorization: Bearer <ten token>
 ```
 
-HTTP transport se odmítne nastartovat bez `EDOOKIT_PUBLIC_URL`,
-`EDOOKIT_AUTH_PASSWORD` a `EDOOKIT_JWT_SECRET` (≥ 32 B) — `/mcp` se tak nikdy
-nevystaví bez auth. `SIGINT`/`SIGTERM` ukončí server čistě. Pro server install
-jsou připravené DEB/RPM balíčky se systemd unitou (viz [Distribution](#distribution-and-packaging)).
+HTTP transport se **odmítne nastartovat bez `EDOOKIT_API_TOKEN`** (≥ 16 znaků) —
+`/mcp` se tak nikdy nevystaví úplně bez ochrany. Bind mimo loopback vyžaduje
+`EDOOKIT_BIND_NON_LOOPBACK=true`; za Host-preserving proxy přidej veřejné jméno
+do `EDOOKIT_ALLOWED_HOST` (rmcp DNS-rebinding allowlist, jinak loopback-only).
+`SIGINT`/`SIGTERM` ukončí server čistě. Pro server install jsou DEB/RPM balíčky
+se systemd unitou (viz [Distribution](#distribution-and-packaging)).
 
 ### Co umí (dostupné nástroje)
 
@@ -205,7 +208,7 @@ použít. Když máte připojený i Gmail/Slack MCP, pomáhá v promptu zmínit
                                                │ (auth code flow)
 ┌──────────────┐  stdio / HTTP ┌─────────────┐ │
 │ AI assistant │ ◄──────────►  │ edookit-mcp │ ◄┴── chromium (chromiumoxide)
-│ (Claude / …) │   (+ OAuth)   │   (rmcp)    │      only for login
+│ (Claude / …) │  (+ bearer)   │   (rmcp)    │      only for login
 └──────────────┘               └──────┬──────┘
                                        │ reqwest + swappable cookie jar
                                        ▼
@@ -261,10 +264,9 @@ jar atomically (clearing path-scoped cookies a name-based clear would miss).
 |---|---|
 | `src/main.rs` | flag parsing (clap), env wiring, transport selection, dev runners |
 | `src/server.rs` | rmcp tool registration (the 7 tools) + MCP `ServerHandler` |
-| `src/http.rs` | Streamable HTTP transport + axum integration + `validate_public_url` / `guard_bind_address` |
+| `src/http.rs` | Streamable HTTP transport + axum integration + static bearer-token gate + `guard_bind_address` |
 | `src/client/` | reqwest session client, swappable cookie jar, retry/origin, cookie cache, chromiumoxide login |
 | `src/tools/` | one module per tool + HTML/date utils + untrusted-data envelope + PDFium worker + experimental MCP Apps inbox UI (`ui.rs`) |
-| `src/oauth/` | built-in OAuth 2.1 AS (jwt HS256, server, middleware, ratelimit, login template) |
 | `packaging/` | systemd unit + env template + Debian maintainer scripts |
 | `.github/workflows/` | `ci.yml` (fmt/clippy/test/audit) + `release.yml` (cross-platform + deb/rpm) |
 
@@ -276,13 +278,14 @@ jar atomically (clearing path-scoped cookies a name-based clear would miss).
 (html5ever), [`pdfium-render`](https://docs.rs/pdfium-render) + bundled PDFium,
 [`pdf-extract`](https://docs.rs/pdf-extract), [`image`](https://docs.rs/image),
 [`jiff`](https://docs.rs/jiff) (bundled tzdata), [`axum`](https://docs.rs/axum) +
-`tower`, hand-rolled HS256 via `hmac`/`sha2`/`subtle`, [`tokio`](https://docs.rs/tokio).
+`tower` (HTTP transport, with a `subtle` constant-time bearer-token check),
+[`tokio`](https://docs.rs/tokio).
 
 ### Development
 
 ```bash
 make build        # fetch PDFium + build
-make test         # 93 tests, race-free
+make test         # 92 tests, race-free
 make check        # fmt + clippy-fix + test (mutates)
 make pre-push     # fmt-check + clippy -D + test + audit + build (the gate)
 make tools        # install cargo-audit (once)
@@ -292,20 +295,20 @@ make smoke-message MSG=m-NNNNNN   # (dev) dump raw message-edit JSON
 
 ### Testing
 
-**93 tests.** White-box `#[cfg(test)]` modules per file (mirroring Go's in-package tests):
+White-box `#[cfg(test)]` modules per file (mirroring Go's in-package tests):
 HTML/date parsers against captured samples, an `httptest`-equivalent via
-[`wiremock`](https://docs.rs/wiremock) for the client + download flows, an
-injected clock for the OAuth AS, and a full DCR→authorize→token→refresh→replay
-flow via `tower::oneshot`. The PDFium render path is exercised against a synthetic
-PDF. The chromiumoxide login is not unit-tested (same as the Go original) — run
-`make smoke-login` against a live account.
+[`wiremock`](https://docs.rs/wiremock) for the client + download flows, the
+HTTP transport's bearer-token gate via `tower::oneshot`, and the MCP server
+handler (tool args, MCP Apps wiring). The PDFium render path is exercised against
+a synthetic PDF. The chromiumoxide login is not unit-tested (same as the Go
+original) — run `make smoke-login` against a live account.
 
 ### Security notes (accepted residual risks)
 
 The threat model assumes the **operator trusts whoever drives the MCP client** —
 this is a personal connector to your own school account, not a multi-tenant
-service. Two design choices carry residual risk that is accepted deliberately and
-documented here rather than engineered away:
+service. A few design choices carry residual risk that is accepted deliberately
+and documented here rather than engineered away:
 
 - **Attachment download path is not sandboxed.** `edookit_download_attachments`
   writes to the caller-supplied `destination_dir` (with `~` expansion), faithful
@@ -328,15 +331,15 @@ documented here rather than engineered away:
   + pixel dimensions) on a dedicated blocking thread under a mutex. The
   WASM-sandbox property is the one place Go's stack is genuinely safer; see the
   comparison section. Accepted for the native-render performance and simplicity.
-- **OAuth state is persisted to disk (refresh tokens included).** So a restart /
-  upgrade doesn't invalidate connected clients (otherwise the in-memory DCR store
-  is lost and clients hit `unknown client_id` until re-added), the AS persists its
-  client registrations + refresh records to `EDOOKIT_OAUTH_STATE` (default under
-  the user data dir; the server points it at its systemd `StateDirectory`). The
-  file holds refresh tokens — bearer-equivalent for minting access tokens — so it
-  is written atomically `0600`, owner-only, the same posture as the cookie cache
-  and the JWT-secret env file. Set `EDOOKIT_OAUTH_STATE=none` to opt back into
-  in-memory-only. Auth codes are never persisted (single-use, seconds-long TTL).
+- **The HTTP transport has no built-in identity — only a static bearer token.**
+  `--http` gates `/mcp` on a single shared secret (`EDOOKIT_API_TOKEN`,
+  constant-time compared; the transport refuses to start without it). There is no
+  per-user auth, no OAuth/DCR — an earlier built-in OAuth 2.1 AS was removed once
+  the public deployment was retired. So anyone holding the token has full access:
+  run behind a TLS terminator, keep the bind on loopback (`guard_bind_address`
+  refuses non-loopback without `EDOOKIT_BIND_NON_LOOPBACK=true`), and front it
+  with your own auth/VPN if you expose it. stdio (the default) has no network
+  surface at all.
 
 ### Experimental: MCP Apps inbox UI
 
@@ -416,8 +419,9 @@ is its shakedown.)*
 ## Go vs Rust — an honest comparison
 
 *Written from the actual port (the whole app: client, chromedp login, 6 tools,
-stdio + HTTP transports, OAuth AS). The author wrote both; this is engineering
-observation, not advocacy.*
+stdio + HTTP transports, and — until the public deployment was retired — a
+built-in OAuth 2.1 AS). The author wrote both; this is engineering observation,
+not advocacy.*
 
 **Framing caveat:** the Go original is a mature, much-reviewed codebase. Porting
 it faithfully means the Rust inherits its design and defensive edge-case
@@ -435,7 +439,7 @@ annoying**, not in the architecture.
 | Startup (`--version`, mean of 30) | 6.6 ms | **3.8 ms** | Rust has no runtime/GC init to amortize |
 | Resident memory (idle HTTP server) | ~25.1 MiB | **~13.5 MiB** | Measured on the production gateway (Rocky Linux 10.2, aarch64): Go 0.1.13 `VmRSS` 25,712 kB / 9 threads / 1.28 GB virtual, vs Rust 0.1.1 `VmRSS` 13,796 kB (14,672 kB after a request) / 3 threads / 163 MB virtual — Rust ~46 % leaner resident, and a fraction of the virtual reservation |
 | Prod LOC (excl. tests) | ~6,600 | ~5,100 | Rust a touch tighter |
-| Tests | somewhat larger by LOC | **93** | Rust now covers the parsers, client (retry/origin/fast-path/concurrency), the full OAuth flow, and grid/download integration; Go's suite is still a bit larger |
+| Tests | somewhat larger by LOC | **92** | Rust covers the parsers, client (retry/origin/fast-path/concurrency), the HTTP bearer-token gate, the MCP handler (tool args + MCP Apps wiring), and grid/download integration; Go's suite is still a bit larger |
 
 Memory was measured on the actual deployment (the `gateway-ssst` public MCP
 endpoint) — the long-running Go service idled at ~25 MiB resident (its lifetime
@@ -454,12 +458,15 @@ difference is real and measurable.
   "did you handle the missing field?" spots where `Option` forced the decision,
   and `#[non_exhaustive]` structs that refused silent construction.
 - **Errors are values you can't forget.** `Result` + `?` makes the
-  re-login/retry and OAuth grant flows explicit — no `if err != nil` to omit, no
+  re-login/retry flows explicit — no `if err != nil` to omit, no
   use-after-error.
-- **The hairiest logic ported with structural guarantees.** The OAuth
-  refresh-rotation + replay-detection state machine runs under one
-  `parking_lot::Mutex`; the type system makes "held a lock across `.await`"
-  impossible by construction, and exhaustive enums model the grant outcomes.
+- **The hairiest logic ported with structural guarantees.** The trickiest
+  subsystem the port carried — a built-in OAuth refresh-rotation +
+  replay-detection state machine (since removed with the public deployment) —
+  ran under one `parking_lot::Mutex`; the type system made "held a lock across
+  `.await`" impossible by construction, and exhaustive enums modelled the grant
+  outcomes. The same guarantees still cover the live concurrency (the PDFium
+  worker mutex, the swappable cookie jar).
 - **Concurrency is checked, not hoped.** The swappable cookie jar
   (`ArcSwap<Mutex<…>>`) and the shared `Arc<Client>` are `Send + Sync` by proof;
   `cargo test` needs no `-race` flag because the races can't compile.
