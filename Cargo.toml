@@ -11,34 +11,34 @@ repository = "https://github.com/dsaiko/edookit-mcp"
 readme = "README.md"
 
 [dependencies]
-anyhow = "1.0.102"
-arc-swap = "1.9.1"
+anyhow = "1.0.104"
+arc-swap = "1.9.2"
 axum = "0.8.9"
-base64 = "0.22.1"
+base64 = "0.23.1"
 chromiumoxide = "0.9.1"
-clap = { version = "4.6.1", features = ["derive", "env"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
 cookie_store = { version = "0.22.1", features = ["public_suffix"] }
 dirs = "6.0.0"
 ego-tree = "0.11.0"
-futures = "0.3.32"
+futures = "0.3.34"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif"] }
-jiff = { version = "0.2.28", features = ["tzdb-bundle-always"] }
+jiff = { version = "0.2.35", features = ["tzdb-bundle-always"] }
 mime_guess = "2.0.5"
 parking_lot = "0.12.5"
-pdf-extract = "0.10.0"
-pdfium-render = "0.9.1"
-regex = "1.12.3"
+pdf-extract = "0.12.0"
+pdfium-render = "0.9.3"
+regex = "1.13.1"
 reqwest = { version = "0.13.4", features = ["json", "stream", "cookies"] }
-rmcp = { version = "1.7.0", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.2.0", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 scraper = "0.27.0"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 subtle = "2.6.1"
 tempfile = "3.27.0"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["full"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
 tower = "0.5.3"
-tower-http = { version = "0.6.11", features = ["limit"] }
+tower-http = { version = "0.7.1", features = ["limit"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"

@@ -35,8 +35,7 @@
 use std::collections::BTreeMap;
 
 use rmcp::model::{
-    AnnotateAble, ClientCapabilities, ExtensionCapabilities, Meta, RawResource, Resource,
-    ResourceContents,
+    ClientCapabilities, ExtensionCapabilities, MetaObject, Resource, ResourceContents,
 };
 
 use super::messages::ListResult;
@@ -164,11 +163,11 @@ fn inbox_template_html() -> String {
 
 /// Resource descriptor for `resources/list`.
 pub fn inbox_resource_descriptor() -> Resource {
-    let mut raw = RawResource::new(INBOX_UI_URI, "Edookit – přijaté zprávy");
-    raw.mime_type = Some(UI_MIME.to_string());
-    raw.description =
+    let mut resource = Resource::new(INBOX_UI_URI, "Edookit – přijaté zprávy");
+    resource.mime_type = Some(UI_MIME.to_string());
+    resource.description =
         Some("Interactive inbox list (MCP Apps UI); click a row to open the message.".to_string());
-    raw.no_annotation()
+    resource
 }
 
 /// Resource contents for `resources/read` of [`INBOX_UI_URI`].
@@ -183,11 +182,11 @@ pub fn inbox_template_contents() -> ResourceContents {
 
 /// `_meta` linking `edookit_list_inbox` to its UI template — the nested
 /// `_meta.ui.resourceUri` form (the flat `ui/resourceUri` is deprecated).
-pub fn inbox_tool_meta() -> Meta {
+pub fn inbox_tool_meta() -> MetaObject {
     let obj = serde_json::json!({
         "ui": { "resourceUri": INBOX_UI_URI, "visibility": ["model", "app"] }
     });
-    Meta(obj.as_object().expect("object literal").clone())
+    MetaObject(obj.as_object().expect("object literal").clone())
 }
 
 /// Whether the *client* negotiated the MCP Apps UI extension with a mimeType we
@@ -270,8 +269,8 @@ mod tests {
     #[test]
     fn resource_descriptor_uri_and_mime() {
         let r = inbox_resource_descriptor();
-        assert_eq!(r.raw.uri, INBOX_UI_URI);
-        assert_eq!(r.raw.mime_type.as_deref(), Some(UI_MIME));
+        assert_eq!(r.uri, INBOX_UI_URI);
+        assert_eq!(r.mime_type.as_deref(), Some(UI_MIME));
     }
 
     #[test]

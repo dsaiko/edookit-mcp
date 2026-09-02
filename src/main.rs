@@ -149,7 +149,27 @@ fn build_client_from_env() -> anyhow::Result<Client> {
     cfg.headless_login = getenv_bool("EDOOKIT_HEADLESS_LOGIN", true)?;
     cfg.cookie_cache_path = cookie_cache_path()?;
     cfg.timezone = Some(load_timezone()?);
+    cfg.download_hosts = download_hosts();
     Client::new(cfg)
+}
+
+/// Resolves EDOOKIT_DOWNLOAD_HOSTS — the hosts an attachment download may be
+/// redirected to besides the base origin (Edookit serves uploaded files from
+/// `dataN.edookit.net`). Comma- or whitespace-separated; exact hostnames or
+/// `*.suffix` wildcards. Unset → the built-in default; set but empty → strict
+/// same-origin (no redirect off the tenant host is tolerated).
+fn download_hosts() -> Vec<String> {
+    let Ok(raw) = std::env::var("EDOOKIT_DOWNLOAD_HOSTS") else {
+        return client::DEFAULT_DOWNLOAD_HOSTS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+    };
+    raw.split([',', ' ', '\t'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// EDOOKIT_NO_COOKIE_CACHE=true disables caching; EDOOKIT_COOKIE_CACHE overrides

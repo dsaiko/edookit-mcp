@@ -13,9 +13,9 @@ use std::sync::Arc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, Implementation, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
-    ResourcesCapability, ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, ResourcesCapability, ServerCapabilities, ServerInfo,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::RequestContext;
@@ -253,7 +253,7 @@ impl EdookitServer {
                 let json = match serde_json::to_string(&result) {
                     Ok(j) => j,
                     Err(e) => {
-                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                        return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                             "marshal: {e}"
                         ))]));
                     }
@@ -262,7 +262,7 @@ impl EdookitServer {
                 // truth. When the MCP Apps UI is enabled, the same rows ride
                 // along as structuredContent — the data channel the linked
                 // ui://edookit/inbox template renders from.
-                let mut out = CallToolResult::success(vec![Content::text(
+                let mut out = CallToolResult::success(vec![ContentBlock::text(
                     tools::wrap_as_untrusted_json(&json),
                 )]);
                 if self.ui_resources {
@@ -270,7 +270,9 @@ impl EdookitServer {
                 }
                 Ok(out)
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                e.to_string(),
+            )])),
         }
     }
 
@@ -299,7 +301,7 @@ impl EdookitServer {
         Parameters(args): Parameters<GetMessageArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         if args.id.is_empty() {
-            return Ok(CallToolResult::error(vec![Content::text(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "missing required parameter: id",
             )]));
         }
@@ -316,7 +318,7 @@ impl EdookitServer {
         Parameters(args): Parameters<DownloadArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         if args.id.is_empty() {
-            return Ok(CallToolResult::error(vec![Content::text(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "missing required parameter: id",
             )]));
         }
@@ -337,7 +339,7 @@ impl EdookitServer {
         Parameters(args): Parameters<ViewArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         if args.id.is_empty() || args.attachment_id.is_empty() {
-            return Ok(CallToolResult::error(vec![Content::text(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "missing required parameter: both id and attachment_id are required",
             )]));
         }
@@ -351,17 +353,21 @@ impl EdookitServer {
                 // Bookend the attachment blocks with the untrusted-data banner so
                 // the "treat as data" instruction has a hard boundary.
                 let mut content = Vec::with_capacity(res.blocks.len() + 2);
-                content.push(Content::text(tools::untrusted_attachment_banner()));
+                content.push(ContentBlock::text(tools::untrusted_attachment_banner()));
                 for block in res.blocks {
                     match block {
-                        ViewBlock::Text(t) => content.push(Content::text(t)),
-                        ViewBlock::Image { b64, mime } => content.push(Content::image(b64, mime)),
+                        ViewBlock::Text(t) => content.push(ContentBlock::text(t)),
+                        ViewBlock::Image { b64, mime } => {
+                            content.push(ContentBlock::image(b64, mime))
+                        }
                     }
                 }
-                content.push(Content::text(tools::untrusted_attachment_close()));
+                content.push(ContentBlock::text(tools::untrusted_attachment_close()));
                 Ok(CallToolResult::success(content))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                e.to_string(),
+            )])),
         }
     }
 
@@ -388,8 +394,8 @@ impl EdookitServer {
         match serde_json::to_string(self.info.as_ref()) {
             // server_info is the one tool NOT wrapped in the untrusted envelope —
             // it's our own trusted build metadata, not Edookit-derived content.
-            Ok(j) => Ok(CallToolResult::success(vec![Content::text(j)])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+            Ok(j) => Ok(CallToolResult::success(vec![ContentBlock::text(j)])),
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "marshal: {e}"
             ))])),
         }
@@ -412,10 +418,7 @@ impl ServerHandler for EdookitServer {
         // Apps surface (resources + the ui extension) by mutating public fields.
         let mut capabilities = ServerCapabilities::builder().enable_tools().build();
         if self.ui_resources {
-            capabilities.resources = Some(ResourcesCapability {
-                subscribe: None,
-                list_changed: None,
-            });
+            capabilities.resources = Some(ResourcesCapability::default());
             capabilities.extensions = Some(tools::ui::ui_extensions());
         }
 
@@ -439,18 +442,20 @@ impl ServerHandler for EdookitServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         // `structuredContent` is the Apps data channel; strip it for peers that
         // didn't negotiate the UI extension so Edookit rows never reach a
         // non-UI model outside the untrusted-data envelope. (Only
         // `edookit_list_inbox` sets it, and only when the env switch is on.)
         let ui_active = self.ui_active(&context);
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let mut result = self.tool_router.call(tcc).await?;
-        if !ui_active {
+        let mut response = self.tool_router.call(tcc).await?;
+        // Our tools only ever complete (no elicitation/tasks), but the enum is
+        // #[non_exhaustive] — pass anything else through untouched.
+        if !ui_active && let CallToolResponse::Complete(result) = &mut response {
             result.structured_content = None;
         }
-        Ok(result)
+        Ok(response)
     }
 
     async fn list_tools(
@@ -464,11 +469,7 @@ impl ServerHandler for EdookitServer {
         {
             t.meta = Some(tools::ui::inbox_tool_meta());
         }
-        Ok(ListToolsResult {
-            tools,
-            meta: None,
-            next_cursor: None,
-        })
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn list_resources(
@@ -487,11 +488,9 @@ impl ServerHandler for EdookitServer {
         &self,
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         if self.ui_active(&context) && request.uri == tools::ui::INBOX_UI_URI {
-            return Ok(ReadResourceResult::new(vec![
-                tools::ui::inbox_template_contents(),
-            ]));
+            return Ok(ReadResourceResult::new(vec![tools::ui::inbox_template_contents()]).into());
         }
         Err(ErrorData::resource_not_found(
             format!("unknown resource: {}", request.uri),
@@ -506,12 +505,12 @@ impl ServerHandler for EdookitServer {
 fn json_result<T: Serialize>(result: anyhow::Result<T>) -> CallToolResult {
     match result {
         Ok(value) => match serde_json::to_string(&value) {
-            Ok(json) => {
-                CallToolResult::success(vec![Content::text(tools::wrap_as_untrusted_json(&json))])
-            }
-            Err(e) => CallToolResult::error(vec![Content::text(format!("marshal: {e}"))]),
+            Ok(json) => CallToolResult::success(vec![ContentBlock::text(
+                tools::wrap_as_untrusted_json(&json),
+            )]),
+            Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("marshal: {e}"))]),
         },
-        Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+        Err(e) => CallToolResult::error(vec![ContentBlock::text(e.to_string())]),
     }
 }
 
@@ -629,7 +628,7 @@ mod tests {
         // MCP Apps: the model-facing text block is unchanged; the rows ride
         // along as structuredContent (the UI template's data channel).
         assert_eq!(res.content.len(), 1, "single untrusted-JSON text block");
-        assert!(res.content[0].raw.as_text().is_some());
+        assert!(res.content[0].as_text().is_some());
         let sc = res.structured_content.expect("structuredContent present");
         assert_eq!(sc["messages"][0]["id"], "m-290491");
     }

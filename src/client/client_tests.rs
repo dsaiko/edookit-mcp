@@ -166,6 +166,18 @@ impl Respond for Seq {
 }
 
 fn build_client(uri: &str, login_calls: Arc<AtomicUsize>) -> Client {
+    build_client_with_hosts(uri, login_calls, None)
+}
+
+/// `download_hosts`: `None` keeps the default allow-list, `Some(v)` replaces it.
+/// It must be set **before** `Client::new`, because the allow-list is baked into
+/// the download client's redirect policy at construction (that is the whole
+/// point — the guard runs per hop, before a request goes out).
+fn build_client_with_hosts(
+    uri: &str,
+    login_calls: Arc<AtomicUsize>,
+    download_hosts: Option<Vec<String>>,
+) -> Client {
     let lc = login_calls;
     let login_fn: LoginFn = Arc::new(move || {
         let lc = lc.clone();
@@ -177,6 +189,9 @@ fn build_client(uri: &str, login_calls: Arc<AtomicUsize>) -> Client {
     let mut cfg = Config::new(uri, "user", "pass");
     cfg.retry_base_delay = Duration::from_millis(1); // keep retry tests fast
     cfg.login_fn = Some(login_fn);
+    if let Some(hosts) = download_hosts {
+        cfg.download_hosts = hosts;
+    }
     Client::new(cfg).unwrap()
 }
 
@@ -327,6 +342,607 @@ async fn off_origin_absolute_url_rejected_preflight() {
     // An absolute URL on a foreign origin must be refused before dispatch.
     let err = cli
         .get_json::<serde_json::Value>("https://evil.example/steal")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("off-origin"), "got: {err}");
+}
+
+#[test]
+fn download_host_pattern_matching() {
+    // Exact host.
+    assert!(host_matches_pattern(
+        "data4.edookit.net",
+        "data4.edookit.net"
+    ));
+    assert!(!host_matches_pattern(
+        "data5.edookit.net",
+        "data4.edookit.net"
+    ));
+    // Wildcard covers any subdomain, at any depth.
+    assert!(host_matches_pattern("data4.edookit.net", "*.edookit.net"));
+    assert!(host_matches_pattern("a.b.edookit.net", "*.edookit.net"));
+    // …but not the bare suffix, and not a look-alike that merely ends with it.
+    assert!(!host_matches_pattern("edookit.net", "*.edookit.net"));
+    assert!(!host_matches_pattern("evil-edookit.net", "*.edookit.net"));
+    assert!(!host_matches_pattern(
+        "edookit.net.evil.example",
+        "*.edookit.net"
+    ));
+    // Case- and trailing-dot-insensitive; empty patterns match nothing.
+    assert!(host_matches_pattern("DATA4.Edookit.NET", "*.edookit.net"));
+    assert!(host_matches_pattern("data4.edookit.net.", "*.edookit.net"));
+    assert!(!host_matches_pattern("data4.edookit.net", ""));
+    assert!(!host_matches_pattern("data4.edookit.net", "*."));
+}
+
+/// Edookit 302s `/handler/download/*` to its storage CDN, so an allow-listed
+/// off-origin redirect must deliver the bytes instead of being read as a
+/// session bounce. `localhost` vs `127.0.0.1` gives two distinct hosts on one
+/// wiremock server.
+#[tokio::test]
+async fn download_redirect_to_allowed_host_delivers_bytes() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    let cdn = format!("http://127.0.0.1:{}/cdn/file", server.address().port());
+    Mock::given(method("GET"))
+        .and(mpath("/handler/download/file1"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", cdn.as_str()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(mpath("/cdn/file"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "application/pdf")
+                .set_body_bytes(b"%PDF-1.7 payload".to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let logins = Arc::new(AtomicUsize::new(0));
+    let cli = build_client_with_hosts(
+        &format!("http://localhost:{}", server.address().port()),
+        logins.clone(),
+        Some(vec!["127.0.0.1".to_string()]),
+    );
+
+    let (body, ctype) = cli
+        .get_bytes("/handler/download/file1", 1024)
+        .await
+        .unwrap();
+    assert_eq!(body, b"%PDF-1.7 payload");
+    assert_eq!(ctype, "application/pdf");
+    // The allow-listed hop must NOT have been mistaken for an expiry.
+    assert_eq!(logins.load(Ordering::SeqCst), 1, "one login, no re-login");
+
+    // …and the session must not ride along to the allow-listed host: the jar
+    // scopes host-only cookies to the tenant, and the CDN authenticates with
+    // the token in the URL instead.
+    let cdn_reqs: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path() == "/cdn/file")
+        .collect();
+    assert_eq!(cdn_reqs.len(), 1, "the CDN hop happened");
+    assert!(
+        !cdn_reqs[0].headers.contains_key("cookie"),
+        "no session cookie sent off-origin"
+    );
+}
+
+/// A download redirect to a host that is *not* allow-listed still counts as a
+/// session bounce (one re-login, then a diagnosable error naming the host).
+#[tokio::test]
+async fn download_redirect_to_disallowed_host_errors_with_host() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    let cdn = format!("http://127.0.0.1:{}/cdn/file", server.address().port());
+    Mock::given(method("GET"))
+        .and(mpath("/handler/download/file1"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", cdn.as_str()))
+        .mount(&server)
+        .await;
+
+    let logins = Arc::new(AtomicUsize::new(0));
+    let cli = build_client_with_hosts(
+        &format!("http://localhost:{}", server.address().port()),
+        logins.clone(),
+        Some(vec![]), // strict same-origin
+    );
+
+    let err = cli
+        .get_bytes("/handler/download/file1", 1024)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("127.0.0.1"), "error names the host: {msg}");
+    assert!(msg.contains("EDOOKIT_DOWNLOAD_HOSTS"), "actionable: {msg}");
+    assert_eq!(
+        logins.load(Ordering::SeqCst),
+        2,
+        "bounce triggers one re-login"
+    );
+}
+
+/// A chain that detours through a **disallowed** host and returns to an allowed
+/// one must not pass — and the detour must never be contacted at all. Checking
+/// only the final URL would accept this, after reqwest had already fetched the
+/// detour (twice, once the re-login retry fires).
+#[tokio::test]
+async fn redirect_chain_via_disallowed_host_is_never_contacted() {
+    // The detour: records every hit, and would bounce us back on-origin.
+    let detour = MockServer::start().await;
+
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    Mock::given(method("GET"))
+        .and(mpath("/handler/download/file1"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/hop", detour.uri()).as_str()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(mpath("/hop"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/cdn/file", server.uri()).as_str()),
+        )
+        .mount(&detour)
+        .await;
+    Mock::given(method("GET"))
+        .and(mpath("/cdn/file"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+        .mount(&server)
+        .await;
+
+    // 127.0.0.1 is allow-listed, so the *final* destination would look fine —
+    // but the detour runs on a different port, so the hop must be refused.
+    let cli = build_client_with_hosts(
+        &format!("http://localhost:{}", server.address().port()),
+        Arc::new(AtomicUsize::new(0)),
+        Some(vec!["127.0.0.1".to_string()]),
+    );
+    let err = cli
+        .get_bytes("/handler/download/file1", 1024)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("bounced off-origin"), "got: {err}");
+    assert!(
+        detour.received_requests().await.unwrap().is_empty(),
+        "the disallowed hop must never be requested"
+    );
+}
+
+/// An HTML attachment served from the allow-listed CDN must be delivered as
+/// the file it is. The stale-session sniff only makes sense for the tenant —
+/// running it off-origin re-logs in for every HTML attachment and, when that
+/// login fails, loses an already-downloaded file.
+#[tokio::test]
+async fn cdn_html_attachment_is_not_mistaken_for_a_login_page() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    let cdn = format!("http://127.0.0.1:{}/cdn/file", server.address().port());
+    Mock::given(method("GET"))
+        .and(mpath("/handler/download/file1"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", cdn.as_str()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(mpath("/cdn/file"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html; charset=utf-8")
+                .set_body_bytes(b"<html><body>a real html attachment</body></html>".to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let logins = Arc::new(AtomicUsize::new(0));
+    let cli = build_client_with_hosts(
+        &format!("http://localhost:{}", server.address().port()),
+        logins.clone(),
+        Some(vec!["127.0.0.1".to_string()]),
+    );
+    let (body, ct) = cli
+        .get_bytes("/handler/download/file1", 4096)
+        .await
+        .unwrap();
+    assert!(body.starts_with(b"<html>"), "the html file is returned");
+    assert!(ct.starts_with("text/html"));
+    assert_eq!(
+        logins.load(Ordering::SeqCst),
+        1,
+        "an off-origin html body must not trigger a re-login"
+    );
+}
+
+/// Same for a CDN JSON attachment that happens to contain `authenticated:false`
+/// — off-origin it is data, not a session verdict, and must be returned.
+#[tokio::test]
+async fn cdn_json_with_auth_false_is_returned_as_data() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    let cdn = format!("http://127.0.0.1:{}/cdn/file", server.address().port());
+    Mock::given(method("GET"))
+        .and(mpath("/handler/download/file1"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", cdn.as_str()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(mpath("/cdn/file"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"authenticated": false})),
+        )
+        .mount(&server)
+        .await;
+
+    let cli = build_client_with_hosts(
+        &format!("http://localhost:{}", server.address().port()),
+        Arc::new(AtomicUsize::new(0)),
+        Some(vec!["127.0.0.1".to_string()]),
+    );
+    let (body, _) = cli
+        .get_bytes("/handler/download/file1", 4096)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains("\"authenticated\""),
+        "the JSON file is returned verbatim"
+    );
+}
+
+/// …while a *tenant* html body still means "stale session": the gate that
+/// makes the two tests above safe.
+#[tokio::test]
+async fn tenant_html_body_still_triggers_one_relogin() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    Mock::given(method("GET"))
+        .and(mpath("/handler/download/file1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_bytes(b"<html>login</html>".to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let logins = Arc::new(AtomicUsize::new(0));
+    let cli = build_client(&server.uri(), logins.clone());
+    // Still html after the re-login → accepted as a genuine html attachment.
+    let (body, _) = cli
+        .get_bytes("/handler/download/file1", 4096)
+        .await
+        .unwrap();
+    assert_eq!(body, b"<html>login</html>");
+    assert_eq!(
+        logins.load(Ordering::SeqCst),
+        2,
+        "tenant html is retried once behind a re-login"
+    );
+}
+
+/// Direct test of the isolation mechanism, because the wiremock version below
+/// cannot exercise it: `localhost` and `127.0.0.1` share no registrable domain,
+/// so a `Domain=` cookie could not cross between them anyway. Here the tenant
+/// sets `Domain=.edookit.net` — exactly the attribute that would hand the
+/// session to `dataN.edookit.net` — and the assertions show the raw jar *would*
+/// leak it while the download client's view does not.
+#[test]
+fn tenant_only_cookie_view_blocks_the_shared_jar_off_origin() {
+    use reqwest::cookie::CookieStore as _;
+
+    let base = parse_base_url("https://school.edookit.net", false).unwrap();
+    let cdn = Url::parse("https://data4.edookit.net/v1/fetch/x").unwrap();
+    let jar = Arc::new(Jar::new());
+
+    // The tenant sets a registrable-domain-scoped session cookie.
+    let set = HeaderValue::from_static("sid=secret; Domain=.edookit.net; Path=/");
+    jar.set_cookies(&mut [&set].into_iter(), &base);
+
+    // Baseline: the shared jar hands that cookie to the CDN host — this is the
+    // leak the download client must not have.
+    assert!(
+        jar.cookies(&cdn).is_some(),
+        "precondition: a Domain-scoped cookie does reach the CDN via the raw jar"
+    );
+
+    let view = TenantOnlyCookies {
+        jar: jar.clone(),
+        base_url: base.clone(),
+    };
+    assert!(
+        view.cookies(&cdn).is_none(),
+        "the download client must send nothing off-origin"
+    );
+    assert!(
+        view.cookies(&base).is_some(),
+        "…while keeping the session for the tenant hop"
+    );
+
+    // And a Set-Cookie from the CDN must not enter the shared jar.
+    let planted = HeaderValue::from_static("sid=attacker; Domain=.edookit.net; Path=/");
+    view.set_cookies(&mut [&planted].into_iter(), &cdn);
+    let tenant_cookies = jar.cookies(&base).unwrap();
+    assert!(
+        tenant_cookies.to_str().unwrap().contains("sid=secret"),
+        "tenant session untouched, got {tenant_cookies:?}"
+    );
+}
+
+/// The off-origin download hop must be cookie-free **structurally**, not
+/// because today's tenant cookies happen to be host-only: a `Domain=`-scoped
+/// tenant cookie would otherwise domain-match the CDN and ride along, and a
+/// `Set-Cookie` from the CDN could come back to influence the tenant session.
+#[tokio::test]
+async fn cdn_hop_neither_receives_nor_sets_cookies() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    let cdn = format!("http://127.0.0.1:{}/cdn/file", server.address().port());
+    Mock::given(method("GET"))
+        .and(mpath("/handler/download/file1"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                // A domain-scoped cookie set by the tenant: the shared jar would
+                // hand this to any *.localhost/127.0.0.1 host on attribute rules.
+                .insert_header("Set-Cookie", "tenant-wide=secret; Path=/")
+                .insert_header("Location", cdn.as_str()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(mpath("/cdn/file"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                // The CDN tries to plant a cookie of its own.
+                .insert_header("Set-Cookie", "cdn-planted=evil; Path=/")
+                .set_body_bytes(b"payload".to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let cli = build_client_with_hosts(
+        &format!("http://localhost:{}", server.address().port()),
+        Arc::new(AtomicUsize::new(0)),
+        Some(vec!["127.0.0.1".to_string()]),
+    );
+    let (body, _) = cli
+        .get_bytes("/handler/download/file1", 1024)
+        .await
+        .unwrap();
+    assert_eq!(body, b"payload");
+
+    let cdn_req = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.url.path() == "/cdn/file")
+        .expect("the CDN hop happened");
+    assert!(
+        !cdn_req.headers.contains_key("cookie"),
+        "no cookie may be sent to the off-origin hop"
+    );
+    // Nor may the CDN's Set-Cookie reach the jar the tenant requests use.
+    let names: Vec<String> = cli.session_cookies().into_iter().map(|c| c.name).collect();
+    assert!(
+        !names.iter().any(|n| n == "cdn-planted"),
+        "CDN cookie must not enter the tenant jar, got {names:?}"
+    );
+}
+
+/// A refusal must name the whole origin and *which* check failed — advising
+/// "add the host to the allow-list" is useless when the host is already on it
+/// and only the port or scheme is wrong.
+#[test]
+fn refusal_reason_distinguishes_host_scheme_and_port() {
+    let base = parse_base_url("https://school.edookit.net", false).unwrap();
+    let hosts = vec!["*.edookit.net".to_string()];
+    let verdict = |u: &str| origin_verdict(&Url::parse(u).unwrap(), &base, &hosts);
+
+    assert_eq!(
+        verdict("https://data4.edookit.net/x"),
+        OriginVerdict::Allowed
+    );
+    assert_eq!(
+        verdict("https://evil.example/x"),
+        OriginVerdict::HostNotAllowed
+    );
+    assert_eq!(
+        verdict("http://data4.edookit.net/x"),
+        OriginVerdict::SchemeMismatch
+    );
+    assert_eq!(
+        verdict("https://data4.edookit.net:8443/x"),
+        OriginVerdict::PortMismatch
+    );
+
+    // With an EMPTY allow-list the tenant's own host must still be diagnosed by
+    // what actually differed, not as "host not allowed".
+    let strict = |u: &str| origin_verdict(&Url::parse(u).unwrap(), &base, &[]);
+    assert_eq!(
+        strict("http://school.edookit.net/x"),
+        OriginVerdict::SchemeMismatch,
+        "https->http on the tenant host is a downgrade, not an unknown host"
+    );
+    assert_eq!(
+        strict("https://school.edookit.net:8443/x"),
+        OriginVerdict::PortMismatch
+    );
+    assert_eq!(
+        strict("https://data4.edookit.net/x"),
+        OriginVerdict::HostNotAllowed
+    );
+
+    // The advice differs per reason, and never tells you to allow-list a host
+    // that is already allow-listed.
+    let port_advice = OriginVerdict::PortMismatch.advice(&base);
+    assert!(port_advice.contains("port must be 443"), "{port_advice}");
+    assert!(
+        !port_advice.contains("EDOOKIT_DOWNLOAD_HOSTS"),
+        "{port_advice}"
+    );
+    let scheme_advice = OriginVerdict::SchemeMismatch.advice(&base);
+    assert!(scheme_advice.contains("https"), "{scheme_advice}");
+    assert!(
+        OriginVerdict::HostNotAllowed
+            .advice(&base)
+            .contains("EDOOKIT_DOWNLOAD_HOSTS")
+    );
+    // And the origin is rendered whole, not just the hostname.
+    assert_eq!(
+        origin_str(&Url::parse("https://data4.edookit.net:8443/x").unwrap()),
+        "https://data4.edookit.net:8443"
+    );
+}
+
+/// An allow-listed host on the wrong port is refused *before dispatch*, with a
+/// message that points at the port rather than the allow-list.
+#[tokio::test]
+async fn preflight_port_mismatch_message_points_at_the_port() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    let cli = build_client_with_hosts(
+        &server.uri(),
+        Arc::new(AtomicUsize::new(0)),
+        Some(vec!["127.0.0.1".to_string()]),
+    );
+    // Same allow-listed host, different port.
+    let other_port = server.address().port().wrapping_add(1).max(1);
+    let err = cli
+        .get_bytes(&format!("http://127.0.0.1:{other_port}/file"), 16)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("port must be"), "names the real cause: {msg}");
+    assert!(
+        msg.contains(&other_port.to_string()),
+        "names the origin: {msg}"
+    );
+}
+
+/// A redirect loop must NOT masquerade as an expired session: no re-login, no
+/// retries, and an error that says "redirect", not "add the host to
+/// EDOOKIT_DOWNLOAD_HOSTS".
+#[tokio::test]
+async fn redirect_loop_is_distinct_from_session_expiry() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    let here = format!("{}/loop", server.uri());
+    Mock::given(method("GET"))
+        .and(mpath("/loop"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", here.as_str()))
+        .mount(&server)
+        .await;
+
+    let logins = Arc::new(AtomicUsize::new(0));
+    let cli = build_client(&server.uri(), logins.clone());
+    let err = cli.get_bytes("/loop", 1024).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("redirect"), "names the real cause: {msg}");
+    assert!(
+        !msg.contains("EDOOKIT_DOWNLOAD_HOSTS"),
+        "must not advise the allow-list knob: {msg}"
+    );
+    assert_eq!(
+        logins.load(Ordering::SeqCst),
+        1,
+        "a loop is deterministic — no re-login"
+    );
+}
+
+/// The hop budget matches reqwest's own default (`Policy::limited(10)`), which
+/// our custom policy replaces: ten same-origin hops still resolve.
+#[tokio::test]
+async fn ten_redirect_hops_are_still_followed() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    for i in 0..10 {
+        let next = format!("{}/hop/{}", server.uri(), i + 1);
+        Mock::given(method("GET"))
+            .and(mpath(format!("/hop/{i}")))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", next.as_str()))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(mpath("/hop/10"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"arrived".to_vec()))
+        .mount(&server)
+        .await;
+
+    let cli = build_client(&server.uri(), Arc::new(AtomicUsize::new(0)));
+    let (body, _) = cli.get_bytes("/hop/0", 1024).await.unwrap();
+    assert_eq!(body, b"arrived", "ten hops are within budget");
+}
+
+/// An allow-listed *hostname* must not implicitly allow every port: cookies are
+/// not port-scoped, so a hop to the tenant host on another port would still be
+/// handed the session cookie while escaping `same_origin`.
+#[test]
+fn allowed_host_does_not_widen_to_other_ports() {
+    let base = parse_base_url("https://school.edookit.net", false).unwrap();
+    let hosts = vec!["*.edookit.net".to_string()];
+    let allowed = |u: &str| origin_allowed(&Url::parse(u).unwrap(), &base, &hosts);
+
+    assert!(
+        allowed("https://data4.edookit.net/v1/fetch/x"),
+        "the CDN on 443"
+    );
+    assert!(
+        allowed("https://data4.edookit.net:443/v1/fetch/x"),
+        "explicit 443"
+    );
+    assert!(
+        !allowed("https://data4.edookit.net:8443/v1/fetch/x"),
+        "other port"
+    );
+    assert!(
+        !allowed("https://school.edookit.net:8443/steal"),
+        "same host, other port — would still receive the cookie"
+    );
+    // Scheme downgrade is refused even on an allow-listed host.
+    assert!(!allowed("http://data4.edookit.net/v1/fetch/x"));
+    // An empty allow-list means strict same-origin.
+    assert!(!origin_allowed(
+        &Url::parse("https://data4.edookit.net/v1/fetch/x").unwrap(),
+        &base,
+        &[]
+    ));
+    assert!(origin_allowed(
+        &Url::parse("https://school.edookit.net/handler/x").unwrap(),
+        &base,
+        &[]
+    ));
+}
+
+/// The allow-list also widens the pre-dispatch SSRF fence, because attachment
+/// URLs arrive fully qualified from Edookit — but only for the download paths,
+/// and only for allow-listed hosts.
+#[tokio::test]
+async fn download_preflight_honours_allow_list() {
+    let server = MockServer::start().await;
+    mount_warmup(&server).await;
+    let cli = build_client_with_hosts(
+        &server.uri(),
+        Arc::new(AtomicUsize::new(0)),
+        Some(vec!["*.edookit.net".to_string()]),
+    );
+
+    // Not allow-listed → refused before dispatch.
+    let err = cli
+        .get_bytes("https://evil.example/steal", 16)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("off-origin"), "got: {err}");
+
+    // Allow-listed, but the JSON path keeps the strict same-origin fence.
+    let err = cli
+        .get_json::<serde_json::Value>("https://data4.edookit.net/v1/fetch/x")
         .await
         .unwrap_err();
     assert!(err.to_string().contains("off-origin"), "got: {err}");
