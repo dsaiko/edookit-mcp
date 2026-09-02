@@ -188,6 +188,9 @@ použít. Když máte připojený i Gmail/Slack MCP, pomáhá v promptu zmínit
 - **„login failed … interaction_required"** → přihlaste se ručně do
   uuidentity.plus4u.net, pak zkuste znovu.
 - **opakovaně „session expired"** → `make clear-cookies`.
+- **„download bounced off-origin to …"** → Edookit servíruje nahrané soubory ze
+  svého úložiště (`/handler/download/…` → 302 na `dataN.edookit.net`); doplňte ten
+  host do `EDOOKIT_DOWNLOAD_HOSTS` (default `*.edookit.net`).
 - **PDF příloha se nezobrazí jako obrázek** → nenašla se knihovna PDFium;
   nastavte `EDOOKIT_PDFIUM_LIB` nebo spusťte `make build` (text se extrahuje i tak).
 - **občasná „network error" / 502/503/504** → tyhle blipy konektor 2× opakuje s
@@ -330,6 +333,15 @@ and documented here rather than engineered away:
   + pixel dimensions) on a dedicated blocking thread under a mutex. The
   WASM-sandbox property is the one place Go's stack is genuinely safer; see the
   comparison section. Accepted for the native-render performance and simplicity.
+- **Attachment downloads may follow a redirect off the tenant origin.** Edookit
+  serves uploaded files from its own storage CDN, so `/handler/download/file<uuid>`
+  302s to `https://dataN.edookit.net/v1/fetch/<uuid>?token=…`. Every other request
+  (`/handler/*` JSON, the warmup) stays strictly same-origin; only the two download
+  paths consult the `EDOOKIT_DOWNLOAD_HOSTS` allow-list (default `*.edookit.net`,
+  exact hosts or `*.suffix` subdomain wildcards), a scheme downgrade is never
+  followed, and the pre-dispatch SSRF fence applies the same list to the
+  fully-qualified attachment URLs Edookit hands us. Session cookies are host-scoped
+  and so are not sent to the CDN — it authenticates with the token in the URL.
 - **The HTTP transport has no built-in identity — only a static bearer token.**
   `--http` gates `/mcp` on a single shared secret (`EDOOKIT_API_TOKEN`,
   constant-time compared; the transport refuses to start without it). There is no
