@@ -8,6 +8,7 @@ mod date;
 mod htmlutil;
 pub mod message;
 pub mod messages;
+pub mod overview;
 mod pdfrender;
 pub mod ui;
 pub mod untrusted;

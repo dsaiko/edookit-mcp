@@ -78,12 +78,15 @@ const DOM_ACCEPTANCE: &str = "__lc_Grid_Acceptance";
 /// Fetches and parses a single message by row UID ("m-NNNNNN" or "NNNNNN").
 pub async fn get_message(cli: &Client, id_or_uid: &str) -> anyhow::Result<FullMessage> {
     let num = normalize_message_id(id_or_uid)?;
-    let path = format!("/handler/page/message-edit?__index={num}");
-    let raw: Value = cli
-        .get_json(&path)
-        .await
-        .map_err(|e| anyhow!("fetch message {id_or_uid}: {e}"))?;
-    parse_full_message(num, &raw, cli.timezone())
+    if cli.uses_handler_api().await.map_err(|e| anyhow!("{e}"))? {
+        let path = format!("/handler/page/message-edit?__index={num}");
+        let raw: Value = cli
+            .get_json(&path)
+            .await
+            .map_err(|e| anyhow!("fetch message {id_or_uid}: {e}"))?;
+        return parse_full_message(num, &raw, cli.timezone());
+    }
+    super::overview::get_message(cli, id_or_uid).await
 }
 
 /// Strips the optional "m-" prefix and parses a positive int.
@@ -375,7 +378,7 @@ fn parse_status_html(s: &str, tz: &TimeZone) -> (String, String, String) {
 
 /// Renders editor HTML to plain text: tags stripped, entities decoded,
 /// paragraph/`<br>` breaks preserved as newlines, whitespace collapsed.
-fn html_to_text(raw_html: &str) -> String {
+pub(crate) fn html_to_text(raw_html: &str) -> String {
     if raw_html.is_empty() {
         return String::new();
     }
