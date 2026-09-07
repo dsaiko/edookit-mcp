@@ -194,6 +194,9 @@ pub struct Client {
     // Guards the logged-in flag AND serializes the login flow: a concurrent
     // burst of first calls all block here so only one chromium launch happens.
     logged_in: tokio::sync::Mutex<bool>,
+    /// Cached result of probing `/handler/page/dashboard`. `None` until first
+    /// check; `Some(false)` on tenants that only expose the overview HTML UI.
+    handler_api: parking_lot::Mutex<Option<bool>>,
 }
 
 impl Client {
@@ -247,6 +250,7 @@ impl Client {
             jar,
             tz,
             logged_in: tokio::sync::Mutex::new(false),
+            handler_api: parking_lot::Mutex::new(None),
         };
         if let Some(path) = client.cfg.cookie_cache_path.clone() {
             client.preload_cookies(&path);
@@ -309,6 +313,70 @@ impl Client {
     /// name/value pairs; do not log these in production).
     pub fn session_cookies(&self) -> Vec<StoredCookie> {
         self.jar.export_name_values(&self.base_url)
+    }
+
+    /// Whether this tenant still serves the legacy `/handler/*` JSON API.
+    /// Newer instances return HTTP 404 and are handled via overview HTML pages.
+    pub async fn uses_handler_api(&self) -> Result<bool, ClientError> {
+        self.ensure_logged_in().await?;
+        if let Some(v) = *self.handler_api.lock() {
+            return Ok(v);
+        }
+        let available = self.probe_handler_api().await?;
+        *self.handler_api.lock() = Some(available);
+        Ok(available)
+    }
+
+    /// Fetches `path` and returns the response body as UTF-8 text. Used for
+    /// overview HTML pages on tenants without the legacy JSON API.
+    pub async fn get_text(&self, path: &str) -> Result<String, ClientError> {
+        let mut allow_retry = true;
+        loop {
+            self.ensure_logged_in().await?;
+            self.preflight_same_origin(path)?;
+
+            let req = self.new_request(path, false)?;
+            let resp = self.send_retrying(req).await?;
+
+            if resp.status().is_redirection() || !same_origin(resp.url(), &self.base_url) {
+                if !allow_retry {
+                    return Err(ClientError::msg("session expired and re-login failed"));
+                }
+                self.invalidate_session().await;
+                allow_retry = false;
+                continue;
+            }
+            let status = resp.status().as_u16();
+            if status >= 400 {
+                return Err(ClientError::msg(format!("GET {path}: HTTP {status}")));
+            }
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|e| ClientError::msg(format!("read body from {path}: {e}")))?;
+            if parse_auth_envelope(&body) == Some(false) {
+                if !allow_retry {
+                    return Err(ClientError::msg(
+                        "session reported authenticated=false and re-login failed",
+                    ));
+                }
+                self.invalidate_session().await;
+                allow_retry = false;
+                continue;
+            }
+            let text = String::from_utf8(body.to_vec()).map_err(|e| {
+                ClientError::msg(format!("decode UTF-8 from {path}: {e}"))
+            })?;
+            if text.contains("/user/login") && text.len() < 512 {
+                if !allow_retry {
+                    return Err(ClientError::msg("session expired and re-login failed"));
+                }
+                self.invalidate_session().await;
+                allow_retry = false;
+                continue;
+            }
+            return Ok(text);
+        }
     }
 
     /// Fetches `path` and decodes the JSON response into `T`. Re-authenticates
@@ -598,7 +666,18 @@ impl Client {
     async fn invalidate_session(&self) {
         let mut guard = self.logged_in.lock().await;
         *guard = false;
+        *self.handler_api.lock() = None;
         self.jar.reset();
+    }
+
+    async fn probe_handler_api(&self) -> Result<bool, ClientError> {
+        self.preflight_same_origin("/handler/page/dashboard")?;
+        let req = self.new_request("/handler/page/dashboard", true)?;
+        let resp = self
+            .send_retrying(req)
+            .await
+            .map_err(|e| ClientError::msg(format!("probe handler API: {e}")))?;
+        Ok(resp.status().as_u16() < 400)
     }
 
     async fn warmup(&self) -> Result<(), ClientError> {

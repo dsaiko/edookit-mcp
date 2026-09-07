@@ -436,6 +436,15 @@ mod tests {
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(mpath("/handler/page/dashboard"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "authenticated": true
+                })),
+            )
+            .mount(&server)
+            .await;
         let dl_url = format!("{}/handler/download/file1", server.uri());
         Mock::given(method("GET"))
             .and(mpath("/handler/page/message-edit"))

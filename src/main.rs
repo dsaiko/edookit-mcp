@@ -258,13 +258,26 @@ async fn run_login_test(cli: &Client) -> anyhow::Result<()> {
         cli.session_cookies().len()
     );
 
-    let probe: serde_json::Value = cli.get_json("/handler/page/dashboard").await?;
-    if probe.get("authenticated").and_then(|v| v.as_bool()) != Some(true) {
-        bail!(
-            "/handler/page/dashboard returned authenticated=false despite successful login — warmup is broken"
-        );
+    if cli.uses_handler_api().await? {
+        let probe: serde_json::Value = cli.get_json("/handler/page/dashboard").await?;
+        if probe.get("authenticated").and_then(|v| v.as_bool()) != Some(true) {
+            bail!(
+                "/handler/page/dashboard returned authenticated=false despite successful login — warmup is broken"
+            );
+        }
+        eprintln!("authenticated session verified via /handler/page/dashboard");
+    } else {
+        let html = cli
+            .get_text("/overview/updates")
+            .await
+            .map_err(|e| anyhow!("overview session probe failed: {e}"))?;
+        if !html.contains("inboxMessage") {
+            bail!(
+                "/overview/updates loaded but looks unlike an inbox page — UI may have changed"
+            );
+        }
+        eprintln!("authenticated session verified via /overview/updates (overview UI)");
     }
-    eprintln!("authenticated session verified via /handler/page/dashboard");
     Ok(())
 }
 

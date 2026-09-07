@@ -87,39 +87,62 @@ pub async fn list_inbox(cli: &Client, opts: InboxOptions) -> anyhow::Result<List
             "invalid view {view:?} (want one of {VIEW_INBOX}/{VIEW_UNREAD}/{VIEW_STARRED}/{VIEW_ARCHIVED}/{VIEW_ALL})"
         );
     }
-    let mut q: Vec<(&str, String)> = vec![
-        ("object_type_general", "object_type_message".into()),
-        ("object_filter", view.into()),
-    ];
-    if !opts.fulltext.is_empty() {
-        q.push(("fulltext", opts.fulltext.clone()));
+    if cli.uses_handler_api().await.map_err(|e| anyhow!("{e}"))? {
+        let mut q: Vec<(&str, String)> = vec![
+            ("object_type_general", "object_type_message".into()),
+            ("object_filter", view.into()),
+        ];
+        if !opts.fulltext.is_empty() {
+            q.push(("fulltext", opts.fulltext.clone()));
+        }
+        return fetch_and_parse(
+            cli,
+            "/handler/grid/objects-for-me-data",
+            &q,
+            &opts.since,
+            normalize_limit(opts.limit),
+            false,
+        )
+        .await;
     }
-    fetch_and_parse(
-        cli,
-        "/handler/grid/objects-for-me-data",
-        &q,
-        &opts.since,
-        normalize_limit(opts.limit),
-        false,
-    )
-    .await
+    if !opts.fulltext.is_empty() {
+        bail!("fulltext search is not supported on overview-based Edookit instances");
+    }
+    super::overview::list_inbox(cli, opts).await
 }
 
 /// Fetches messages the user has sent (Komunikace → Vytvořené).
 pub async fn list_sent(cli: &Client, opts: SentOptions) -> anyhow::Result<ListResult> {
-    let mut q: Vec<(&str, String)> = vec![("object_type_general", "object_type_message".into())];
-    if !opts.fulltext.is_empty() {
-        q.push(("fulltext", opts.fulltext.clone()));
+    if cli.uses_handler_api().await.map_err(|e| anyhow!("{e}"))? {
+        let mut q: Vec<(&str, String)> = vec![("object_type_general", "object_type_message".into())];
+        if !opts.fulltext.is_empty() {
+            q.push(("fulltext", opts.fulltext.clone()));
+        }
+        return fetch_and_parse(
+            cli,
+            "/handler/grid/created-objects-data",
+            &q,
+            &opts.since,
+            normalize_limit(opts.limit),
+            true,
+        )
+        .await;
     }
-    fetch_and_parse(
-        cli,
-        "/handler/grid/created-objects-data",
-        &q,
-        &opts.since,
-        normalize_limit(opts.limit),
-        true,
-    )
-    .await
+    if !opts.fulltext.is_empty() {
+        bail!("fulltext search is not supported on overview-based Edookit instances");
+    }
+    super::overview::list_sent(cli, opts).await
+}
+
+pub(crate) fn normalize_limit_public(n: i64) -> i64 {
+    normalize_limit(n)
+}
+
+pub(crate) fn parse_since_public(
+    s: &str,
+    tz: &TimeZone,
+) -> anyhow::Result<Option<jiff::Timestamp>> {
+    parse_since(s, tz)
 }
 
 fn normalize_limit(n: i64) -> i64 {
@@ -583,6 +606,18 @@ mod tests {
             .await;
     }
 
+    async fn mount_handler_api(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(mpath("/handler/page/dashboard"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "authenticated": true
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
     /// Each grid row is `[uid, uid, html]`.
     fn grid(rows: Vec<(String, String)>) -> serde_json::Value {
         let data: Vec<Vec<String>> = rows
@@ -602,6 +637,7 @@ mod tests {
     async fn list_inbox_paginates_and_truncates_to_limit() {
         let server = MockServer::start().await;
         mount_warmup(&server).await;
+        mount_handler_api(&server).await;
         // Page 1 is a full page (PAGE_SIZE) → triggers a second fetch.
         let page1: Vec<(String, String)> = (0..100)
             .map(|i| {
@@ -653,6 +689,7 @@ mod tests {
     async fn list_inbox_since_skips_older_but_keeps_scanning() {
         let server = MockServer::start().await;
         mount_warmup(&server).await;
+        mount_handler_api(&server).await;
         let rows = vec![
             (
                 "m-3".to_string(),
@@ -695,6 +732,7 @@ mod tests {
     async fn list_inbox_propagates_fulltext_and_view() {
         let server = MockServer::start().await;
         mount_warmup(&server).await;
+        mount_handler_api(&server).await;
         // Responds only if BOTH the view filter and fulltext are in the query.
         Mock::given(method("GET"))
             .and(mpath("/handler/grid/objects-for-me-data"))
@@ -726,6 +764,7 @@ mod tests {
     async fn all_rows_unparseable_is_error_not_empty() {
         let server = MockServer::start().await;
         mount_warmup(&server).await;
+        mount_handler_api(&server).await;
         let rows = vec![
             ("m-1".into(), "<div></div>".into()),
             ("m-2".into(), "<div></div>".into()),
@@ -745,6 +784,7 @@ mod tests {
     async fn list_sent_uses_status_and_created_objects_endpoint() {
         let server = MockServer::start().await;
         mount_warmup(&server).await;
+        mount_handler_api(&server).await;
         let row = r#"<small><b>21.05.2026 12:31</b> <span>Publikováno</span></small><div><a href="x"><b>Test</b></a></div>"#;
         Mock::given(method("GET"))
             .and(mpath("/handler/grid/created-objects-data"))

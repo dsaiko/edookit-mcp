@@ -591,6 +591,15 @@ mod tests {
             .respond_with(ResponseTemplate::new(200))
             .mount(server)
             .await;
+        Mock::given(method("GET"))
+            .and(mpath("/handler/page/dashboard"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "authenticated": true
+                })),
+            )
+            .mount(server)
+            .await;
         let row = r#"<small><b>21.05.2026 12:31</b> <span>Učitel 4SC</span></small><div><a href="x"><b>Pozvánka</b></a></div>"#;
         let grid = serde_json::json!({
             "components": { "workspace": [ { "data": [["m-290491", "m-290491", row]] } ] }
